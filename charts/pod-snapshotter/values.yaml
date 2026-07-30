@@ -1,0 +1,46 @@
+nameOverride: ""
+namespace: pod-snapshotter
+
+manager:
+  image:
+    repository: pod-snapshotter/manager
+    tag: latest
+    pullPolicy: IfNotPresent
+  replicas: 1
+  leaderElect: false
+  # Skip kubelet serving-cert verification (needed on clusters with
+  # self-signed kubelet certs — the same trade-off metrics-server makes).
+  kubeletInsecureTLS: true
+  # Refuse to checkpoint pods on nodes whose agent has not reported
+  # prerequisites ok (annotation podsnapshot.io/prereqs=ok).
+  requireNodePrereqs: true
+  # fuse-client HTTP API used for artifact existence checks and deletion.
+  fuseAPIEndpoint: "http://fuse-client.fuse-system.svc.cluster.local:8081"
+  resources:
+    requests: {cpu: 50m, memory: 128Mi}
+    limits: {memory: 512Mi}
+
+agent:
+  image:
+    repository: pod-snapshotter/agent
+    tag: latest
+    pullPolicy: IfNotPresent
+  # Restrict the agent to GPU nodes by default. Set to {} to run everywhere
+  # (e.g. CPU-only checkpoint trials on kind).
+  nodeSelector:
+    nvidia.com/gpu.present: "true"
+  tolerations:
+    - key: nvidia.com/gpu
+      operator: Exists
+      effect: NoSchedule
+  # Paths on the host.
+  fuseMount: /mnt/fuse
+  checkpointsDir: /var/lib/kubelet/checkpoints
+  workRoot: /var/lib/pod-snapshotter/restores
+  criSocket: /run/containerd/containerd.sock
+  # fuse-client integration on each node.
+  fuseAPIEndpoint: "http://127.0.0.1:8081"
+  fuseAgentSocket: /var/run/fuse-client/agent.sock
+  resources:
+    requests: {cpu: 100m, memory: 256Mi}
+    limits: {memory: 2Gi}

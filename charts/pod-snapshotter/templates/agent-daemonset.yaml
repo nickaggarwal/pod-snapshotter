@@ -1,0 +1,82 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: pod-snapshotter-agent
+  namespace: {{ .Values.namespace }}
+  labels:
+    app: pod-snapshotter-agent
+spec:
+  selector:
+    matchLabels:
+      app: pod-snapshotter-agent
+  template:
+    metadata:
+      labels:
+        app: pod-snapshotter-agent
+    spec:
+      serviceAccountName: pod-snapshotter-agent
+      # hostPID: nsenter into the host mount namespace to run the node's
+      # runc/criu/cuda-checkpoint; hostNetwork: reach fuse-client on
+      # 127.0.0.1:8081.
+      hostPID: true
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      {{- with .Values.agent.nodeSelector }}
+      nodeSelector: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.agent.tolerations }}
+      tolerations: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: agent
+          image: "{{ .Values.agent.image.repository }}:{{ .Values.agent.image.tag }}"
+          imagePullPolicy: {{ .Values.agent.image.pullPolicy }}
+          args:
+            - --fuse-mount={{ .Values.agent.fuseMount }}
+            - --checkpoints-dir={{ .Values.agent.checkpointsDir }}
+            - --work-root={{ .Values.agent.workRoot }}
+            - --cri-socket={{ .Values.agent.criSocket }}
+            - --fuse-api-endpoint={{ .Values.agent.fuseAPIEndpoint }}
+            - --fuse-agent-socket={{ .Values.agent.fuseAgentSocket }}
+            - --host-root=/host
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          securityContext:
+            privileged: true
+          resources: {{- toYaml .Values.agent.resources | nindent 12 }}
+          volumeMounts:
+            - name: kubelet-checkpoints
+              mountPath: {{ .Values.agent.checkpointsDir }}
+            - name: fuse-mount
+              mountPath: {{ .Values.agent.fuseMount }}
+              mountPropagation: HostToContainer
+            - name: work-root
+              mountPath: {{ .Values.agent.workRoot }}
+            - name: cri-socket
+              mountPath: {{ .Values.agent.criSocket }}
+            - name: fuse-client-run
+              mountPath: /var/run/fuse-client
+            - name: host-root
+              mountPath: /host
+              readOnly: true
+            - name: kubelet-pods
+              mountPath: /var/lib/kubelet/pods
+              mountPropagation: HostToContainer
+      volumes:
+        - name: kubelet-checkpoints
+          hostPath: {path: {{ .Values.agent.checkpointsDir }}, type: DirectoryOrCreate}
+        - name: fuse-mount
+          hostPath: {path: {{ .Values.agent.fuseMount }}, type: DirectoryOrCreate}
+        - name: work-root
+          hostPath: {path: {{ .Values.agent.workRoot }}, type: DirectoryOrCreate}
+        - name: cri-socket
+          hostPath: {path: {{ .Values.agent.criSocket }}, type: Socket}
+        - name: fuse-client-run
+          hostPath: {path: /var/run/fuse-client, type: DirectoryOrCreate}
+        - name: host-root
+          hostPath: {path: /, type: Directory}
+        - name: kubelet-pods
+          hostPath: {path: /var/lib/kubelet/pods, type: Directory}

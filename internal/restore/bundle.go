@@ -1,0 +1,179 @@
+// Package restore implements the node-local restore pipeline:
+//
+//	unpack checkpoint tar -> build OCI bundle -> rewrite spec.dump ->
+//	runc restore (joining the placeholder pod's sandbox namespaces)
+//
+// The kubelet checkpoint tar (CRI archive) contains:
+//
+//	checkpoint/       CRIU image files (incl. CUDA plugin dumps)
+//	config.dump       container runtime metadata (image, id, ...)
+//	spec.dump         the original OCI runtime spec of the container
+//	rootfs-diff.tar   filesystem writes on top of the image
+//	dump.log          CRIU dump log
+package restore
+
+import (
+	"archive/tar"
+	"encoding/json"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"strings"
+)
+
+// Bundle is an unpacked checkpoint plus a prepared OCI bundle directory.
+type Bundle struct {
+	// Dir is the working directory: <root>/<restore-uid>/
+	Dir string
+	// CheckpointDir contains the CRIU images (<Dir>/checkpoint).
+	CheckpointDir string
+	// RootfsDir is the container rootfs the restored process runs over.
+	RootfsDir string
+	// SpecPath is <Dir>/bundle/config.json (rewritten spec.dump).
+	SpecPath string
+	// ConfigDump is the parsed config.dump.
+	ConfigDump map[string]any
+}
+
+// maxTarEntries and maxTarSize guard against pathological archives.
+const (
+	maxTarEntries = 1 << 20
+	// 1 TiB — checkpoint tars are legitimately huge (VRAM + heap).
+	maxTarSize = 1 << 40
+)
+
+// Unpack extracts the checkpoint tar into workDir and prepares the bundle
+// layout. rootfsDir is where the image rootfs was materialized (by the CRI
+// resolver, from the placeholder container's image mounts); rootfs-diff.tar
+// is applied on top of it.
+func Unpack(tarPath, workDir, rootfsDir string) (*Bundle, error) {
+	if err := os.MkdirAll(workDir, 0o755); err != nil {
+		return nil, err
+	}
+	f, err := os.Open(tarPath)
+	if err != nil {
+		return nil, fmt.Errorf("opening checkpoint tar: %w", err)
+	}
+	defer f.Close()
+
+	if err := extractTar(f, workDir); err != nil {
+		return nil, fmt.Errorf("extracting checkpoint tar: %w", err)
+	}
+
+	b := &Bundle{
+		Dir:           workDir,
+		CheckpointDir: filepath.Join(workDir, "checkpoint"),
+		RootfsDir:     rootfsDir,
+		SpecPath:      filepath.Join(workDir, "bundle", "config.json"),
+	}
+	if fi, err := os.Stat(b.CheckpointDir); err != nil || !fi.IsDir() {
+		return nil, fmt.Errorf("checkpoint tar %s has no checkpoint/ directory (not a CRI checkpoint archive?)", tarPath)
+	}
+
+	// Parse config.dump (json).
+	if raw, err := os.ReadFile(filepath.Join(workDir, "config.dump")); err == nil {
+		_ = json.Unmarshal(raw, &b.ConfigDump)
+	}
+
+	// Apply rootfs writes on top of the image rootfs.
+	diff := filepath.Join(workDir, "rootfs-diff.tar")
+	if _, err := os.Stat(diff); err == nil && rootfsDir != "" {
+		df, err := os.Open(diff)
+		if err != nil {
+			return nil, err
+		}
+		defer df.Close()
+		if err := extractTar(df, rootfsDir); err != nil {
+			return nil, fmt.Errorf("applying rootfs-diff.tar: %w", err)
+		}
+	}
+
+	if err := os.MkdirAll(filepath.Dir(b.SpecPath), 0o755); err != nil {
+		return nil, err
+	}
+	return b, nil
+}
+
+// extractTar safely extracts a tar stream into dir, rejecting path escapes.
+func extractTar(r io.Reader, dir string) error {
+	tr := tar.NewReader(r)
+	entries := 0
+	var total int64
+	for {
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if entries++; entries > maxTarEntries {
+			return fmt.Errorf("archive has too many entries")
+		}
+
+		name := filepath.Clean(hdr.Name)
+		if name == "." {
+			continue
+		}
+		if strings.HasPrefix(name, "..") || filepath.IsAbs(name) {
+			return fmt.Errorf("archive entry %q escapes extraction dir", hdr.Name)
+		}
+		target := filepath.Join(dir, name)
+
+		switch hdr.Typeflag {
+		case tar.TypeDir:
+			if err := os.MkdirAll(target, os.FileMode(hdr.Mode)&0o777|0o700); err != nil {
+				return err
+			}
+		case tar.TypeReg:
+			if total += hdr.Size; total > maxTarSize {
+				return fmt.Errorf("archive exceeds size limit")
+			}
+			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+				return err
+			}
+			out, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, os.FileMode(hdr.Mode)&0o777)
+			if err != nil {
+				return err
+			}
+			if _, err := io.Copy(out, tr); err != nil { // #nosec G110 -- size capped above
+				out.Close()
+				return err
+			}
+			if err := out.Close(); err != nil {
+				return err
+			}
+		case tar.TypeSymlink:
+			// Reject absolute or escaping link targets.
+			if filepath.IsAbs(hdr.Linkname) {
+				return fmt.Errorf("archive symlink %q has absolute target %q", hdr.Name, hdr.Linkname)
+			}
+			joined := filepath.Clean(filepath.Join(filepath.Dir(name), hdr.Linkname))
+			if strings.HasPrefix(joined, "..") {
+				return fmt.Errorf("archive symlink %q escapes extraction dir", hdr.Name)
+			}
+			os.Remove(target)
+			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+				return err
+			}
+			if err := os.Symlink(hdr.Linkname, target); err != nil {
+				return err
+			}
+		case tar.TypeLink:
+			linkSrc := filepath.Join(dir, filepath.Clean(hdr.Linkname))
+			if !strings.HasPrefix(linkSrc, filepath.Clean(dir)+string(os.PathSeparator)) {
+				return fmt.Errorf("archive hardlink %q escapes extraction dir", hdr.Name)
+			}
+			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+				return err
+			}
+			os.Remove(target)
+			if err := os.Link(linkSrc, target); err != nil {
+				return err
+			}
+		default:
+			// FIFOs/devices inside checkpoint archives are unexpected; skip.
+		}
+	}
+}

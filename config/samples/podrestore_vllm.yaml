@@ -1,0 +1,36 @@
+apiVersion: podsnapshot.io/v1alpha1
+kind: PodRestore
+metadata:
+  name: vllm-demo-restore
+  namespace: default
+spec:
+  # Point at a tar artifact directly...
+  artifactURI: fuse:///snapshots/default/vllm-demo-snap/vllm.tar
+  # ...or reference the PodSnapshot instead:
+  # snapshotRef:
+  #   name: vllm-demo-snap
+
+  # The template MUST use the same image as the checkpointed container and
+  # request the same GPU count. Its command is replaced by a keeper process;
+  # the restored workload joins this pod's network/IPC namespaces, so the
+  # readiness probe below turns Ready when the restored vLLM server answers.
+  podTemplate:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: vllm
+          image: vllm/vllm-openai:v0.9.2
+          ports:
+            - containerPort: 8000
+          resources:
+            limits:
+              nvidia.com/gpu: "1"
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            periodSeconds: 5
+
+  prewarm: true   # stream the tar through the fuse cache onto local NVMe first
+  pin: true       # pin the artifact against cache eviction during restore
+  timeoutSeconds: 900

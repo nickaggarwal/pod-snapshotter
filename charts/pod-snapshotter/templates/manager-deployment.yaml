@@ -1,0 +1,42 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pod-snapshotter-manager
+  namespace: {{ .Values.namespace }}
+  labels:
+    app: pod-snapshotter-manager
+spec:
+  replicas: {{ .Values.manager.replicas }}
+  selector:
+    matchLabels:
+      app: pod-snapshotter-manager
+  template:
+    metadata:
+      labels:
+        app: pod-snapshotter-manager
+    spec:
+      serviceAccountName: pod-snapshotter-manager
+      containers:
+        - name: manager
+          image: "{{ .Values.manager.image.repository }}:{{ .Values.manager.image.tag }}"
+          imagePullPolicy: {{ .Values.manager.image.pullPolicy }}
+          args:
+            - --leader-elect={{ .Values.manager.leaderElect }}
+            - --kubelet-insecure-tls={{ .Values.manager.kubeletInsecureTLS }}
+            - --require-node-prereqs={{ .Values.manager.requireNodePrereqs }}
+            {{- if .Values.manager.fuseAPIEndpoint }}
+            - --fuse-api-endpoint={{ .Values.manager.fuseAPIEndpoint }}
+            {{- end }}
+          ports:
+            - name: metrics
+              containerPort: 8080
+          livenessProbe:
+            httpGet: {path: /healthz, port: 8082}
+            initialDelaySeconds: 15
+          readinessProbe:
+            httpGet: {path: /readyz, port: 8082}
+            initialDelaySeconds: 5
+          resources: {{- toYaml .Values.manager.resources | nindent 12 }}
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false

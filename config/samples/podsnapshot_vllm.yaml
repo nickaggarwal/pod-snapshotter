@@ -1,0 +1,13 @@
+apiVersion: podsnapshot.io/v1alpha1
+kind: PodSnapshot
+metadata:
+  name: vllm-demo-snap
+  namespace: default
+spec:
+  podName: vllm-demo
+  container: vllm
+  # Defaults to fuse:///snapshots/default/vllm-demo-snap/vllm.tar
+  # artifactURI: fuse:///snapshots/default/vllm-demo-snap/vllm.tar
+  deletionPolicy: Retain
+  # VRAM copy + CRIU dump for a small model; raise for big models.
+  timeoutSeconds: 300

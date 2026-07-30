@@ -1,0 +1,92 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ .Values.namespace }}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: pod-snapshotter-manager
+  namespace: {{ .Values.namespace }}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: pod-snapshotter-agent
+  namespace: {{ .Values.namespace }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: pod-snapshotter-manager
+rules:
+  - apiGroups: [""]
+    resources: [events]
+    verbs: [create, patch]
+  - apiGroups: [""]
+    resources: [nodes]
+    verbs: [get, list, watch]
+  # The kubelet authorizes checkpoint calls via SubjectAccessReview on
+  # nodes/proxy (verb create).
+  - apiGroups: [""]
+    resources: [nodes/proxy]
+    verbs: [get, create]
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [get, list, watch, create, delete]
+  - apiGroups: [podsnapshot.io]
+    resources: [podsnapshots, podrestores]
+    verbs: [get, list, watch, create, update, patch, delete]
+  - apiGroups: [podsnapshot.io]
+    resources: [podsnapshots/status, podrestores/status]
+    verbs: [get, update, patch]
+  - apiGroups: [podsnapshot.io]
+    resources: [podsnapshots/finalizers, podrestores/finalizers]
+    verbs: [update]
+  - apiGroups: [coordination.k8s.io]
+    resources: [leases]
+    verbs: [get, list, watch, create, update, patch, delete]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: pod-snapshotter-agent
+rules:
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [get, list, watch]
+  - apiGroups: [""]
+    resources: [nodes]
+    verbs: [get, list, watch, patch]
+  - apiGroups: [podsnapshot.io]
+    resources: [podsnapshots, podrestores]
+    verbs: [get, list, watch]
+  - apiGroups: [podsnapshot.io]
+    resources: [podsnapshots/status, podrestores/status]
+    verbs: [get, update, patch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: pod-snapshotter-manager
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: pod-snapshotter-manager
+subjects:
+  - kind: ServiceAccount
+    name: pod-snapshotter-manager
+    namespace: {{ .Values.namespace }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: pod-snapshotter-agent
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: pod-snapshotter-agent
+subjects:
+  - kind: ServiceAccount
+    name: pod-snapshotter-agent
+    namespace: {{ .Values.namespace }}

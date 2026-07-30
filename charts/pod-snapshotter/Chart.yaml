@@ -1,0 +1,9 @@
+apiVersion: v2
+name: pod-snapshotter
+description: >
+  Kubernetes operator that checkpoints running GPU (CUDA) pods via the kubelet
+  checkpoint API (CRIU + NVIDIA cuda-checkpoint) and restores them from tar
+  artifacts stored on the fuse-client distributed cache filesystem.
+type: application
+version: 0.1.0
+appVersion: "0.1.0"

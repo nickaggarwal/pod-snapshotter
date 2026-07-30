@@ -1,0 +1,28 @@
+# A sample CUDA inference pod to snapshot. The three /dev/nvidia* device
+# nodes are provided by the NVIDIA device plugin / container toolkit (CDI).
+apiVersion: v1
+kind: Pod
+metadata:
+  name: vllm-demo
+  namespace: default
+  labels:
+    app: vllm-demo
+spec:
+  restartPolicy: Never
+  containers:
+    - name: vllm
+      image: vllm/vllm-openai:v0.9.2
+      args:
+        - --model=Qwen/Qwen2.5-0.5B-Instruct
+        - --port=8000
+      ports:
+        - containerPort: 8000
+      resources:
+        limits:
+          nvidia.com/gpu: "1"
+      readinessProbe:
+        httpGet:
+          path: /health
+          port: 8000
+        initialDelaySeconds: 20
+        periodSeconds: 5
