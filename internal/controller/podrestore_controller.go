@@ -125,7 +125,9 @@ func (r *PodRestoreReconciler) reconcilePending(ctx context.Context, restore *sn
 		return r.fail(ctx, restore, err.Error())
 	}
 
-	if r.Artifacts != nil {
+	// file:// artifacts are node-local — the manager cannot see them, only
+	// the agent on the target node can (it re-checks before restoring).
+	if r.Artifacts != nil && uri.Scheme != artifact.SchemeFile {
 		if _, err := r.Artifacts.Stat(ctx, uri); err != nil {
 			setCondition(&restore.Status.Conditions, snapv1.ConditionArtifactAvailable, metav1.ConditionFalse, "NotFound", err.Error())
 			restore.Status.Message = fmt.Sprintf("artifact not available yet: %v", err)
@@ -184,6 +186,17 @@ func (r *PodRestoreReconciler) reconcilePreparing(ctx context.Context, restore *
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 	} else if err != nil {
 		return ctrl.Result{}, err
+	}
+
+	// A pod with our name may be a leftover from a previous PodRestore of
+	// the same name (still terminating). Never adopt it: wait for it to go
+	// away, then create our own.
+	if !metav1.IsControlledBy(&pod, restore) || pod.DeletionTimestamp != nil {
+		restore.Status.Message = fmt.Sprintf("waiting for stale placeholder pod %s to terminate", pod.Name)
+		if err := r.Status().Update(ctx, restore); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 	}
 
 	switch pod.Status.Phase {

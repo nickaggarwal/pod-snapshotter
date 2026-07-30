@@ -8,6 +8,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"os"
+	"path"
+	"strings"
 	"time"
 
 	"google.golang.org/grpc"
@@ -31,6 +34,14 @@ type SandboxInfo struct {
 	// `sleep`, so the restored workload reuses this rootfs (with
 	// rootfs-diff.tar applied on top) instead of preparing a new snapshot.
 	KeeperRootfs string
+	// KeeperMounts maps destination -> source from the keeper's OCI config.
+	// Runtime-generated mount sources (nvidia-ctk hook files, etc.) for the
+	// NEW pod live here; the spec rewriter borrows them when the old spec's
+	// source has vanished with the old pod.
+	KeeperMounts map[string]string
+	// PodCgroupPath is the placeholder pod's cgroup (v2) path, e.g.
+	// /kubepods.slice/kubepods-burstable.slice/kubepods-...-pod<uid>.slice
+	PodCgroupPath string
 }
 
 // Resolver queries the CRI runtime service.
@@ -130,11 +141,53 @@ func (r *Resolver) Resolve(ctx context.Context, podUID, keeperContainerName stri
 		return nil, fmt.Errorf("keeper container %q not running in sandbox %s", keeperContainerName, sb.Id)
 	}
 
-	// The keeper's rootfs as seen through /proc on the host: valid while the
-	// keeper lives, which the placeholder pod guarantees during restore.
-	if info.KeeperPID > 0 {
-		info.KeeperRootfs = fmt.Sprintf("/proc/%d/root", info.KeeperPID)
+	// The keeper's rootfs: containerd v2 task bundles live at a fixed path
+	// keyed by container id. runc requires a real absolute path (it rejects
+	// /proc/<pid>/root, which is a magic symlink).
+	if info.KeeperContainerID != "" {
+		p := fmt.Sprintf("/run/containerd/io.containerd.runtime.v2.task/k8s.io/%s/rootfs", info.KeeperContainerID)
+		if _, err := os.Stat(p); err == nil {
+			info.KeeperRootfs = p
+		} else if info.KeeperPID > 0 {
+			// Fallback for non-containerd layouts.
+			info.KeeperRootfs = fmt.Sprintf("/proc/%d/root", info.KeeperPID)
+		}
 	}
+	// The placeholder pod's real cgroup: parent of the keeper container's
+	// scope, read from host /proc (requires hostPID). Restored containers
+	// are placed here so they inherit the POD's limits (GPU/memory), not
+	// the agent's.
+	if info.KeeperPID > 0 {
+		if raw, err := os.ReadFile(fmt.Sprintf("/proc/%d/cgroup", info.KeeperPID)); err == nil {
+			for _, line := range strings.Split(strings.TrimSpace(string(raw)), "\n") {
+				// cgroup v2: "0::/kubepods.slice/.../cri-containerd-<id>.scope"
+				if rest, ok := strings.CutPrefix(line, "0::"); ok {
+					info.PodCgroupPath = path.Dir(rest)
+					break
+				}
+			}
+		}
+	}
+
+	// Keeper OCI config: destination->source of its mounts.
+	if info.KeeperContainerID != "" {
+		cfgPath := fmt.Sprintf("/run/containerd/io.containerd.runtime.v2.task/k8s.io/%s/config.json", info.KeeperContainerID)
+		if raw, err := os.ReadFile(cfgPath); err == nil {
+			var cfg struct {
+				Mounts []struct {
+					Destination string `json:"destination"`
+					Source      string `json:"source"`
+				} `json:"mounts"`
+			}
+			if json.Unmarshal(raw, &cfg) == nil {
+				info.KeeperMounts = make(map[string]string, len(cfg.Mounts))
+				for _, m := range cfg.Mounts {
+					info.KeeperMounts[m.Destination] = m.Source
+				}
+			}
+		}
+	}
+
 	// Namespace fallback: some runtimes omit the sandbox pid in verbose info.
 	if info.PausePID == 0 {
 		info.PausePID = info.KeeperPID

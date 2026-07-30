@@ -14,12 +14,17 @@ package restore
 
 import (
 	"archive/tar"
+	"bufio"
+	"compress/gzip"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
+	"syscall"
 )
 
 // Bundle is an unpacked checkpoint plus a prepared OCI bundle directory.
@@ -34,6 +39,79 @@ type Bundle struct {
 	SpecPath string
 	// ConfigDump is the parsed config.dump.
 	ConfigDump map[string]any
+	// NvidiaHookMounts are container mountpoints created by the NVIDIA
+	// container toolkit's device-node-modification hook (tmpfs files at
+	// /run/nvidia-ctk-hook<uuid>, bind-mounted over
+	// /proc/driver/nvidia/params). They are mounted OUTSIDE the OCI spec, so
+	// runc restore has no external mapping for them; the spec rewriter must
+	// add bind mounts so CRIU can map them. Extracted from dump.log.
+	NvidiaHookMounts []string
+}
+
+var nvidiaHookRe = regexp.MustCompile(`/run/nvidia-ctk-hook[0-9a-fA-F-]+`)
+
+// dumpMountRe matches CRIU dump.log mount records:
+//
+//	type ext4 source /dev/root mnt_id 2521 s_dev 0x800001 /usr/lib64/... @ ./usr/lib64/... flags ...
+var dumpMountRe = regexp.MustCompile(`type (\S+) source (\S+) mnt_id \d+ s_dev \S+ (\S+) @ \./(\S+) flags`)
+
+// ExtraMount is a mount present in the checkpointed container but absent
+// from its OCI spec (injected by runtime hooks like nvidia-ctk).
+type ExtraMount struct {
+	// ContainerPath is the in-container mountpoint (leading /).
+	ContainerPath string
+	// HostPath is the source path on the host root filesystem ("" for
+	// tmpfs and other non-host-backed mounts).
+	HostPath string
+	// FSType as recorded by CRIU (ext4, tmpfs, ...).
+	FSType string
+}
+
+// ScanExtraMounts parses dump.log for every mount CRIU recorded inside the
+// container. The caller diffs these against the OCI spec to find hook-
+// injected mounts that need explicit spec entries for restore.
+func ScanExtraMounts(dumpLogPath string) []ExtraMount {
+	raw, err := os.ReadFile(dumpLogPath)
+	if err != nil {
+		return nil
+	}
+	seen := map[string]bool{}
+	var out []ExtraMount
+	for _, m := range dumpMountRe.FindAllStringSubmatch(string(raw), -1) {
+		fsType, source, hostPath, containerPath := m[1], m[2], m[3], "/"+m[4]
+		if containerPath == "/." || seen[containerPath] {
+			continue
+		}
+		seen[containerPath] = true
+		em := ExtraMount{ContainerPath: containerPath, FSType: fsType}
+		// "source /dev/root ... <path>" records a bind from the host root
+		// fs; other block sources are similar. tmpfs has no host backing.
+		if fsType != "tmpfs" && source != "tmpfs" {
+			em.HostPath = hostPath
+		}
+		out = append(out, em)
+	}
+	return out
+}
+
+// scanNvidiaHookMounts extracts toolkit hook mountpoints from dump.log.
+func scanNvidiaHookMounts(dumpLogPath string) []string {
+	raw, err := os.ReadFile(dumpLogPath)
+	if err != nil {
+		return nil
+	}
+	seen := map[string]bool{}
+	var out []string
+	for _, m := range nvidiaHookRe.FindAllString(string(raw), -1) {
+		if !seen[m] {
+			seen[m] = true
+			out = append(out, m)
+		}
+	}
+	if len(out) > 0 && strings.Contains(string(raw), "/proc/driver/nvidia/params") {
+		out = append(out, "/proc/driver/nvidia/params")
+	}
+	return out
 }
 
 // maxTarEntries and maxTarSize guard against pathological archives.
@@ -76,7 +154,10 @@ func Unpack(tarPath, workDir, rootfsDir string) (*Bundle, error) {
 		_ = json.Unmarshal(raw, &b.ConfigDump)
 	}
 
-	// Apply rootfs writes on top of the image rootfs.
+	b.NvidiaHookMounts = scanNvidiaHookMounts(filepath.Join(workDir, "dump.log"))
+
+	// Apply rootfs writes on top of the image rootfs. containerd 2.x writes
+	// this member gzip-compressed despite the .tar name; sniff the magic.
 	diff := filepath.Join(workDir, "rootfs-diff.tar")
 	if _, err := os.Stat(diff); err == nil && rootfsDir != "" {
 		df, err := os.Open(diff)
@@ -84,7 +165,24 @@ func Unpack(tarPath, workDir, rootfsDir string) (*Bundle, error) {
 			return nil, err
 		}
 		defer df.Close()
-		if err := extractTar(df, rootfsDir); err != nil {
+		var dr io.Reader = df
+		br := bufio.NewReader(df)
+		if magic, err := br.Peek(2); err == nil && magic[0] == 0x1f && magic[1] == 0x8b {
+			gz, err := gzip.NewReader(br)
+			if err != nil {
+				return nil, fmt.Errorf("opening gzipped rootfs-diff.tar: %w", err)
+			}
+			defer gz.Close()
+			dr = gz
+		} else {
+			dr = br
+		}
+		// tolerateReadOnly: the live rootfs contains read-only bind mounts
+		// injected by the runtime (NVIDIA CDI files like
+		// /etc/vulkan/icd.d/nvidia_icd.json, resolv.conf, etc.) that also
+		// show up in the diff; they are re-injected identically in the new
+		// pod, so EROFS on those paths is expected and safe to skip.
+		if err := extractTarOpts(dr, rootfsDir, true); err != nil {
 			return nil, fmt.Errorf("applying rootfs-diff.tar: %w", err)
 		}
 	}
@@ -97,6 +195,10 @@ func Unpack(tarPath, workDir, rootfsDir string) (*Bundle, error) {
 
 // extractTar safely extracts a tar stream into dir, rejecting path escapes.
 func extractTar(r io.Reader, dir string) error {
+	return extractTarOpts(r, dir, false)
+}
+
+func extractTarOpts(r io.Reader, dir string, tolerateReadOnly bool) error {
 	tr := tar.NewReader(r)
 	entries := 0
 	var total int64
@@ -135,6 +237,12 @@ func extractTar(r io.Reader, dir string) error {
 			}
 			out, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, os.FileMode(hdr.Mode)&0o777)
 			if err != nil {
+				if tolerateReadOnly && isReadOnlyErr(err) {
+					if _, err := io.Copy(io.Discard, tr); err != nil { // #nosec G110
+						return err
+					}
+					continue
+				}
 				return err
 			}
 			if _, err := io.Copy(out, tr); err != nil { // #nosec G110 -- size capped above
@@ -176,4 +284,31 @@ func extractTar(r io.Reader, dir string) error {
 			// FIFOs/devices inside checkpoint archives are unexpected; skip.
 		}
 	}
+}
+
+// OldPodUID extracts the checkpointed pod's UID from config.dump. containerd
+// names CRI containers "<container>_<pod>_<namespace>_<podUID>_<attempt>";
+// some runtimes also provide a sandbox object — try both.
+func OldPodUID(configDump map[string]any) string {
+	if configDump == nil {
+		return ""
+	}
+	if s, ok := configDump["sandbox"].(map[string]any); ok {
+		if uid, ok := s["uid"].(string); ok && uid != "" {
+			return uid
+		}
+	}
+	if name, ok := configDump["name"].(string); ok {
+		parts := strings.Split(name, "_")
+		if len(parts) >= 5 {
+			return parts[len(parts)-2]
+		}
+	}
+	return ""
+}
+
+// isReadOnlyErr reports EROFS/EPERM/EACCES-style failures from writing over
+// runtime-injected read-only mounts.
+func isReadOnlyErr(err error) bool {
+	return errors.Is(err, syscall.EROFS) || errors.Is(err, os.ErrPermission)
 }

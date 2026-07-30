@@ -53,12 +53,21 @@ spec:
             - name: fuse-mount
               mountPath: {{ .Values.agent.fuseMount }}
               mountPropagation: HostToContainer
-            - name: work-root
-              mountPath: {{ .Values.agent.workRoot }}
-            - name: cri-socket
-              mountPath: {{ .Values.agent.criSocket }}
+            # Parent dir: covers workRoot (restores/) AND node-local file://
+            # artifacts (artifacts/) so both survive agent pod restarts.
+            - name: state-root
+              mountPath: /var/lib/pod-snapshotter
+            # Whole runtime dir (not just the socket): the restore path needs
+            # the v2 task bundles' rootfs dirs for keeper rootfs resolution.
+            - name: containerd-run
+              mountPath: /run/containerd
+              mountPropagation: HostToContainer
             - name: fuse-client-run
               mountPath: /var/run/fuse-client
+            # Host /run (writable): restore recreates NVIDIA toolkit hook
+            # files (/run/nvidia-ctk-hook<uuid>) at their checkpointed paths.
+            - name: host-run
+              mountPath: /host-run
             - name: host-root
               mountPath: /host
               readOnly: true
@@ -70,12 +79,14 @@ spec:
           hostPath: {path: {{ .Values.agent.checkpointsDir }}, type: DirectoryOrCreate}
         - name: fuse-mount
           hostPath: {path: {{ .Values.agent.fuseMount }}, type: DirectoryOrCreate}
-        - name: work-root
-          hostPath: {path: {{ .Values.agent.workRoot }}, type: DirectoryOrCreate}
-        - name: cri-socket
-          hostPath: {path: {{ .Values.agent.criSocket }}, type: Socket}
+        - name: state-root
+          hostPath: {path: /var/lib/pod-snapshotter, type: DirectoryOrCreate}
+        - name: containerd-run
+          hostPath: {path: /run/containerd, type: Directory}
         - name: fuse-client-run
           hostPath: {path: /var/run/fuse-client, type: DirectoryOrCreate}
+        - name: host-run
+          hostPath: {path: /run, type: Directory}
         - name: host-root
           hostPath: {path: /, type: Directory}
         - name: kubelet-pods

@@ -1,0 +1,126 @@
+{{- if .Values.nodeSetup.enabled }}
+# Per-node host setup for checkpoint/restore prerequisites.
+#
+# containerd requires CRIU >= 3.16 on the host for CRI CheckpointContainer;
+# runc reads /etc/criu/runc.conf. AKS/EKS/GKE node images do not ship CRIU,
+# so this privileged DaemonSet nsenters the host mount namespace, installs
+# CRIU from the distro repo if absent (apt or dnf), and writes runc.conf with
+# tcp-established + link-remap. It then sleeps; the pod restarts (and
+# re-verifies, idempotently) on node reboot or image upgrade.
+#
+# GPU nodes additionally need cuda-checkpoint and the CRIU CUDA plugin —
+# install those via your GPU node image / driver installer (see
+# docs/prerequisites.md); the agent's prereq checker reports both.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: pod-snapshotter-node-setup
+  namespace: {{ .Values.namespace }}
+  labels:
+    app: pod-snapshotter-node-setup
+spec:
+  selector:
+    matchLabels:
+      app: pod-snapshotter-node-setup
+  template:
+    metadata:
+      labels:
+        app: pod-snapshotter-node-setup
+    spec:
+      {{- with .Values.agent.nodeSelector }}
+      nodeSelector: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.agent.tolerations }}
+      tolerations: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      hostPID: true
+      restartPolicy: Always
+      containers:
+        - name: setup
+          image: {{ .Values.nodeSetup.image }}
+          securityContext:
+            privileged: true
+          resources:
+            requests: {cpu: 10m, memory: 64Mi}
+            # apt/dnf run in the host mount ns but are accounted to this
+            # cgroup; package installs need real headroom.
+            limits: {memory: 512Mi}
+          command:
+            - nsenter
+            - -t
+            - "1"
+            - -m
+            - -p
+            - --
+            - sh
+            - -c
+            - |
+              set -e
+              export DEBIAN_FRONTEND=noninteractive
+              GPU=0; [ -e /dev/nvidiactl ] && GPU=1
+
+              # CRIU. GPU nodes need >= 4.0 (CUDA plugin); distro packages
+              # may be 3.x, so on apt systems prefer the CRIU team PPA.
+              NEED_CRIU=0
+              if ! command -v criu >/dev/null 2>&1; then
+                NEED_CRIU=1
+              elif [ "$GPU" = "1" ] && criu --version | head -1 | grep -q 'Version: 3'; then
+                NEED_CRIU=1
+              fi
+              if [ "$NEED_CRIU" = "1" ]; then
+                if command -v apt-get >/dev/null 2>&1; then
+                  if [ "$GPU" = "1" ]; then
+                    command -v add-apt-repository >/dev/null 2>&1 || \
+                      apt-get update -qq && apt-get install -y -qq software-properties-common
+                    add-apt-repository -y ppa:criu/ppa || true
+                  fi
+                  apt-get update -qq && apt-get install -y -qq criu
+                elif command -v dnf >/dev/null 2>&1; then
+                  dnf install -y -q criu
+                else
+                  echo "unsupported package manager; install CRIU manually" >&2
+                  exit 1
+                fi
+              fi
+
+              # cuda-checkpoint (GPU nodes): standalone binary from NVIDIA.
+              if [ "$GPU" = "1" ] && ! command -v cuda-checkpoint >/dev/null 2>&1; then
+                curl -fsSL -o /usr/local/bin/cuda-checkpoint \
+                  {{ .Values.nodeSetup.cudaCheckpointURL }} && \
+                  chmod +x /usr/local/bin/cuda-checkpoint || \
+                  echo "WARN: cuda-checkpoint download failed; install manually" >&2
+              fi
+
+              mkdir -p /etc/criu
+              grep -q '^tcp-established$' /etc/criu/runc.conf 2>/dev/null || \
+                printf 'tcp-established\nlink-remap\n' > /etc/criu/runc.conf
+
+              # NVIDIA container toolkit >= 1.17 injects a
+              # "disable-device-node-modification" hook that masks
+              # /proc/driver/nvidia/params via a tmpfs file mounted from
+              # /run/nvidia-ctk-hook<uuid>. That per-container mount is
+              # recorded in CRIU images but cannot be mapped at restore
+              # ("No mapping for N:(null) mountpoint"), so checkpoint nodes
+              # must turn the hook OFF: features.disable-device-node-
+              # modification = false (the flag enables the hook when true;
+              # toolkit >= 1.19 defaults it on). Pods created BEFORE this
+              # change must be recreated to be checkpointable.
+              # GPU nodes must run the NVIDIA container runtime in CDI mode.
+              # In the default/legacy mode libnvidia-container bind-mounts
+              # dozens of driver files (libcuda, libglxserver_nvidia, ...)
+              # into the container OUTSIDE the OCI spec; CRIU records those
+              # mounts but runc restore has no mapping for them ("No mapping
+              # for N:(null) mountpoint"). In CDI mode every injection is
+              # written INTO the OCI spec, so it lands in the checkpoint's
+              # spec.dump and restores cleanly. Pods created before the
+              # switch must be recreated to be checkpointable.
+              if [ "$GPU" = "1" ] && command -v nvidia-ctk >/dev/null 2>&1; then
+                mkdir -p /etc/cdi
+                nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml
+                nvidia-ctk config --set nvidia-container-runtime.mode=cdi --in-place
+                echo "nvidia-container-runtime: CDI mode enabled ($(grep -c 'name:' /etc/cdi/nvidia.yaml) CDI entries)"
+              fi
+
+              echo "node setup ok: $(criu --version | head -1) gpu=$GPU"
+              exec sleep infinity
+{{- end }}

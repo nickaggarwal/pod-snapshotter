@@ -126,3 +126,17 @@ func TestUnpackAppliesRootfsDiff(t *testing.T) {
 		t.Errorf("rootfs-diff not applied: %v", err)
 	}
 }
+
+func TestOldPodUID(t *testing.T) {
+	fromName := map[string]any{"name": "counter_gpu-counter_default_2c0f4544-4fb4-489b-bbb0-cc9ebf848ecf_0"}
+	if got := OldPodUID(fromName); got != "2c0f4544-4fb4-489b-bbb0-cc9ebf848ecf" {
+		t.Errorf("OldPodUID from name = %q", got)
+	}
+	fromSandbox := map[string]any{"sandbox": map[string]any{"uid": "abc-123"}}
+	if got := OldPodUID(fromSandbox); got != "abc-123" {
+		t.Errorf("OldPodUID from sandbox = %q", got)
+	}
+	if got := OldPodUID(nil); got != "" {
+		t.Errorf("OldPodUID(nil) = %q", got)
+	}
+}

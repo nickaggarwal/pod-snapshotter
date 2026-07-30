@@ -2,9 +2,11 @@ package restore
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path"
+	"regexp"
 	"strings"
 
 	rspec "github.com/opencontainers/runtime-spec/specs-go"
@@ -25,7 +27,33 @@ type SandboxTarget struct {
 	CgroupsPath string
 	// RootfsPath overrides the spec root path (the prepared rootfs).
 	RootfsPath string
+	// SandboxID of the NEW placeholder sandbox. Mount sources under
+	// containerd's per-sandbox dirs (.../sandboxes/<64-hex>/hostname, shm,
+	// resolv.conf) are rewritten from the old sandbox id to this one.
+	SandboxID string
+	// KeeperMounts (destination -> source) from the NEW keeper container's
+	// OCI config. Last-resort remap for runtime-generated sources (e.g.
+	// /run/nvidia-ctk-hook<uuid> files) that died with the old pod.
+	KeeperMounts map[string]string
+	// NvidiaHookMounts: container mountpoints of the toolkit's params-
+	// masking hook found in the checkpoint (see Bundle.NvidiaHookMounts).
+	// For each, a bind mount is appended to the spec so runc passes CRIU an
+	// external mount mapping; PrepareNvidiaHookFiles must have created the
+	// host-side sources first.
+	NvidiaHookMounts []string
+	// ExtraMounts: every mount CRIU recorded in the checkpointed container
+	// (from dump.log). Entries missing from the spec (hook-injected driver
+	// libs etc.) get bind entries added so restore can map them.
+	ExtraMounts []ExtraMount
+	// HostRoot is where the node's root filesystem is visible to THIS
+	// process (e.g. /host in the agent container). Host paths in the spec
+	// stay unprefixed — runc resolves them in the host mount namespace —
+	// but existence checks here must go through HostRoot.
+	HostRoot string
 }
+
+// sandboxDirRe matches containerd per-sandbox path components.
+var sandboxDirRe = regexp.MustCompile(`(/sandboxes/)[0-9a-f]{64}(/)`)
 
 // nsPath returns /proc/<pid>/ns/<kind>.
 func nsPath(pid int, kind string) string {
@@ -83,6 +111,31 @@ func RewriteSpec(specDumpPath, outPath string, target SandboxTarget) (*rspec.Spe
 	if target.CgroupsPath != "" {
 		spec.Linux.CgroupsPath = target.CgroupsPath
 	}
+
+	// Device cgroup: spec.dump carries only the CRI's default-deny rule —
+	// the runtime grants device access at create time (CDI/device plugin),
+	// outside the dumped spec. Replaying the deny-all here loads a BPF
+	// cgroup_device program that blocks /dev/nvidia*, and cuda-checkpoint
+	// then fails with "no CUDA-capable device is detected". Allow all
+	// devices; real isolation still comes from the mount list (only the
+	// dumped device nodes are bind-mounted in).
+	if spec.Linux.Resources == nil {
+		spec.Linux.Resources = &rspec.LinuxResources{}
+	}
+	spec.Linux.Resources.Devices = []rspec.LinuxDeviceCgroup{
+		{Allow: true, Access: "rwm"},
+	}
+
+	// The kubelet-applied AppArmor profile (cri-containerd.apparmor.d) is
+	// per-container-instance state the restore environment can't re-enter
+	// (CRIU pie: "can't write lsm profile -22"). Run unconfined — the
+	// keeper pod's own confinement still bounds the sandbox.
+	if spec.Process != nil {
+		spec.Process.ApparmorProfile = ""
+		if spec.Process.SelinuxLabel != "" {
+			spec.Process.SelinuxLabel = ""
+		}
+	}
 	if target.RootfsPath != "" {
 		if spec.Root == nil {
 			spec.Root = &rspec.Root{}
@@ -98,6 +151,25 @@ func RewriteSpec(specDumpPath, outPath string, target SandboxTarget) (*rspec.Spe
 		if target.OldPodUID != "" && target.PodUID != "" && strings.HasPrefix(m.Source, oldPodPrefix) {
 			m.Source = newPodPrefix + strings.TrimPrefix(m.Source, oldPodPrefix)
 		}
+		// containerd sandbox-scoped files (hostname, resolv.conf, shm).
+		if target.SandboxID != "" {
+			m.Source = sandboxDirRe.ReplaceAllString(m.Source, "${1}"+target.SandboxID+"${2}")
+		}
+		// Kubelet volume dirs with generated names (projected serviceaccount
+		// tokens like kube-api-access-<rand>) differ per pod instance; remap
+		// to the new pod's actual dir when the rewritten source is missing.
+		if strings.HasPrefix(m.Source, newPodPrefix) {
+			m.Source = resolveVolumeDir(m.Source)
+		}
+		// Any remaining bind source that vanished with the old pod: borrow
+		// the NEW keeper's source for the same destination.
+		if m.Type == "bind" || hasBindOption(m.Options) {
+			if _, err := os.Stat(m.Source); err != nil {
+				if src, ok := target.KeeperMounts[m.Destination]; ok && src != "" {
+					m.Source = src
+				}
+			}
+		}
 		// NVIDIA device nodes must stay private so CRIU's CUDA plugin can
 		// manage the mappings (cuda-checkpoint requirement).
 		if isNvidiaDevice(m.Destination) {
@@ -105,10 +177,143 @@ func RewriteSpec(specDumpPath, outPath string, target SandboxTarget) (*rspec.Spe
 		}
 	}
 
+	// NVIDIA toolkit hook mounts: the hook mounted these OUTSIDE the OCI
+	// spec at checkpoint time, so restore needs explicit spec entries for
+	// CRIU's external mount mapping. The tmpfs file lives at the SAME host
+	// path (recreated by PrepareNvidiaHookFiles); params is bind-mounted
+	// from it, mirroring what the hook did.
+	// Hook-injected mounts (NVIDIA toolkit driver libs, ctk hook tmpfs
+	// files): present in the checkpointed mount namespace but absent from
+	// spec.dump because a runtime hook — not the OCI spec — created them.
+	// Add bind entries so runc hands CRIU an external mapping for each.
+	// Mounts under /proc are skipped (runc rejects them; CRIU restores
+	// nested proc binds once their source mounts are mappable).
+	inSpec := map[string]bool{}
+	for _, m := range spec.Mounts {
+		inSpec[m.Destination] = true
+	}
+	for _, em := range target.ExtraMounts {
+		if inSpec[em.ContainerPath] || strings.HasPrefix(em.ContainerPath, "/proc/") {
+			continue
+		}
+		// tmpfs mounts (e.g. the nvidia-ctk hook's /run/nvidia-ctk-hook*)
+		// are NOT external: CRIU recreates them with contents from the
+		// image. They only need a directory mountpoint in the rootfs
+		// (PrepareHookMountpoints).
+		if em.FSType == "tmpfs" || em.HostPath == "" {
+			continue
+		}
+		if _, err := os.Stat(path.Join(target.HostRoot, em.HostPath)); err != nil {
+			continue
+		}
+		spec.Mounts = append(spec.Mounts, rspec.Mount{
+			Destination: em.ContainerPath,
+			Type:        "bind",
+			Source:      em.HostPath,
+			Options:     []string{"rbind", "rprivate", "ro", "nosuid", "nodev"},
+		})
+		inSpec[em.ContainerPath] = true
+	}
+
 	if err := writeJSON(outPath, &spec); err != nil {
 		return nil, err
 	}
 	return &spec, nil
+}
+
+// PrepareNvidiaHookFiles recreates the toolkit hook's host-side artifacts: a
+// copy of /proc/driver/nvidia/params with ModifyDeviceFiles forced to 0 at
+// each /run/nvidia-ctk-hook<uuid> path recorded in the checkpoint.
+// hostRunDir is the agent's mount of the HOST /run (the spec's sources are
+// resolved by runc in the host mount namespace).
+func PrepareNvidiaHookFiles(hookMounts []string, hostRunDir string) error {
+	var params []byte
+	for _, hm := range hookMounts {
+		if !strings.HasPrefix(hm, "/run/nvidia-ctk-hook") {
+			continue
+		}
+		if params == nil {
+			raw, err := os.ReadFile("/proc/driver/nvidia/params")
+			if err != nil {
+				return fmt.Errorf("reading /proc/driver/nvidia/params: %w", err)
+			}
+			params = []byte(strings.Replace(string(raw), "ModifyDeviceFiles: 1", "ModifyDeviceFiles: 0", 1))
+		}
+		dst := path.Join(hostRunDir, strings.TrimPrefix(hm, "/run/"))
+		// A directory may linger at this path from an earlier failed
+		// restore (runc auto-creates missing bind destinations as dirs).
+		if fi, err := os.Stat(dst); err == nil && fi.IsDir() {
+			_ = os.Remove(dst)
+		}
+		if err := os.WriteFile(dst, params, 0o444); err != nil && !errors.Is(err, os.ErrExist) {
+			return fmt.Errorf("writing hook params file %s: %w", dst, err)
+		}
+	}
+	return nil
+}
+
+// PrepareHookMountpoints pre-creates DIRECTORY mountpoints in the rootfs for
+// the hook's tmpfs mounts. CRIU recreates the tmpfs (with contents) itself;
+// it just needs a directory to mount on. A stale FILE at the path (from the
+// toolkit hook's own bind or an earlier restore attempt) is removed.
+func PrepareHookMountpoints(rootfsDir string, hookMounts []string) error {
+	for _, hm := range hookMounts {
+		if !strings.HasPrefix(hm, "/run/nvidia-ctk-hook") {
+			continue
+		}
+		dst := path.Join(rootfsDir, hm)
+		if fi, err := os.Stat(dst); err == nil && !fi.IsDir() {
+			if err := os.Remove(dst); err != nil {
+				return fmt.Errorf("removing stale file %s: %w", dst, err)
+			}
+		}
+		if err := os.MkdirAll(dst, 0o755); err != nil {
+			return fmt.Errorf("creating mountpoint dir %s: %w", dst, err)
+		}
+	}
+	return nil
+}
+
+func hasBindOption(opts []string) bool {
+	for _, o := range opts {
+		if o == "bind" || o == "rbind" {
+			return true
+		}
+	}
+	return false
+}
+
+// resolveVolumeDir returns src if it exists; otherwise, for paths like
+// .../volumes/kubernetes.io~projected/kube-api-access-abcde, it looks for a
+// sibling dir sharing the name's prefix up to the last '-' (the generated
+// suffix) and returns it when the match is unique.
+func resolveVolumeDir(src string) string {
+	if _, err := os.Stat(src); err == nil {
+		return src
+	}
+	dir, base := path.Split(src)
+	dash := strings.LastIndex(base, "-")
+	if dash <= 0 {
+		return src
+	}
+	prefix := base[:dash+1]
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return src
+	}
+	var match string
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), prefix) {
+			if match != "" {
+				return src // ambiguous; leave unchanged
+			}
+			match = e.Name()
+		}
+	}
+	if match == "" {
+		return src
+	}
+	return dir + match
 }
 
 // ValidateGPUDevices checks that every /dev/nvidia* mount in the spec exists

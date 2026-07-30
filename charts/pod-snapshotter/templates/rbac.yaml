@@ -26,10 +26,11 @@ rules:
   - apiGroups: [""]
     resources: [nodes]
     verbs: [get, list, watch]
-  # The kubelet authorizes checkpoint calls via SubjectAccessReview on
-  # nodes/proxy (verb create).
+  # The kubelet authorizes checkpoint calls via SubjectAccessReview. Kubelets
+  # map the /checkpoint endpoint to the "checkpoint" subresource (observed on
+  # AKS 1.32); older docs say "proxy" — grant both.
   - apiGroups: [""]
-    resources: [nodes/proxy]
+    resources: [nodes/proxy, nodes/checkpoint]
     verbs: [get, create]
   - apiGroups: [""]
     resources: [pods]

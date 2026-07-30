@@ -17,6 +17,12 @@ cloud tier (S3/Azure/GCS) automatically, and restores read through the
 3-tier cache — hot artifacts come from local NVMe or peer nodes, cold ones
 stream from cloud.
 
+**Verified end-to-end on AKS** (Ubuntu 24.04 GPU pool, A100, containerd 2.3,
+CRIU 4.2.1, driver 570): a PyTorch pod holding a ~2 GB CUDA tensor was
+checkpointed to a 3 GB tar and restored into a fresh placeholder pod — the
+process resumed exactly where it left off (its counter continued from the
+checkpointed value) with GPU memory re-attached by the CRIU CUDA plugin.
+
 ## How it works
 
 ```
@@ -105,7 +111,9 @@ failing checks) as a node annotation; the manager refuses to checkpoint on
 nodes that aren't ready. Checks: CRIU ≥ 4.1 + CUDA plugin, `cuda-checkpoint`
 on PATH, NVIDIA driver ≥ 570, `/etc/criu/runc.conf` with `tcp-established` +
 `link-remap`, kubelet `ContainerCheckpoint` feature gate (default-on ≥ 1.30),
-containerd ≥ 2.0 or CRI-O ≥ 1.25, fuse-client mounted at `/mnt/fuse`.
+**containerd ≥ 2.0** (1.7 lacks the CRI `CheckpointContainer` RPC — on AKS
+that means Ubuntu 24.04 node pools, not 22.04) or CRI-O ≥ 1.25, fuse-client
+mounted at `/mnt/fuse`.
 
 ## fuse-client integration
 

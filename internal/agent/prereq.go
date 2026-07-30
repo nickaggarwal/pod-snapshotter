@@ -102,6 +102,16 @@ func (p *PrereqChecker) checkAndPublish(ctx context.Context) {
 func (p *PrereqChecker) run(ctx context.Context) []string {
 	var failures []string
 
+	// Container runtime must implement CRI CheckpointContainer: containerd
+	// >= 2.0 or CRI-O >= 1.25. containerd 1.7 returns Unimplemented.
+	// Read from the Node object — no host access needed.
+	var node corev1.Node
+	if err := p.Client.Get(ctx, types.NamespacedName{Name: p.NodeName}, &node); err == nil {
+		if !runtimeSupportsCheckpoint(node.Status.NodeInfo.ContainerRuntimeVersion) {
+			failures = append(failures, "runtime-no-checkpoint-support")
+		}
+	}
+
 	// Fuse mount visible to the agent.
 	if p.FuseMount != "" {
 		if fi, err := os.Stat(p.FuseMount); err != nil || !fi.IsDir() {
@@ -196,6 +206,33 @@ func parseCriuVersion(out string) (major, minor int, ok bool) {
 	major, _ = strconv.Atoi(m[1])
 	minor, _ = strconv.Atoi(m[2])
 	return major, minor, true
+}
+
+// runtimeSupportsCheckpoint parses Node.status.nodeInfo.containerRuntimeVersion
+// (e.g. "containerd://1.7.30-2", "containerd://2.0.4", "cri-o://1.29.1") and
+// reports whether the runtime implements CRI CheckpointContainer.
+func runtimeSupportsCheckpoint(runtimeVersion string) bool {
+	name, ver, ok := strings.Cut(runtimeVersion, "://")
+	if !ok {
+		return false
+	}
+	parts := strings.SplitN(ver, ".", 3)
+	if len(parts) < 2 {
+		return false
+	}
+	major, err1 := strconv.Atoi(parts[0])
+	minor, err2 := strconv.Atoi(strings.TrimFunc(parts[1], func(r rune) bool { return r < '0' || r > '9' }))
+	if err1 != nil || err2 != nil {
+		return false
+	}
+	switch name {
+	case "containerd":
+		return major >= 2
+	case "cri-o":
+		return major > 1 || (major == 1 && minor >= 25)
+	default:
+		return false
+	}
 }
 
 func driverMajor(out string) int {

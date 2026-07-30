@@ -20,6 +20,16 @@ manager:
     requests: {cpu: 50m, memory: 128Mi}
     limits: {memory: 512Mi}
 
+# Host prerequisite installer: a privileged DaemonSet (same node scope as the
+# agent) that installs CRIU on each node via the distro package manager and
+# writes /etc/criu/runc.conf. Disable if your node image already ships CRIU
+# or you manage host config elsewhere.
+nodeSetup:
+  enabled: true
+  image: busybox:1.36
+  # NVIDIA's standalone checkpoint utility, installed on GPU nodes only.
+  cudaCheckpointURL: https://github.com/NVIDIA/cuda-checkpoint/raw/main/bin/x86_64_Linux/cuda-checkpoint
+
 agent:
   image:
     repository: pod-snapshotter/agent

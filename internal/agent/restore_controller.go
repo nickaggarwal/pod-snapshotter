@@ -42,6 +42,11 @@ type RestoreReconciler struct {
 	// WorkRoot is node-local scratch for bundles (default
 	// /var/lib/pod-snapshotter/restores).
 	WorkRoot string
+	// HostRunDir is where the HOST's /run is mounted in this container
+	// (for recreating nvidia toolkit hook files at their original paths).
+	HostRunDir string
+	// HostRoot is where the host's / is mounted (read-only) here.
+	HostRoot string
 
 	Resolver SandboxResolver
 	Runc     restore.RuncRunner
@@ -171,7 +176,21 @@ func (r *RestoreReconciler) restore(ctx context.Context, pr *snapv1.PodRestore) 
 		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 	}
 
+	// The keeper (and with it /proc/<pid>/root) can vanish between resolve
+	// and unpack if the placeholder pod is replaced; that's transient.
+	if sandbox.KeeperRootfs != "" {
+		if _, err := os.Stat(sandbox.KeeperRootfs); err != nil {
+			pr.Status.Message = fmt.Sprintf("keeper rootfs %s not ready: %v; retrying", sandbox.KeeperRootfs, err)
+			if uerr := r.Status().Update(ctx, pr); uerr != nil {
+				return ctrl.Result{}, uerr
+			}
+			return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+		}
+	}
+
 	workDir := filepath.Join(r.WorkRoot, string(pr.UID))
+	// Clean any partial state from a prior attempt before unpacking.
+	_ = os.RemoveAll(workDir)
 	// The keeper runs the same image as the checkpointed container; its live
 	// rootfs (with rootfs-diff.tar applied) is the restored workload's root.
 	bundle, err := restore.Unpack(tarPath, workDir, sandbox.KeeperRootfs)
@@ -179,13 +198,21 @@ func (r *RestoreReconciler) restore(ctx context.Context, pr *snapv1.PodRestore) 
 		return r.fail(ctx, pr, fmt.Sprintf("unpacking checkpoint: %v", err))
 	}
 
-	oldPodUID := ""
-	if b := bundle.ConfigDump; b != nil {
-		if s, ok := b["sandbox"].(map[string]any); ok {
-			if uid, ok := s["uid"].(string); ok {
-				oldPodUID = uid
-			}
+	oldPodUID := restore.OldPodUID(bundle.ConfigDump)
+
+	if len(bundle.NvidiaHookMounts) > 0 {
+		if err := restore.PrepareHookMountpoints(sandbox.KeeperRootfs, bundle.NvidiaHookMounts); err != nil {
+			return r.fail(ctx, pr, fmt.Sprintf("preparing hook mountpoints: %v", err))
 		}
+	}
+
+	// Place the restored container under the placeholder POD's cgroup so it
+	// inherits the pod's limits. An absolute cgroupfs path is required — a
+	// relative/systemd-style one makes runc nest under the agent's cgroup,
+	// whose small memory limit OOM-kills CRIU mid-restore.
+	cgPath := fmt.Sprintf("/snap-%s", pr.Name)
+	if sandbox.PodCgroupPath != "" {
+		cgPath = fmt.Sprintf("%s/snap-%s", sandbox.PodCgroupPath, pr.Name)
 	}
 
 	spec, err := restore.RewriteSpec(
@@ -195,8 +222,13 @@ func (r *RestoreReconciler) restore(ctx context.Context, pr *snapv1.PodRestore) 
 			PausePID:    sandbox.PausePID,
 			PodUID:      pr.Status.PodUID,
 			OldPodUID:   oldPodUID,
-			CgroupsPath: fmt.Sprintf("kubepods-pod%s.slice:snap:%s", pr.Status.PodUID, pr.Name),
-			RootfsPath:  sandbox.KeeperRootfs,
+			CgroupsPath: cgPath,
+			RootfsPath:       sandbox.KeeperRootfs,
+			SandboxID:        sandbox.SandboxID,
+			KeeperMounts:     sandbox.KeeperMounts,
+			NvidiaHookMounts: bundle.NvidiaHookMounts,
+			ExtraMounts:      restore.ScanExtraMounts(filepath.Join(workDir, "dump.log")),
+			HostRoot:         r.HostRoot,
 		},
 	)
 	if err != nil {

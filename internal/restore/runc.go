@@ -60,11 +60,14 @@ func NewHostRunc() *HostRunc {
 	}
 }
 
-func (h *HostRunc) command(ctx context.Context, args ...string) *exec.Cmd {
+// command builds: nsenter -t 1 -m -p -- runc [globalArgs] <args>.
+// Global flags (--root, --log, --log-format) must precede the subcommand.
+func (h *HostRunc) command(ctx context.Context, globalArgs []string, args ...string) *exec.Cmd {
 	full := append([]string{
 		"-t", strconv.Itoa(h.NsenterTarget), "-m", "-p", "--",
 		h.RuncBinary, "--root", h.RuncRoot,
-	}, args...)
+	}, globalArgs...)
+	full = append(full, args...)
 	return exec.CommandContext(ctx, "nsenter", full...)
 }
 
@@ -82,19 +85,39 @@ func (h *HostRunc) Restore(ctx context.Context, opts RestoreOpts) (int, error) {
 		"--image-path", opts.ImagePath,
 		"--work-path", opts.WorkPath,
 		"--pid-file", pidFile,
-		"--log", logFile,
-		"--log-format", "json",
 		"--detach",
 	}
+	// Note: --tcp-close is not in all runc builds; tcp behavior comes from
+	// /etc/criu/runc.conf (tcp-established). opts.TCPClose maps to
+	// tcp-close in a per-restore criu config when supported.
 	if opts.TCPClose {
-		args = append(args, "--tcp-close")
+		args = append(args, "--tcp-established=false")
 	}
+	// NOTE: no --lsm-profile flag. AppArmor rejects changeprofile into
+	// "unconfined" (EINVAL), so profile overrides cannot help here; instead
+	// the CHECKPOINTED pod must run AppArmor-unconfined
+	// (securityContext.appArmorProfile: Unconfined, k8s >= 1.30) so the
+	// CRIU image records no LSM state. See docs/prerequisites.md.
 	args = append(args, opts.ContainerID)
 
-	cmd := h.command(ctx, args...)
-	out, err := cmd.CombinedOutput()
+	cmd := h.command(ctx, []string{"--log", logFile, "--log-format", "json"}, args...)
+	// The detached container inherits runc's stdio: never hand it in-process
+	// pipes (CombinedOutput) — the restored workload keeps the write end open
+	// forever and the agent would block on EOF long after runc exits. Point
+	// stdio at a file instead; it doubles as the restored workload's log.
+	outPath := filepath.Join(opts.WorkPath, "restore-output.log")
+	outFile, err := os.OpenFile(outPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
 	if err != nil {
-		return 0, fmt.Errorf("runc restore failed: %w\noutput: %s\n%s", err, strings.TrimSpace(string(out)), tailFile(logFile, 4096))
+		return 0, fmt.Errorf("opening restore output log: %w", err)
+	}
+	cmd.Stdout = outFile
+	cmd.Stderr = outFile
+	cmd.Stdin = nil
+	runErr := cmd.Run()
+	outFile.Close()
+	if runErr != nil {
+		out, _ := os.ReadFile(outPath)
+		return 0, fmt.Errorf("runc restore failed: %w\noutput: %s\n%s", runErr, strings.TrimSpace(string(out)), tailFile(logFile, 4096))
 	}
 
 	raw, err := os.ReadFile(pidFile)
@@ -113,11 +136,11 @@ func (h *HostRunc) Kill(ctx context.Context, containerID string) error {
 	// Best-effort kill, then delete state.
 	killCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
-	_ = h.command(killCtx, "kill", containerID, "KILL").Run()
+	_ = h.command(killCtx, nil, "kill", containerID, "KILL").Run()
 
 	delCtx, cancel2 := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel2()
-	out, err := h.command(delCtx, "delete", "--force", containerID).CombinedOutput()
+	out, err := h.command(delCtx, nil, "delete", "--force", containerID).CombinedOutput()
 	if err != nil && !strings.Contains(string(out), "does not exist") {
 		return fmt.Errorf("runc delete %s: %w (%s)", containerID, err, strings.TrimSpace(string(out)))
 	}
@@ -126,7 +149,7 @@ func (h *HostRunc) Kill(ctx context.Context, containerID string) error {
 
 // State implements RuncRunner.
 func (h *HostRunc) State(ctx context.Context, containerID string) (bool, error) {
-	out, err := h.command(ctx, "state", containerID).CombinedOutput()
+	out, err := h.command(ctx, nil, "state", containerID).CombinedOutput()
 	if err != nil {
 		if strings.Contains(string(out), "does not exist") {
 			return false, nil
