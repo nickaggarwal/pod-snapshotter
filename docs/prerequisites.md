@@ -58,15 +58,19 @@ manager refuses to checkpoint pods on nodes not marked `ok`.
 
 > The Helm chart installs CRIU for you: the `nodeSetup` DaemonSet (enabled by
 > default, `nodeSetup.enabled=false` to opt out) installs CRIU from
-> `ppa:criu/ppa` on Ubuntu nodes (4.2+ with the CUDA plugin; the distro's own
-> 24.04 package is still 3.x), downloads NVIDIA's `cuda-checkpoint` binary,
-> writes `/etc/criu/runc.conf`, and switches the NVIDIA Container Toolkit to
-> CDI mode. On non-Ubuntu nodes it falls back to the distro package — GPU
-> checkpointing then needs a custom node image with CRIU ≥ 4.x.
+> `ppa:criu/ppa` on Ubuntu nodes — the PPA is required on **all** Ubuntu
+> 24.04 nodes, not just GPU ones: noble dropped `criu` from the archive
+> entirely ("no installation candidate" on AKS images). It also downloads
+> NVIDIA's `cuda-checkpoint` binary, writes `/etc/criu/runc.conf`, and
+> switches the NVIDIA Container Toolkit to CDI mode (GPU nodes only). On
+> non-Ubuntu nodes it falls back to the distro package — GPU checkpointing
+> then needs a custom node image with CRIU ≥ 4.x.
 
-- CRIU ≥ 4.1 (4.0 introduced the NVIDIA CUDA plugin; 4.1 has fixes).
-- The CUDA plugin (`cuda_plugin.so`) installed in CRIU's plugin dir
-  (`/usr/lib/criu/`, `/usr/lib64/criu/`, or `/usr/local/lib/criu/`).
+- GPU nodes: CRIU ≥ 4.1 (4.0 introduced the NVIDIA CUDA plugin; 4.1 fixes),
+  with `cuda_plugin.so` in CRIU's plugin dir (`/usr/lib/criu/`,
+  `/usr/lib64/criu/`, or `/usr/local/lib/criu/`).
+- CPU-only nodes: CRIU ≥ 3.16 suffices (containerd's floor); the agent's
+  prereq checker applies the matching threshold per node.
 - `criu check` should pass on the host.
 
 ## 4. NVIDIA

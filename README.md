@@ -31,6 +31,14 @@ the `fuse://` path: snapshot written to the FUSE mount on the source node,
 restore reading it through the target node's own mount via the distributed
 cache (peer/cloud tiers), no manual artifact copy.
 
+**CPU-only pods work as well** (verified on a D4as_v4 Ubuntu 24.04 pool): the
+pipeline is plain CRIU underneath — GPU handling is an extension that no-ops
+when the checkpoint has no NVIDIA state. A Python pod with a ~40 MB heap
+checkpointed in seconds and restored (via `fuse://`) resuming from the
+checkpointed counter. CPU nodes only need containerd ≥ 2.0, CRIU (the
+nodeSetup DaemonSet installs it), and the AppArmor-Unconfined workload
+setting; there is no driver/GPU matching constraint between nodes.
+
 ## How it works
 
 ```

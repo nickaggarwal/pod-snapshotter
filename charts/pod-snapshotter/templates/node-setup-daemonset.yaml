@@ -79,11 +79,12 @@ spec:
               fi
               if [ "$NEED_CRIU" = "1" ]; then
                 if command -v apt-get >/dev/null 2>&1; then
-                  if [ "$GPU" = "1" ]; then
-                    command -v add-apt-repository >/dev/null 2>&1 || \
-                      apt-get update -qq && apt-get install -y -qq software-properties-common
-                    add-apt-repository -y ppa:criu/ppa || true
-                  fi
+                  # The CRIU team PPA is needed on ALL Ubuntu nodes, not just
+                  # GPU: Ubuntu 24.04 (noble) dropped criu from the archive
+                  # entirely ("no installation candidate" on AKS images).
+                  command -v add-apt-repository >/dev/null 2>&1 || \
+                    { apt-get update -qq && apt-get install -y -qq software-properties-common; }
+                  add-apt-repository -y ppa:criu/ppa || true
                   apt-get update -qq && apt-get install -y -qq criu
                 elif command -v dnf >/dev/null 2>&1; then
                   dnf install -y -q criu
