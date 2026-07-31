@@ -46,7 +46,6 @@ func main() {
 		workRoot        string
 		criSocket       string
 		hostRoot        string
-		hostRunDir      string
 		skipHostChecks  bool
 	)
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8083", "Metrics endpoint address (0 to disable).")
@@ -59,7 +58,6 @@ func main() {
 	flag.StringVar(&workRoot, "work-root", "/var/lib/pod-snapshotter/restores", "Node-local scratch for restore bundles (hostPath mount).")
 	flag.StringVar(&criSocket, "cri-socket", "/run/containerd/containerd.sock", "CRI runtime socket.")
 	flag.StringVar(&hostRoot, "host-root", "", "Host filesystem mount for file checks (e.g. /host).")
-	flag.StringVar(&hostRunDir, "host-run-dir", "/host-run", "Mount of the host /run (writable) for recreating runtime hook files.")
 	flag.BoolVar(&skipHostChecks, "skip-host-checks", false, "Skip nsenter-based prereq checks (dev only).")
 
 	opts := zap.Options{Development: false}
@@ -107,14 +105,13 @@ func main() {
 		os.Exit(1)
 	}
 	restoreCtrl := &agent.RestoreReconciler{
-		Client:     mgr.GetClient(),
-		NodeName:   nodeName,
-		FuseMount:  fuseMount,
-		WorkRoot:   workRoot,
-		HostRunDir: hostRunDir,
-		HostRoot:   hostRoot,
-		Resolver:   resolver,
-		Runc:       restore.NewHostRunc(),
+		Client:    mgr.GetClient(),
+		NodeName:  nodeName,
+		FuseMount: fuseMount,
+		WorkRoot:  workRoot,
+		HostRoot:  hostRoot,
+		Resolver:  resolver,
+		Runc:      restore.NewHostRunc(),
 	}
 	if fuseAgentSocket != "" {
 		if pinner, err := fuseclient.DialSession(fuseAgentSocket); err != nil {

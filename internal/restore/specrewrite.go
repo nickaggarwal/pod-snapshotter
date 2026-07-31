@@ -2,7 +2,6 @@ package restore
 
 import (
 	"encoding/json"
-	"errors"
 	"fmt"
 	"os"
 	"path"
@@ -35,12 +34,6 @@ type SandboxTarget struct {
 	// OCI config. Last-resort remap for runtime-generated sources (e.g.
 	// /run/nvidia-ctk-hook<uuid> files) that died with the old pod.
 	KeeperMounts map[string]string
-	// NvidiaHookMounts: container mountpoints of the toolkit's params-
-	// masking hook found in the checkpoint (see Bundle.NvidiaHookMounts).
-	// For each, a bind mount is appended to the spec so runc passes CRIU an
-	// external mount mapping; PrepareNvidiaHookFiles must have created the
-	// host-side sources first.
-	NvidiaHookMounts []string
 	// ExtraMounts: every mount CRIU recorded in the checkpointed container
 	// (from dump.log). Entries missing from the spec (hook-injected driver
 	// libs etc.) get bind entries added so restore can map them.
@@ -132,9 +125,7 @@ func RewriteSpec(specDumpPath, outPath string, target SandboxTarget) (*rspec.Spe
 	// keeper pod's own confinement still bounds the sandbox.
 	if spec.Process != nil {
 		spec.Process.ApparmorProfile = ""
-		if spec.Process.SelinuxLabel != "" {
-			spec.Process.SelinuxLabel = ""
-		}
+		spec.Process.SelinuxLabel = ""
 	}
 	if target.RootfsPath != "" {
 		if spec.Root == nil {
@@ -177,11 +168,6 @@ func RewriteSpec(specDumpPath, outPath string, target SandboxTarget) (*rspec.Spe
 		}
 	}
 
-	// NVIDIA toolkit hook mounts: the hook mounted these OUTSIDE the OCI
-	// spec at checkpoint time, so restore needs explicit spec entries for
-	// CRIU's external mount mapping. The tmpfs file lives at the SAME host
-	// path (recreated by PrepareNvidiaHookFiles); params is bind-mounted
-	// from it, mirroring what the hook did.
 	// Hook-injected mounts (NVIDIA toolkit driver libs, ctk hook tmpfs
 	// files): present in the checkpointed mount namespace but absent from
 	// spec.dump because a runtime hook — not the OCI spec — created them.
@@ -196,11 +182,11 @@ func RewriteSpec(specDumpPath, outPath string, target SandboxTarget) (*rspec.Spe
 		if inSpec[em.ContainerPath] || strings.HasPrefix(em.ContainerPath, "/proc/") {
 			continue
 		}
-		// tmpfs mounts (e.g. the nvidia-ctk hook's /run/nvidia-ctk-hook*)
-		// are NOT external: CRIU recreates them with contents from the
-		// image. They only need a directory mountpoint in the rootfs
-		// (PrepareHookMountpoints).
-		if em.FSType == "tmpfs" || em.HostPath == "" {
+		// Mounts without host backing (tmpfs, e.g. the nvidia-ctk hook's
+		// /run/nvidia-ctk-hook*) are NOT external: CRIU recreates them with
+		// contents from the image. They only need a directory mountpoint in
+		// the rootfs (PrepareHookMountpoints).
+		if em.HostPath == "" {
 			continue
 		}
 		if _, err := os.Stat(path.Join(target.HostRoot, em.HostPath)); err != nil {
@@ -221,44 +207,13 @@ func RewriteSpec(specDumpPath, outPath string, target SandboxTarget) (*rspec.Spe
 	return &spec, nil
 }
 
-// PrepareNvidiaHookFiles recreates the toolkit hook's host-side artifacts: a
-// copy of /proc/driver/nvidia/params with ModifyDeviceFiles forced to 0 at
-// each /run/nvidia-ctk-hook<uuid> path recorded in the checkpoint.
-// hostRunDir is the agent's mount of the HOST /run (the spec's sources are
-// resolved by runc in the host mount namespace).
-func PrepareNvidiaHookFiles(hookMounts []string, hostRunDir string) error {
-	var params []byte
-	for _, hm := range hookMounts {
-		if !strings.HasPrefix(hm, "/run/nvidia-ctk-hook") {
-			continue
-		}
-		if params == nil {
-			raw, err := os.ReadFile("/proc/driver/nvidia/params")
-			if err != nil {
-				return fmt.Errorf("reading /proc/driver/nvidia/params: %w", err)
-			}
-			params = []byte(strings.Replace(string(raw), "ModifyDeviceFiles: 1", "ModifyDeviceFiles: 0", 1))
-		}
-		dst := path.Join(hostRunDir, strings.TrimPrefix(hm, "/run/"))
-		// A directory may linger at this path from an earlier failed
-		// restore (runc auto-creates missing bind destinations as dirs).
-		if fi, err := os.Stat(dst); err == nil && fi.IsDir() {
-			_ = os.Remove(dst)
-		}
-		if err := os.WriteFile(dst, params, 0o444); err != nil && !errors.Is(err, os.ErrExist) {
-			return fmt.Errorf("writing hook params file %s: %w", dst, err)
-		}
-	}
-	return nil
-}
-
 // PrepareHookMountpoints pre-creates DIRECTORY mountpoints in the rootfs for
 // the hook's tmpfs mounts. CRIU recreates the tmpfs (with contents) itself;
 // it just needs a directory to mount on. A stale FILE at the path (from the
 // toolkit hook's own bind or an earlier restore attempt) is removed.
 func PrepareHookMountpoints(rootfsDir string, hookMounts []string) error {
 	for _, hm := range hookMounts {
-		if !strings.HasPrefix(hm, "/run/nvidia-ctk-hook") {
+		if !strings.HasPrefix(hm, nvidiaHookPrefix) {
 			continue
 		}
 		dst := path.Join(rootfsDir, hm)

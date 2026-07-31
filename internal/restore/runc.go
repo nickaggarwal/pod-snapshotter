@@ -29,8 +29,8 @@ type RestoreOpts struct {
 	BundleDir   string // contains config.json (the rewritten spec)
 	ImagePath   string // CRIU images (checkpoint/ dir from the tar)
 	WorkPath    string // CRIU work/log dir
-	// TCPClose maps to CRIU --tcp-close: restore with established TCP
-	// connections closed instead of preserved (escape hatch when peers are
+	// TCPClose passes --tcp-established=false to runc restore: refuse to
+	// preserve established TCP connections (escape hatch when peers are
 	// gone; runc.conf's tcp-established handles the normal case).
 	TCPClose bool
 }
@@ -87,9 +87,8 @@ func (h *HostRunc) Restore(ctx context.Context, opts RestoreOpts) (int, error) {
 		"--pid-file", pidFile,
 		"--detach",
 	}
-	// Note: --tcp-close is not in all runc builds; tcp behavior comes from
-	// /etc/criu/runc.conf (tcp-established). opts.TCPClose maps to
-	// tcp-close in a per-restore criu config when supported.
+	// --tcp-close is not in all runc builds; --tcp-established=false is the
+	// portable spelling.
 	if opts.TCPClose {
 		args = append(args, "--tcp-established=false")
 	}
@@ -116,8 +115,9 @@ func (h *HostRunc) Restore(ctx context.Context, opts RestoreOpts) (int, error) {
 	runErr := cmd.Run()
 	outFile.Close()
 	if runErr != nil {
-		out, _ := os.ReadFile(outPath)
-		return 0, fmt.Errorf("runc restore failed: %w\noutput: %s\n%s", runErr, strings.TrimSpace(string(out)), tailFile(logFile, 4096))
+		// Tail only: the output file doubles as the restored workload's log
+		// and can be arbitrarily large; this error lands in the CR status.
+		return 0, fmt.Errorf("runc restore failed: %w\noutput tail: %s\nrunc log tail: %s", runErr, strings.TrimSpace(tailFile(outPath, 4096)), tailFile(logFile, 4096))
 	}
 
 	raw, err := os.ReadFile(pidFile)
@@ -177,5 +177,5 @@ func tailFile(p string, n int64) string {
 	if _, err := f.ReadAt(buf, off); err != nil {
 		return ""
 	}
-	return "criu log tail:\n" + string(buf)
+	return string(buf)
 }

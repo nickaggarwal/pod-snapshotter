@@ -42,9 +42,6 @@ type RestoreReconciler struct {
 	// WorkRoot is node-local scratch for bundles (default
 	// /var/lib/pod-snapshotter/restores).
 	WorkRoot string
-	// HostRunDir is where the HOST's /run is mounted in this container
-	// (for recreating nvidia toolkit hook files at their original paths).
-	HostRunDir string
 	// HostRoot is where the host's / is mounted (read-only) here.
 	HostRoot string
 
@@ -107,11 +104,7 @@ func (r *RestoreReconciler) prewarm(ctx context.Context, pr *snapv1.PodRestore) 
 	f, err := os.Open(hostPath)
 	if err != nil {
 		if os.IsNotExist(err) {
-			pr.Status.Message = fmt.Sprintf("artifact %s not yet visible on node %s; retrying", uri.String(), r.NodeName)
-			if uerr := r.Status().Update(ctx, pr); uerr != nil {
-				return ctrl.Result{}, uerr
-			}
-			return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+			return r.retryTransient(ctx, pr, fmt.Sprintf("artifact %s not yet visible on node %s; retrying", uri.String(), r.NodeName))
 		}
 		return ctrl.Result{}, err
 	}
@@ -156,11 +149,7 @@ func (r *RestoreReconciler) restore(ctx context.Context, pr *snapv1.PodRestore) 
 	}
 	tarPath := uri.HostPath(r.FuseMount)
 	if _, err := os.Stat(tarPath); err != nil {
-		pr.Status.Message = fmt.Sprintf("artifact not readable at %s: %v; retrying", tarPath, err)
-		if uerr := r.Status().Update(ctx, pr); uerr != nil {
-			return ctrl.Result{}, uerr
-		}
-		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+		return r.retryTransient(ctx, pr, fmt.Sprintf("artifact not readable at %s: %v; retrying", tarPath, err))
 	}
 
 	keeperName := pr.Spec.Container
@@ -169,22 +158,14 @@ func (r *RestoreReconciler) restore(ctx context.Context, pr *snapv1.PodRestore) 
 	}
 	sandbox, err := r.Resolver.Resolve(ctx, pr.Status.PodUID, keeperName)
 	if err != nil {
-		pr.Status.Message = fmt.Sprintf("resolving sandbox: %v; retrying", err)
-		if uerr := r.Status().Update(ctx, pr); uerr != nil {
-			return ctrl.Result{}, uerr
-		}
-		return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+		return r.retryTransient(ctx, pr, fmt.Sprintf("resolving sandbox: %v; retrying", err))
 	}
 
 	// The keeper (and with it /proc/<pid>/root) can vanish between resolve
 	// and unpack if the placeholder pod is replaced; that's transient.
 	if sandbox.KeeperRootfs != "" {
 		if _, err := os.Stat(sandbox.KeeperRootfs); err != nil {
-			pr.Status.Message = fmt.Sprintf("keeper rootfs %s not ready: %v; retrying", sandbox.KeeperRootfs, err)
-			if uerr := r.Status().Update(ctx, pr); uerr != nil {
-				return ctrl.Result{}, uerr
-			}
-			return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+			return r.retryTransient(ctx, pr, fmt.Sprintf("keeper rootfs %s not ready: %v; retrying", sandbox.KeeperRootfs, err))
 		}
 	}
 
@@ -210,25 +191,21 @@ func (r *RestoreReconciler) restore(ctx context.Context, pr *snapv1.PodRestore) 
 	// inherits the pod's limits. An absolute cgroupfs path is required — a
 	// relative/systemd-style one makes runc nest under the agent's cgroup,
 	// whose small memory limit OOM-kills CRIU mid-restore.
-	cgPath := fmt.Sprintf("/snap-%s", pr.Name)
-	if sandbox.PodCgroupPath != "" {
-		cgPath = fmt.Sprintf("%s/snap-%s", sandbox.PodCgroupPath, pr.Name)
-	}
+	cgPath := sandbox.PodCgroupPath + "/snap-" + pr.Name
 
 	spec, err := restore.RewriteSpec(
 		filepath.Join(workDir, "spec.dump"),
 		bundle.SpecPath,
 		restore.SandboxTarget{
-			PausePID:    sandbox.PausePID,
-			PodUID:      pr.Status.PodUID,
-			OldPodUID:   oldPodUID,
-			CgroupsPath: cgPath,
-			RootfsPath:       sandbox.KeeperRootfs,
-			SandboxID:        sandbox.SandboxID,
-			KeeperMounts:     sandbox.KeeperMounts,
-			NvidiaHookMounts: bundle.NvidiaHookMounts,
-			ExtraMounts:      restore.ScanExtraMounts(filepath.Join(workDir, "dump.log")),
-			HostRoot:         r.HostRoot,
+			PausePID:     sandbox.PausePID,
+			PodUID:       pr.Status.PodUID,
+			OldPodUID:    oldPodUID,
+			CgroupsPath:  cgPath,
+			RootfsPath:   sandbox.KeeperRootfs,
+			SandboxID:    sandbox.SandboxID,
+			KeeperMounts: sandbox.KeeperMounts,
+			ExtraMounts:  bundle.ExtraMounts,
+			HostRoot:     r.HostRoot,
 		},
 	)
 	if err != nil {
@@ -301,6 +278,17 @@ func (r *RestoreReconciler) teardown(ctx context.Context, pr *snapv1.PodRestore)
 	}
 	setCond(&pr.Status.Conditions, snapv1.ConditionTornDown, metav1.ConditionTrue, "TornDown", "")
 	return ctrl.Result{}, r.Status().Update(ctx, pr)
+}
+
+// retryTransient records msg on the status and requeues shortly — for
+// conditions expected to resolve on their own (artifact propagation, keeper
+// pod scheduling).
+func (r *RestoreReconciler) retryTransient(ctx context.Context, pr *snapv1.PodRestore, msg string) (ctrl.Result, error) {
+	pr.Status.Message = msg
+	if err := r.Status().Update(ctx, pr); err != nil {
+		return ctrl.Result{}, err
+	}
+	return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 }
 
 func (r *RestoreReconciler) fail(ctx context.Context, pr *snapv1.PodRestore, msg string) (ctrl.Result, error) {

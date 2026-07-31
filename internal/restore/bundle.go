@@ -15,6 +15,7 @@ package restore
 import (
 	"archive/tar"
 	"bufio"
+	"bytes"
 	"compress/gzip"
 	"encoding/json"
 	"errors"
@@ -46,9 +47,17 @@ type Bundle struct {
 	// runc restore has no external mapping for them; the spec rewriter must
 	// add bind mounts so CRIU can map them. Extracted from dump.log.
 	NvidiaHookMounts []string
+	// ExtraMounts is every mount CRIU recorded inside the checkpointed
+	// container (from dump.log). The spec rewriter diffs these against the
+	// OCI spec to find hook-injected mounts needing explicit spec entries.
+	ExtraMounts []ExtraMount
 }
 
-var nvidiaHookRe = regexp.MustCompile(`/run/nvidia-ctk-hook[0-9a-fA-F-]+`)
+// nvidiaHookPrefix is where the toolkit's device-node-modification hook
+// mounts its params-masking tmpfs files.
+const nvidiaHookPrefix = "/run/nvidia-ctk-hook"
+
+var nvidiaHookRe = regexp.MustCompile(regexp.QuoteMeta(nvidiaHookPrefix) + `[0-9a-fA-F-]+`)
 
 // dumpMountRe matches CRIU dump.log mount records:
 //
@@ -63,55 +72,42 @@ type ExtraMount struct {
 	// HostPath is the source path on the host root filesystem ("" for
 	// tmpfs and other non-host-backed mounts).
 	HostPath string
-	// FSType as recorded by CRIU (ext4, tmpfs, ...).
-	FSType string
 }
 
-// ScanExtraMounts parses dump.log for every mount CRIU recorded inside the
-// container. The caller diffs these against the OCI spec to find hook-
-// injected mounts that need explicit spec entries for restore.
-func ScanExtraMounts(dumpLogPath string) []ExtraMount {
+// scanDumpLog parses dump.log once, extracting every mount CRIU recorded
+// inside the container plus the NVIDIA toolkit hook mountpoints.
+func scanDumpLog(dumpLogPath string) (extra []ExtraMount, hookMounts []string) {
 	raw, err := os.ReadFile(dumpLogPath)
 	if err != nil {
-		return nil
+		return nil, nil
 	}
 	seen := map[string]bool{}
-	var out []ExtraMount
-	for _, m := range dumpMountRe.FindAllStringSubmatch(string(raw), -1) {
-		fsType, source, hostPath, containerPath := m[1], m[2], m[3], "/"+m[4]
+	for _, m := range dumpMountRe.FindAllSubmatch(raw, -1) {
+		fsType, source, hostPath, containerPath := string(m[1]), string(m[2]), string(m[3]), "/"+string(m[4])
 		if containerPath == "/." || seen[containerPath] {
 			continue
 		}
 		seen[containerPath] = true
-		em := ExtraMount{ContainerPath: containerPath, FSType: fsType}
+		em := ExtraMount{ContainerPath: containerPath}
 		// "source /dev/root ... <path>" records a bind from the host root
 		// fs; other block sources are similar. tmpfs has no host backing.
 		if fsType != "tmpfs" && source != "tmpfs" {
 			em.HostPath = hostPath
 		}
-		out = append(out, em)
+		extra = append(extra, em)
 	}
-	return out
-}
-
-// scanNvidiaHookMounts extracts toolkit hook mountpoints from dump.log.
-func scanNvidiaHookMounts(dumpLogPath string) []string {
-	raw, err := os.ReadFile(dumpLogPath)
-	if err != nil {
-		return nil
-	}
-	seen := map[string]bool{}
-	var out []string
-	for _, m := range nvidiaHookRe.FindAllString(string(raw), -1) {
-		if !seen[m] {
-			seen[m] = true
-			out = append(out, m)
+	hookSeen := map[string]bool{}
+	for _, m := range nvidiaHookRe.FindAll(raw, -1) {
+		s := string(m)
+		if !hookSeen[s] {
+			hookSeen[s] = true
+			hookMounts = append(hookMounts, s)
 		}
 	}
-	if len(out) > 0 && strings.Contains(string(raw), "/proc/driver/nvidia/params") {
-		out = append(out, "/proc/driver/nvidia/params")
+	if len(hookMounts) > 0 && bytes.Contains(raw, []byte("/proc/driver/nvidia/params")) {
+		hookMounts = append(hookMounts, "/proc/driver/nvidia/params")
 	}
-	return out
+	return extra, hookMounts
 }
 
 // maxTarEntries and maxTarSize guard against pathological archives.
@@ -154,7 +150,7 @@ func Unpack(tarPath, workDir, rootfsDir string) (*Bundle, error) {
 		_ = json.Unmarshal(raw, &b.ConfigDump)
 	}
 
-	b.NvidiaHookMounts = scanNvidiaHookMounts(filepath.Join(workDir, "dump.log"))
+	b.ExtraMounts, b.NvidiaHookMounts = scanDumpLog(filepath.Join(workDir, "dump.log"))
 
 	// Apply rootfs writes on top of the image rootfs. containerd 2.x writes
 	// this member gzip-compressed despite the .tar name; sniff the magic.
@@ -165,8 +161,8 @@ func Unpack(tarPath, workDir, rootfsDir string) (*Bundle, error) {
 			return nil, err
 		}
 		defer df.Close()
-		var dr io.Reader = df
 		br := bufio.NewReader(df)
+		var dr io.Reader = br
 		if magic, err := br.Peek(2); err == nil && magic[0] == 0x1f && magic[1] == 0x8b {
 			gz, err := gzip.NewReader(br)
 			if err != nil {
@@ -174,8 +170,6 @@ func Unpack(tarPath, workDir, rootfsDir string) (*Bundle, error) {
 			}
 			defer gz.Close()
 			dr = gz
-		} else {
-			dr = br
 		}
 		// tolerateReadOnly: the live rootfs contains read-only bind mounts
 		// injected by the runtime (NVIDIA CDI files like

@@ -13,10 +13,20 @@ import (
 	"strings"
 	"time"
 
+	rspec "github.com/opencontainers/runtime-spec/specs-go"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1"
 )
+
+// containerdTaskDir is where containerd v2 keeps CRI task bundles (rootfs,
+// config.json) keyed by container id. runc requires a real absolute rootfs
+// path (it rejects /proc/<pid>/root, which is a magic symlink).
+const containerdTaskDir = "/run/containerd/io.containerd.runtime.v2.task/k8s.io"
+
+func taskBundlePath(containerID, file string) string {
+	return path.Join(containerdTaskDir, containerID, file)
+}
 
 // SandboxInfo is what the restore pipeline needs from the CRI.
 type SandboxInfo struct {
@@ -141,16 +151,27 @@ func (r *Resolver) Resolve(ctx context.Context, podUID, keeperContainerName stri
 		return nil, fmt.Errorf("keeper container %q not running in sandbox %s", keeperContainerName, sb.Id)
 	}
 
-	// The keeper's rootfs: containerd v2 task bundles live at a fixed path
-	// keyed by container id. runc requires a real absolute path (it rejects
-	// /proc/<pid>/root, which is a magic symlink).
+	// The keeper's rootfs and OCI config from its containerd task bundle.
 	if info.KeeperContainerID != "" {
-		p := fmt.Sprintf("/run/containerd/io.containerd.runtime.v2.task/k8s.io/%s/rootfs", info.KeeperContainerID)
+		p := taskBundlePath(info.KeeperContainerID, "rootfs")
 		if _, err := os.Stat(p); err == nil {
 			info.KeeperRootfs = p
 		} else if info.KeeperPID > 0 {
 			// Fallback for non-containerd layouts.
 			info.KeeperRootfs = fmt.Sprintf("/proc/%d/root", info.KeeperPID)
+		}
+
+		// Keeper OCI config: destination->source of its mounts.
+		if raw, err := os.ReadFile(taskBundlePath(info.KeeperContainerID, "config.json")); err == nil {
+			var cfg struct {
+				Mounts []rspec.Mount `json:"mounts"`
+			}
+			if json.Unmarshal(raw, &cfg) == nil {
+				info.KeeperMounts = make(map[string]string, len(cfg.Mounts))
+				for _, m := range cfg.Mounts {
+					info.KeeperMounts[m.Destination] = m.Source
+				}
+			}
 		}
 	}
 	// The placeholder pod's real cgroup: parent of the keeper container's
@@ -164,25 +185,6 @@ func (r *Resolver) Resolve(ctx context.Context, podUID, keeperContainerName stri
 				if rest, ok := strings.CutPrefix(line, "0::"); ok {
 					info.PodCgroupPath = path.Dir(rest)
 					break
-				}
-			}
-		}
-	}
-
-	// Keeper OCI config: destination->source of its mounts.
-	if info.KeeperContainerID != "" {
-		cfgPath := fmt.Sprintf("/run/containerd/io.containerd.runtime.v2.task/k8s.io/%s/config.json", info.KeeperContainerID)
-		if raw, err := os.ReadFile(cfgPath); err == nil {
-			var cfg struct {
-				Mounts []struct {
-					Destination string `json:"destination"`
-					Source      string `json:"source"`
-				} `json:"mounts"`
-			}
-			if json.Unmarshal(raw, &cfg) == nil {
-				info.KeeperMounts = make(map[string]string, len(cfg.Mounts))
-				for _, m := range cfg.Mounts {
-					info.KeeperMounts[m.Destination] = m.Source
 				}
 			}
 		}

@@ -59,13 +59,23 @@ spec:
               export DEBIAN_FRONTEND=noninteractive
               GPU=0; [ -e /dev/nvidiactl ] && GPU=1
 
-              # CRIU. GPU nodes need >= 4.0 (CUDA plugin); distro packages
-              # may be 3.x, so on apt systems prefer the CRIU team PPA.
-              NEED_CRIU=0
-              if ! command -v criu >/dev/null 2>&1; then
-                NEED_CRIU=1
-              elif [ "$GPU" = "1" ] && criu --version | head -1 | grep -q 'Version: 3'; then
-                NEED_CRIU=1
+              # CRIU. Same thresholds the agent's prereq checker enforces:
+              # >= 4.1 on GPU nodes (CUDA plugin), >= 3.16 elsewhere
+              # (containerd's CheckpointContainer floor). Distro packages may
+              # be 3.x, so on apt systems prefer the CRIU team PPA.
+              NEED_CRIU=1
+              if command -v criu >/dev/null 2>&1; then
+                VER=$(criu --version 2>/dev/null | head -1 | grep -o '[0-9]*\.[0-9]*' | head -1)
+                MAJ=${VER%%.*}; MIN=${VER#*.}
+                if [ "$GPU" = "1" ]; then
+                  if [ "${MAJ:-0}" -gt 4 ] || { [ "${MAJ:-0}" -eq 4 ] && [ "${MIN:-0}" -ge 1 ]; }; then
+                    NEED_CRIU=0
+                  fi
+                else
+                  if [ "${MAJ:-0}" -gt 3 ] || { [ "${MAJ:-0}" -eq 3 ] && [ "${MIN:-0}" -ge 16 ]; }; then
+                    NEED_CRIU=0
+                  fi
+                fi
               fi
               if [ "$NEED_CRIU" = "1" ]; then
                 if command -v apt-get >/dev/null 2>&1; then

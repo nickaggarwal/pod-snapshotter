@@ -56,18 +56,14 @@ spec:
             # Parent dir: covers workRoot (restores/) AND node-local file://
             # artifacts (artifacts/) so both survive agent pod restarts.
             - name: state-root
-              mountPath: /var/lib/pod-snapshotter
+              mountPath: {{ dir .Values.agent.workRoot }}
             # Whole runtime dir (not just the socket): the restore path needs
             # the v2 task bundles' rootfs dirs for keeper rootfs resolution.
-            - name: containerd-run
-              mountPath: /run/containerd
+            - name: runtime-dir
+              mountPath: {{ dir .Values.agent.criSocket }}
               mountPropagation: HostToContainer
             - name: fuse-client-run
               mountPath: /var/run/fuse-client
-            # Host /run (writable): restore recreates NVIDIA toolkit hook
-            # files (/run/nvidia-ctk-hook<uuid>) at their checkpointed paths.
-            - name: host-run
-              mountPath: /host-run
             - name: host-root
               mountPath: /host
               readOnly: true
@@ -80,13 +76,11 @@ spec:
         - name: fuse-mount
           hostPath: {path: {{ .Values.agent.fuseMount }}, type: DirectoryOrCreate}
         - name: state-root
-          hostPath: {path: /var/lib/pod-snapshotter, type: DirectoryOrCreate}
-        - name: containerd-run
-          hostPath: {path: /run/containerd, type: Directory}
+          hostPath: {path: {{ dir .Values.agent.workRoot }}, type: DirectoryOrCreate}
+        - name: runtime-dir
+          hostPath: {path: {{ dir .Values.agent.criSocket }}, type: Directory}
         - name: fuse-client-run
           hostPath: {path: /var/run/fuse-client, type: DirectoryOrCreate}
-        - name: host-run
-          hostPath: {path: /run, type: Directory}
         - name: host-root
           hostPath: {path: /, type: Directory}
         - name: kubelet-pods

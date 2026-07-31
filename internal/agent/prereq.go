@@ -46,7 +46,13 @@ type PrereqChecker struct {
 	SkipHostChecks bool
 }
 
-var criuVersionRe = regexp.MustCompile(`Version:\s*(\d+)\.(\d+)`)
+var (
+	criuVersionRe = regexp.MustCompile(`Version:\s*(\d+)\.(\d+)`)
+	// nvidia-container-runtime config: mode = "cdi" in the
+	// [nvidia-container-runtime] section (nvidia-ctk config --set writes it
+	// with this exact shape).
+	nvidiaCDIModeRe = regexp.MustCompile(`(?m)^\s*mode\s*=\s*"cdi"`)
+)
 
 // Start runs the checker loop until ctx is done. Blocks; run in a goroutine
 // or via mgr.Add.
@@ -71,17 +77,18 @@ func (p *PrereqChecker) Start(ctx context.Context) error {
 
 func (p *PrereqChecker) checkAndPublish(ctx context.Context) {
 	logger := log.FromContext(ctx).WithName("prereq")
-	failures := p.run(ctx)
-
-	value := "ok"
-	if len(failures) > 0 {
-		value = strings.Join(failures, ",")
-	}
 
 	var node corev1.Node
 	if err := p.Client.Get(ctx, types.NamespacedName{Name: p.NodeName}, &node); err != nil {
 		logger.Error(err, "getting node")
 		return
+	}
+
+	failures := p.run(ctx, &node)
+
+	value := "ok"
+	if len(failures) > 0 {
+		value = strings.Join(failures, ",")
 	}
 	if node.Annotations[snapv1.PrereqsAnnotation] == value {
 		return
@@ -99,17 +106,14 @@ func (p *PrereqChecker) checkAndPublish(ctx context.Context) {
 }
 
 // run returns the list of failing check names.
-func (p *PrereqChecker) run(ctx context.Context) []string {
+func (p *PrereqChecker) run(ctx context.Context, node *corev1.Node) []string {
 	var failures []string
 
 	// Container runtime must implement CRI CheckpointContainer: containerd
 	// >= 2.0 or CRI-O >= 1.25. containerd 1.7 returns Unimplemented.
 	// Read from the Node object — no host access needed.
-	var node corev1.Node
-	if err := p.Client.Get(ctx, types.NamespacedName{Name: p.NodeName}, &node); err == nil {
-		if !runtimeSupportsCheckpoint(node.Status.NodeInfo.ContainerRuntimeVersion) {
-			failures = append(failures, "runtime-no-checkpoint-support")
-		}
+	if !runtimeSupportsCheckpoint(node.Status.NodeInfo.ContainerRuntimeVersion) {
+		failures = append(failures, "runtime-no-checkpoint-support")
 	}
 
 	// Fuse mount visible to the agent.
@@ -123,15 +127,23 @@ func (p *PrereqChecker) run(ctx context.Context) []string {
 		return failures
 	}
 
-	// CRIU version.
+	hasGPU := p.hostFileExists("/dev/nvidiactl")
+
+	// CRIU version: containerd needs >= 3.16 for CheckpointContainer; GPU
+	// checkpointing needs >= 4.1 (4.0 introduced the CUDA plugin, 4.1 fixes).
+	// The nodeSetup DaemonSet installs the PPA 4.x package on GPU nodes only,
+	// so hold CPU-only nodes to the lower bar.
 	if out, err := p.hostCommand(ctx, "criu", "--version"); err != nil {
 		failures = append(failures, "criu-missing")
-	} else if maj, min, ok := parseCriuVersion(out); !ok || maj < 4 || (maj == 4 && min < 1) {
+	} else if maj, min, ok := parseCriuVersion(out); !ok {
+		failures = append(failures, "criu-version-unparseable")
+	} else if hasGPU && (maj < 4 || (maj == 4 && min < 1)) {
 		failures = append(failures, "criu-version-lt-4.1")
+	} else if maj < 3 || (maj == 3 && min < 16) {
+		failures = append(failures, "criu-version-lt-3.16")
 	}
 
 	// CRIU CUDA plugin (well-known install paths).
-	hasGPU := p.hostFileExists("/dev/nvidiactl")
 	if hasGPU {
 		pluginFound := false
 		for _, path := range []string{
@@ -157,14 +169,18 @@ func (p *PrereqChecker) run(ctx context.Context) []string {
 		} else if major := driverMajor(out); major > 0 && major < 570 {
 			failures = append(failures, "nvidia-driver-lt-570")
 		}
+
+		// The toolkit must run in CDI mode: legacy mode injects driver-lib
+		// mounts outside the OCI spec and CRIU cannot map them at restore
+		// ("No mapping for N:(null) mountpoint"). nodeSetup switches the
+		// mode; verify it actually took effect.
+		if raw, err := os.ReadFile(p.hostPath("/etc/nvidia-container-runtime/config.toml")); err != nil || !nvidiaCDIModeRe.Match(raw) {
+			failures = append(failures, "nvidia-toolkit-not-cdi-mode")
+		}
 	}
 
 	// runc.conf directives.
-	confPath := "/etc/criu/runc.conf"
-	if p.HostRoot != "" {
-		confPath = p.HostRoot + confPath
-	}
-	if raw, err := os.ReadFile(confPath); err != nil {
+	if raw, err := os.ReadFile(p.hostPath("/etc/criu/runc.conf")); err != nil {
 		failures = append(failures, "criu-runc-conf-missing")
 	} else {
 		conf := string(raw)
@@ -190,11 +206,13 @@ func (p *PrereqChecker) hostCommand(ctx context.Context, name string, args ...st
 	return string(out), nil
 }
 
+// hostPath prefixes a host filesystem path with the HostRoot mount.
+func (p *PrereqChecker) hostPath(path string) string {
+	return p.HostRoot + path
+}
+
 func (p *PrereqChecker) hostFileExists(path string) bool {
-	if p.HostRoot != "" {
-		path = p.HostRoot + path
-	}
-	_, err := os.Stat(path)
+	_, err := os.Stat(p.hostPath(path))
 	return err == nil
 }
 
