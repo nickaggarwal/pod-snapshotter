@@ -133,6 +133,12 @@ CRIU/cuda-checkpoint restores require the target to match the source:
 Homogeneous GPU node pools satisfy this naturally. Use
 `spec.nodeSelector`/`spec.nodeName` on the PodRestore to steer placement.
 
+Cross-node restore is verified on AKS: an artifact checkpointed on one A100
+node of a pool restores cleanly on another node of the same pool (same VMSS
+image → same GPU/driver/CRIU). Note that `file://` artifacts are node-local
+— for cross-node restores the artifact must reach the target node, which is
+what the `fuse://` scheme (fuse-client distributed cache) is for.
+
 ## Failure annotations reference
 
 | Annotation value | Fix |

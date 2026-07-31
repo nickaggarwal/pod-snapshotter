@@ -18,10 +18,14 @@ cloud tier (S3/Azure/GCS) automatically, and restores read through the
 stream from cloud.
 
 **Verified end-to-end on AKS** (Ubuntu 24.04 GPU pool, A100, containerd 2.3,
-CRIU 4.2.1, driver 570): a PyTorch pod holding a ~2 GB CUDA tensor was
+CRIU 4.2.1, driver 580): a PyTorch pod holding a ~2 GB CUDA tensor was
 checkpointed to a 3 GB tar and restored into a fresh placeholder pod — the
 process resumed exactly where it left off (its counter continued from the
 checkpointed value) with GPU memory re-attached by the CRIU CUDA plugin.
+**Cross-node restore verified too**: the same artifact, checkpointed on one
+A100 node, restored onto a *different* node in the pool (identical GPU
+model, driver, and CRIU — see the environment-matching table in
+[docs/prerequisites.md](docs/prerequisites.md)).
 
 ## How it works
 
