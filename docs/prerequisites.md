@@ -95,8 +95,15 @@ manager refuses to checkpoint pods on nodes not marked `ok`.
 
 ## 5. fuse-client
 
-- The [fuse-client](../../fuse-client) DaemonSet running with its mount at
-  `/mnt/fuse` (configurable via `agent.fuseMount`).
+- The [fuse-cache](https://github.com/nickaggarwal/fuse-cache) client
+  DaemonSet running with its mount at `/mnt/fuse` (configurable via
+  `agent.fuseMount`). It must be scheduled on the GPU nodes too (add the
+  GPU pool to its node affinity and a `nvidia.com/gpu` toleration).
+  Size its memory limit for your artifact sizes — multi-GB checkpoint
+  tars buffer 4 MB chunks in flight on both the write (cloud persist)
+  and read (range-read) paths; an OOM-kill tears down the FUSE mount on
+  that node (verified: 4 Gi and 8 Gi limits both OOMed on 3 GB tars;
+  16 Gi held).
 - Its HTTP API reachable (default `127.0.0.1:8081` on each node via
   hostNetwork, and a `fuse-client` Service for the manager).
 - Optional but recommended: the fuse-client agent socket
@@ -136,8 +143,11 @@ Homogeneous GPU node pools satisfy this naturally. Use
 Cross-node restore is verified on AKS: an artifact checkpointed on one A100
 node of a pool restores cleanly on another node of the same pool (same VMSS
 image → same GPU/driver/CRIU). Note that `file://` artifacts are node-local
-— for cross-node restores the artifact must reach the target node, which is
-what the `fuse://` scheme (fuse-client distributed cache) is for.
+— for cross-node restores use the `fuse://` scheme
+([fuse-cache](https://github.com/nickaggarwal/fuse-cache) distributed
+cache), which is verified end-to-end: snapshot written to the source node's
+mount, restore streaming it through the target node's mount from the
+peer/cloud tiers.
 
 ## Failure annotations reference
 

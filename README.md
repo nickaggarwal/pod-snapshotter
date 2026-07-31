@@ -11,11 +11,12 @@ running CUDA container — GPU memory, CUDA contexts, process state — into a
 single tar archive. Restore memory-maps that state back instead of paying the
 disk→GPU model load and warmup cost.
 
-Artifacts are stored on the sibling [fuse-client](../fuse-client) distributed
-cache filesystem: snapshot tars written to the FUSE mount persist to the
-cloud tier (S3/Azure/GCS) automatically, and restores read through the
-3-tier cache — hot artifacts come from local NVMe or peer nodes, cold ones
-stream from cloud.
+Artifacts are stored on the
+[fuse-cache](https://github.com/nickaggarwal/fuse-cache) distributed cache
+filesystem: snapshot tars written to the FUSE mount persist to the cloud
+tier (S3/Azure/GCS) automatically, and restores read through the 3-tier
+cache — hot artifacts come from local NVMe or peer nodes, cold ones stream
+from cloud.
 
 **Verified end-to-end on AKS** (Ubuntu 24.04 GPU pool, A100, containerd 2.3,
 CRIU 4.2.1, driver 580): a PyTorch pod holding a ~2 GB CUDA tensor was
@@ -25,7 +26,10 @@ checkpointed value) with GPU memory re-attached by the CRIU CUDA plugin.
 **Cross-node restore verified too**: the same artifact, checkpointed on one
 A100 node, restored onto a *different* node in the pool (identical GPU
 model, driver, and CRIU — see the environment-matching table in
-[docs/prerequisites.md](docs/prerequisites.md)).
+[docs/prerequisites.md](docs/prerequisites.md)) — including fully through
+the `fuse://` path: snapshot written to the FUSE mount on the source node,
+restore reading it through the target node's own mount via the distributed
+cache (peer/cloud tiers), no manual artifact copy.
 
 ## How it works
 
