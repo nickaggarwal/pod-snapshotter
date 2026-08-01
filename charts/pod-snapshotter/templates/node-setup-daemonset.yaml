@@ -34,6 +34,12 @@ spec:
       tolerations: {{- toYaml . | nindent 8 }}
       {{- end }}
       hostPID: true
+      # hostNetwork so apt/dnf resolve DNS: nsenter into the host MOUNT ns
+      # makes /etc/resolv.conf the host's (often 127.0.0.53/systemd-resolved),
+      # which is unreachable from the pod netns — installs fail with
+      # "Temporary failure resolving" otherwise (hit on EKS Ubuntu 24.04).
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
       restartPolicy: Always
       containers:
         - name: setup
