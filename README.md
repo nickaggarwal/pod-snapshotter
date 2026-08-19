@@ -160,6 +160,30 @@ placeholder pod construction. GPU-dependent behavior (cuda-checkpoint, CRIU
 CUDA plugin, real restores) needs a GPU node — see
 [docs/testplan-gpu.md](docs/testplan-gpu.md).
 
+## Roadmap — v2 design
+
+[docs/design-v2.md](docs/design-v2.md) tracks the plan to close the gap with
+NVIDIA's [Dynamo Snapshot](https://developer.nvidia.com/blog/nvidia-dynamo-snapshot-fast-startup-for-inference-workloads-on-kubernetes/),
+which solves the same problem with a materially different set of trade-offs.
+In payoff order:
+
+1. **Image directories instead of tars** — `runc restore --image-path <dir>`
+   already wants a directory; the tar exists only because the kubelet
+   checkpoint API returns one. Dropping it removes the untar step from the
+   restore critical path entirely and enables parallel, overlapped prefetch.
+2. **Quiesce/resume hooks** (presence-file protocol) — checkpoint at a chosen
+   safe point after engine init but before the frontend starts. This is also
+   the fix for io_uring (never created at dump time) and for KV cache bloat
+   (`sleep()`/`torch_memory_saver` release the physical pages; NVIDIA measures
+   190 GiB → 6 GiB).
+3. **Snapshots as build artifacts** — one artifact per
+   (image, model, GPU SKU, driver, CRIU), built by a one-shot Job at
+   revision-publish time, restored by every scale-up. Quiesce is destructive,
+   so it cannot run on a serving replica.
+4. **Restore-side I/O parallelism** — `criu-image-streamer` (`--stream`) first,
+   since NVIDIA's threaded-memfd + native-AIO CRIU patches are not upstream yet
+   and a fork means owning node images.
+
 ## Known limitations (v1)
 
 - containerd only (CRI-O's native checkpoint-image restore is a planned
@@ -173,3 +197,10 @@ CUDA plugin, real restores) needs a GPU node — see
   container). The placeholder pod's readiness probe is the health signal.
 - Restore requires an identical environment: same image, same GPU model,
   same driver/CRIU versions (the standard CRIU/cuda-checkpoint constraint).
+  The mismatch is not detected up front — it surfaces as a failure inside
+  `runc restore` (v2 §5 makes the tuple an explicit compatibility key).
+- Checkpointing a *live* serving process dumps whatever it holds, including
+  resources CRIU cannot dump (io_uring rings) and a KV cache full of nothing
+  useful. Quiesce/resume hooks (v2 §4) are the fix.
+- Restore pays a full untar of the artifact before CRIU reads its first page
+  (v2 §3).
