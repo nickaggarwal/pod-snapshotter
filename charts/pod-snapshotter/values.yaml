@@ -51,6 +51,14 @@ agent:
   # fuse-client integration on each node.
   fuseAPIEndpoint: "http://127.0.0.1:8081"
   fuseAgentSocket: /var/run/fuse-client/agent.sock
+  # Directory artifacts are restored in place through the fuse mount, so
+  # pre-warm only has to pull their bytes into the node's NVMe tier — no copy.
+  # Turn this on to copy them onto node-local storage instead, which is worth
+  # measuring if the mount's per-read overhead beats the copy.
+  stageImageLocal: false
+  # Files fetched concurrently from a directory artifact (0 = built-in
+  # default of 8). Tar artifacts are always a single stream.
+  prefetchParallelism: 0
   resources:
     requests: {cpu: 100m, memory: 256Mi}
     limits: {memory: 2Gi}

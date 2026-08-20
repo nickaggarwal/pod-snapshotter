@@ -39,6 +39,8 @@ spec:
             - --fuse-api-endpoint={{ .Values.agent.fuseAPIEndpoint }}
             - --fuse-agent-socket={{ .Values.agent.fuseAgentSocket }}
             - --host-root=/host
+            - --stage-image-local={{ .Values.agent.stageImageLocal }}
+            - --prefetch-parallelism={{ .Values.agent.prefetchParallelism }}
           env:
             - name: NODE_NAME
               valueFrom:

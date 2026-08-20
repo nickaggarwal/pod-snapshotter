@@ -27,6 +27,25 @@ AKS `Standard_NC24ads_A100_v4` node with the prerequisites installed).
 | GR-7 | GPU device missing in restore spec vs node | fails fast with "GPU device nodes missing" |
 | GR-8 | Agent restart mid-Running | checkAlive resumes against existing runc state; no duplicate restore |
 
+## QB — quiesce & build artifacts (v2)
+
+Covers [design-v2.md](design-v2.md) §3–§5. Needs the reference shim on the
+pod: `kubectl create configmap snapshot-shim
+--from-file=snapshot-shim.py=hack/snapshot-shim.py`.
+
+| ID | Scenario | Pass criteria |
+|----|----------|---------------|
+| QB-1 | `SnapshotBuild` of a vLLM pod behind the shim | phase Quiescing → Snapshotting → Completed; `status.quiesce.readyAt` set; build pod deleted afterwards |
+| QB-2 | Directory artifact layout | prefix holds `checkpoint/`, `spec.dump`, MANIFEST (plus `shm-diff.tar` when the container left anything in `/dev/shm`); no `.part` files left behind |
+| QB-3 | MANIFEST is the commit marker | delete the MANIFEST → a restore reports the artifact as absent and retries, never as partial |
+| QB-4 | Restore from `buildRef`, no untar | pod Ready; the agent's work dir holds only `bundle/` and `criu-work/` — no copy of the images |
+| QB-5 | **Generation correctness after `wake_up()`** | same prompt at `temperature: 0` gives byte-identical output to a cold-started replica. A readiness probe passes with a corrupt KV mapping; this is the check that does not |
+| QB-6 | Shim never reports ready | PodSnapshot fails with `QuiesceTimeout` naming the container and the annotation, not an opaque CRIU error |
+| QB-7 | Restore onto a node with a different driver/CRIU | placeholder pod stays Pending (compat-hash selector), or fails with "node X cannot restore this artifact: …" — never a `runc restore` failure |
+| QB-8 | Re-upload the same revision after the artifact shrinks | every file matches its manifest size (the mount ignores `O_TRUNC`; the agent unlinks first) |
+| QB-9 | Parallel pre-warm | `status.prewarmBytes` equals the manifest total; wall time below the single-stream tar path for the same bytes |
+| QB-10 | Build pod name collision with a terminating pod | new build waits for the stale pod instead of adopting it (dumping an already-checkpointed container fails inside containerd) |
+
 ## IR — integration & resilience
 
 | ID | Scenario | Pass criteria |
@@ -36,9 +55,20 @@ AKS `Standard_NC24ads_A100_v4` node with the prerequisites installed).
 | IR-3 | Artifact sha256 spot-check | sha256 of /mnt/fuse tar matches status.artifact.sha256 |
 | IR-4 | Node reboot with stale runc state | agent GC path: PodRestore fails cleanly; no orphaned cgroups |
 
-## Timing table to fill in
+## Measured
 
-| Model | Cold start | Snapshot | Restore (warm NVMe) | Restore (cloud) |
-|-------|-----------|----------|---------------------|-----------------|
-| Qwen2.5-0.5B | | | | |
-| Llama-3-8B | | | | |
+A100 80GB PCIe, driver 580.159.04, CRIU 4.2.1, containerd 2.3.2,
+vLLM 0.9.2 behind `hack/snapshot-shim.py`, weights on the fuse-cache mount.
+Cold start is container start → engine ready. See
+[design-v2.md §8](design-v2.md#8-rollout) for the phase-by-phase breakdown.
+
+| Model | Device memory at dump | Artifact | Cold start | Build (start→artifact) | Restore → Ready |
+|-------|----------------------|----------|-----------|-----------------------|-----------------|
+| Qwen2.5-1.5B-Instruct | 0.98 GiB (from 48.6) | 6.7 GiB, 396 files | ~90 s | ~11 min | **73 s** |
+| Qwen2.5-14B-Instruct | 1.31 GiB (from 72.5) | 52.5 GiB, 640 files | 179 s | 34 min | **395 s** |
+
+The 14B restore is slower than its cold start, and
+[design-v2.md §8](design-v2.md#the-uncomfortable-number) explains why: the
+artifact is 2× the weights, because `sleep(level=1)` offloads them to host
+RAM rather than dropping them. Weight decoupling, not restore-side I/O
+parallelism, is what closes that.

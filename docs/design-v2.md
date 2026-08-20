@@ -1,7 +1,21 @@
 # Design v2 — aligning with NVIDIA Dynamo Snapshot
 
-Status: **proposed**. This document supersedes nothing yet; v1 (tar artifacts,
-live-pod checkpoints) keeps working while these land incrementally.
+Status: **§3–§5 implemented and verified on A100; §6 not started.** v1 (tar
+artifacts, live-pod checkpoints) keeps working unchanged — `artifactFormat`
+defaults to `tar`, and a pod without the quiesce annotation takes the v1 path.
+
+| Workstream | State |
+|---|---|
+| §3 image directories | shipped — `artifactFormat: dir`, MANIFEST commit, parallel pre-warm, restore reads the images in place |
+| §4 quiesce/resume | shipped — `podsnapshot.io/quiesce`, `Quiescing` phase, [hack/snapshot-shim.py](../hack/snapshot-shim.py) |
+| §5 build artifacts | shipped — `SnapshotBuild` CRD, `PodRestore.spec.buildRef`, compatibility-constrained placement |
+| §6a `--stream` restore | not started — `criu-image-streamer` is not on the node images |
+| §6b forked CRIU | not started, deliberately conditional |
+| §7 weight decoupling | not started |
+
+Measured numbers are in [§8](#8-rollout). What running §4 against a real vLLM
+engine actually cost is in [§10](#10-what-the-workload-had-to-give-up), and
+the two fuse-mount behaviors that shaped §3 are in [§11](#11-storage-behavior-that-shaped-the-design).
 
 NVIDIA published
 [Dynamo Snapshot](https://developer.nvidia.com/blog/nvidia-dynamo-snapshot-fast-startup-for-inference-workloads-on-kubernetes/)
@@ -135,6 +149,31 @@ things possible:
 **Compatibility:** `Format` defaults to `tar` when absent, so existing artifacts
 and existing `PodRestore`s keep working unchanged.
 
+### What shipped, and where it differs from the plan above
+
+- A directory URI is one with a trailing slash. `artifact.URI` carries `Dir`,
+  and `CommitPath()` returns the MANIFEST for a directory and the tar itself
+  for a tar, so the manager can Stat one path either way.
+- `restore.Unpack()` split into `Open(imageDir, workDir, rootfsDir)` over an
+  existing directory plus the tar path that feeds it. `Open` only ever reads
+  the artifact; everything it writes (the rewritten OCI config, CRIU's work
+  dir) goes to node-local scratch.
+- **Per-file `.part` + rename was dropped.** On the fuse-client mount, rename
+  copies without unlinking the source — every artifact tar on the cluster had
+  a full-size `.tar.part` beside it — so per-file temp files would double the
+  cost of every artifact for no benefit: the MANIFEST is what commits the
+  tree, and a reader that ignores an uncommitted prefix does not care whether
+  individual files are torn. Image files are written straight to their final
+  names; `RenamePublish` handles the one rename that remains. See §11.
+- The expansion also captures the container's `/dev/shm` as `shm-diff.tar`.
+  It is pod-scoped and external to the CRIU image, so nothing else carries
+  it, and CRIU needs it back — same idea as `rootfs-diff.tar`.
+- Pre-warm defaults to reading the files through the mount (fuse-client
+  promotes every miss to node NVMe) and `runc restore --image-path` then
+  points straight at the artifact: no copy anywhere on the restore path.
+  `--stage-image-local` copies to node NVMe instead, so the two can be
+  measured against each other.
+
 ---
 
 ## 4. Workstream 2 — quiesce/resume hooks
@@ -211,9 +250,41 @@ metadata:
 - `<dir>` must be a writable `emptyDir`; it is captured in the image, so the
   agent writes into the restored container's view of it.
 
-We ship a reference shim (`hack/snapshot-shim.py`) covering vLLM and SGLang, and
-document the protocol for anything else. Workloads without the annotation take
-the v1 path unchanged.
+We ship a reference shim (`hack/snapshot-shim.py`) covering vLLM, and document
+the protocol for anything else. Workloads without the annotation take the v1
+path unchanged.
+
+### What shipped
+
+`PodSnapshot` gains a `Quiescing` phase between `Pending` and
+`Checkpointing`. The manager resolves the contract off the pod's annotations
+and sets the deadline; the node agent polls for the presence file and hands
+the snapshot back to the manager when it appears. The agent reads the
+rendezvous directory through the container init's mount namespace
+(`/proc/<pid>/root/...`) — an `emptyDir` is a mount *inside* the container and
+is not visible under its bundle rootfs, which is the one thing about this that
+is not obvious.
+
+On restore the agent writes the resume file through the *keeper* container's
+mount namespace: the keeper mounts the same `emptyDir` the restored workload
+will, and the spec rewriter has already remapped that volume onto the new pod.
+The contract is also recorded in the artifact MANIFEST, so a quiesced
+checkpoint is self-describing and a `PodRestore` does not have to repeat the
+annotations.
+
+`llm.sleep(level=1)` measured on an A100 80GB, vLLM 0.9.2:
+
+| Model | Device memory before | After | Freed |
+|---|---|---|---|
+| Qwen2.5-1.5B-Instruct | 48.6 GiB | 0.98 GiB | 47.6 GiB |
+| Qwen2.5-14B-Instruct | 72.5 GiB | 1.31 GiB | 71.2 GiB |
+
+The ratio tracks how much of the GPU the KV cache was allowed to claim, as
+Dynamo's does. Note what it does *not* do: `sleep(level=1)` offloads weights
+to host RAM rather than dropping them, so they move from the device side of
+the image to the host side rather than leaving it. That is why the artifacts
+below are still roughly weights-sized — and why §7 is the thing that would
+actually shrink them.
 
 ---
 
@@ -260,6 +331,24 @@ type SnapshotBuildSpec struct {
 The restore controller refuses to schedule onto a node whose
 `podsnapshot.io/prereqs` compatibility tuple does not match the build's —
 today that mismatch is a runtime failure deep inside `runc restore`.
+
+### What shipped
+
+`SnapshotBuild` runs a bare Pod rather than a Job: the checkpoint is taken of
+one specific running container, and a Job's restart semantics only get in the
+way of a pod that is deliberately parked in a poll loop and never exits. The
+build drives an ordinary `PodSnapshot` against that pod, so the quiesce wait
+is the same code path as everywhere else, and deletes the pod once the
+artifact exists.
+
+The compatibility tuple is published by the agent as the node annotation
+`podsnapshot.io/compat` plus a label `podsnapshot.io/compat-hash` — annotations
+cannot be selected on, and the GPU model contains spaces so it cannot be a
+label value. A `PodRestore` with `buildRef` copies the build's tuple into its
+status, and `BuildPlaceholderPod` adds the hash to the pod's `nodeSelector`.
+The scheduler then never places the pod somewhere the artifact cannot restore;
+a pinned `spec.nodeName`, which bypasses the scheduler, is checked directly
+and fails with a specific message instead.
 
 ### Consequences
 
@@ -344,15 +433,13 @@ distributed cache is good at.
 
 ## 8. Rollout
 
-| Phase | Contents | Unblocks |
+| Phase | Contents | State |
 |---|---|---|
-| 1 | Image directories end-to-end (§3) | Removes untar; prerequisite for §6 |
-| 2 | Quiesce/resume + reference shim (§4) | Fixes io_uring; shrinks image |
-| 3 | `SnapshotBuild` + build-time artifacts (§5) | Makes §4 usable in production |
-| 4 | `--stream` restore, measured (§6a) | Parallel reads |
-| 5 | Fork CRIU only if §4 measured short (§6b) | The rest of the 7.9× |
-
-Phases 1 and 2 are independent and can land in parallel. Phase 3 depends on 2.
+| 1 | Image directories end-to-end (§3) | **done** |
+| 2 | Quiesce/resume + reference shim (§4) | **done** |
+| 3 | `SnapshotBuild` + build-time artifacts (§5) | **done** |
+| 4 | `--stream` restore, measured (§6a) | not started — `criu-image-streamer` is not on the node images, and the restore is not currently CRIU-read-bound (see below) |
+| 5 | Fork CRIU only if §4 measured short (§6b) | not started |
 
 ### Benchmark table to fill in
 
@@ -389,3 +476,85 @@ restore onto a node that never ran the build.
   treat a prefix without a complete MANIFEST as absent, not as partial.
 - **Forking CRIU means owning node images.** §6b is deliberately last and
   deliberately conditional.
+
+
+---
+
+## 10. What the workload had to give up
+
+§4 says the shim is "a contract we cannot enforce". Running it against a real
+vLLM engine is what showed how much that contract actually contains. Five
+things had to change before an engine was both dumpable and restorable, and
+only the first is specific to vLLM:
+
+1. **NVML holds its own `/dev/nvidiactl`.** `cuda-checkpoint` hands back the
+   descriptors the CUDA *runtime* owns; NVML's is not one of them, so it is
+   still open when CRIU walks the process:
+   `Can't dump file 9 of that type [20666] (chr 195:255)`. Any library that
+   calls `nvmlInit` without a matching `nvmlShutdown` — PyTorch's device-count
+   probe does — leaves one behind.
+
+2. **`fork` spreads the problem.** vLLM's V1 async path always runs EngineCore
+   in its own process and defaults to forking it, so the worker inherits the
+   frontend's nvidiactl fd. In the child that descriptor belongs to no library
+   at all, so `cuda-checkpoint` does not release it either. vLLM already forces
+   `spawn` when the parent has initialized CUDA; NVML alone does not count,
+   which is the gap.
+
+3. **Anything bound to the pod IP.** `Can't bind inet socket back: Cannot
+   assign requested address`. The engine's ZMQ endpoints and the
+   `torch.distributed` TCPStore are created during engine init — before the
+   quiesce point — so deferring the HTTP frontend does not help. They have to
+   be on loopback, which exists identically in every pod. Same for outbound
+   connections: vLLM's usage reporting keeps a TLS session open to a host on
+   the public internet, and nothing can bring that back elsewhere.
+
+4. **Deleted-but-mapped files on `/dev/shm`.** glibc's `sem_open` creates a
+   temp file, mmaps it, links it to the caller's name and unlinks the temp —
+   so every POSIX semaphore is permanently mapped from a deleted path, and any
+   Python `multiprocessing` primitive produces one. CRIU cannot ghost a
+   *mapped* deleted file that still has a link, so it demands `link-remap`;
+   and `link-remap` hard-links the inode into `/dev/shm` during the dump,
+   drops the link when the dump ends, and expects it back at restore, which a
+   fresh pod's tmpfs cannot provide. The way out is to drop the last link
+   before the dump: `nlink` hits zero and CRIU writes a ghost file, content
+   and all, into the image.
+
+5. **`/dev/shm` itself is not in the image.** It is a pod-scoped external
+   mount, so the agent captures it as `shm-diff.tar` alongside
+   `rootfs-diff.tar` and lays it back down over the restored pod's tmpfs.
+
+The generalizable shape: the quiesce point buys you control over what is
+*created* after it, and nothing at all over what engine initialization already
+did. Everything in the list above exists by the time weights are loaded. A
+future protocol version could plausibly check for these before declaring
+ready — scan `/proc/self/maps` and `/proc/net/tcp` for the known-bad shapes and
+refuse to write `ready-for-checkpoint` — rather than letting the checkpoint
+fail minutes later with a CRIU error nobody can read.
+
+The io_uring wall §4 predicted did not appear at the quiesce point, for the
+reason §4 gives: uvicorn is never started before the dump, so its event loop
+is not in the image. The shim also pins uvicorn to the `asyncio` loop rather
+than uvloop, so that a *restored* process is still dumpable.
+
+## 11. Storage behavior that shaped the design
+
+Two things about the fuse-client mount, both measured, both of which changed
+the §3 implementation:
+
+- **`rename` copies without unlinking the source.** Every artifact tar on the
+  cluster had a full-size `.tar.part` sitting beside it — silently doubling
+  the storage cost of every snapshot taken since v1 shipped. This is why the
+  plan's per-file `.part` + rename was dropped for directory artifacts (the
+  MANIFEST is the commit marker, so per-file atomicity buys nothing) and why
+  `RenamePublish` explicitly removes the source after the one rename that
+  remains.
+
+- **`O_TRUNC` is ignored.** Re-uploading a revision left every file that had
+  shrunk carrying the previous upload's tail, and pre-warm then read a longer
+  image than the manifest described. The agent now unlinks before every
+  overwrite. The manifest's per-file sizes are what caught this — a tar
+  artifact would have carried the corruption into `runc restore`.
+
+Neither is a bug report against fuse-cache so much as a reminder that an
+artifact store is not a POSIX filesystem just because it is mounted like one.

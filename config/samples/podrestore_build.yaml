@@ -1,0 +1,58 @@
+# Restore a revision built by a SnapshotBuild. This is the 0->1 scale-up
+# path: N restores, one build.
+#
+# buildRef also constrains placement. The build recorded the GPU model,
+# driver and CRIU version it ran on, and the placeholder pod is confined to
+# nodes carrying the same tuple — so an incompatible node is rejected by the
+# scheduler instead of by `runc restore` after the GPU has been handed out.
+apiVersion: podsnapshot.io/v1alpha1
+kind: PodRestore
+metadata:
+  name: qwen14b-restore
+  namespace: default
+spec:
+  buildRef:
+    name: qwen14b
+  timeoutSeconds: 900
+  podTemplate:
+    metadata:
+      labels:
+        app: qwen14b
+    spec:
+      nodeSelector:
+        pool: gpuckpt
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+      securityContext:
+        appArmorProfile:
+          type: Unconfined
+      containers:
+        # Same image, same GPU count, same volumes as the build. The command
+        # is replaced by a keeper; the restored workload joins this pod's
+        # namespaces, so the readiness probe below turns Ready exactly when
+        # the restored vLLM answers.
+        - name: vllm
+          image: vllm/vllm-openai:v0.9.2
+          ports:
+            - containerPort: 8000
+          resources:
+            limits:
+              nvidia.com/gpu: "1"
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            periodSeconds: 2
+            failureThreshold: 300
+          volumeMounts:
+            - {name: shim, mountPath: /shim}
+            - {name: snapshot, mountPath: /snapshot}
+            - {name: fuse, mountPath: /mnt/fuse, mountPropagation: HostToContainer}
+            - {name: shm, mountPath: /dev/shm}
+      volumes:
+        - {name: shim, configMap: {name: snapshot-shim}}
+        - {name: snapshot, emptyDir: {}}
+        - {name: fuse, hostPath: {path: /mnt/fuse, type: Directory}}
+        - {name: shm, emptyDir: {medium: Memory, sizeLimit: 16Gi}}
