@@ -43,7 +43,7 @@ func BuildBuilderPod(build *snapv1.SnapshotBuild, podName string) (*corev1.Pod, 
 		return nil, err
 	}
 
-	tmpl := build.Spec.PodTemplate.DeepCopy()
+	tmpl := build.Spec.PodTemplate.ToPodTemplateSpec()
 	pod := &corev1.Pod{
 		ObjectMeta: tmpl.ObjectMeta,
 		Spec:       tmpl.Spec,

@@ -403,7 +403,7 @@ func imageStageDir(workRoot string, pr *snapv1.PodRestore) string {
 // template, then the artifact's own MANIFEST — which is how a directory
 // artifact stays self-describing.
 func resolveResumeDir(pr *snapv1.PodRestore, m *artifact.Manifest) string {
-	for _, meta := range []map[string]string{pr.Annotations, pr.Spec.PodTemplate.Annotations} {
+	for _, meta := range []map[string]string{pr.Annotations, pr.Spec.PodTemplate.Metadata.Annotations} {
 		if meta[snapv1.QuiesceAnnotation] == snapv1.QuiesceModePresenceFile {
 			if dir := meta[snapv1.QuiesceDirAnnotation]; dir != "" {
 				return dir

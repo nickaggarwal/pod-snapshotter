@@ -41,7 +41,7 @@ func BuildPlaceholderPod(restore *snapv1.PodRestore, podName string) (*corev1.Po
 		return nil, err
 	}
 
-	tmpl := restore.Spec.PodTemplate.DeepCopy()
+	tmpl := restore.Spec.PodTemplate.ToPodTemplateSpec()
 	pod := &corev1.Pod{
 		ObjectMeta: tmpl.ObjectMeta,
 		Spec:       tmpl.Spec,

@@ -55,7 +55,7 @@ type PodRestoreSpec struct {
 	// container's image and the template must request the same GPU count.
 	// The controller rewrites the target container's command to a keeper
 	// process; the restored workload joins this pod's namespaces.
-	PodTemplate corev1.PodTemplateSpec `json:"podTemplate"`
+	PodTemplate PodTemplate `json:"podTemplate"`
 
 	// Container in the template that receives the restored workload.
 	// Defaults to the first container.

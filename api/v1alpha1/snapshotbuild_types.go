@@ -1,7 +1,6 @@
 package v1alpha1
 
 import (
-	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -75,7 +74,7 @@ type SnapshotBuildSpec struct {
 	// Quiescing is destructive — a replica that has released its KV cache and
 	// parked in a poll loop is not serving — so it cannot run on a serving
 	// pod. That is the whole reason builds exist.
-	PodTemplate corev1.PodTemplateSpec `json:"podTemplate"`
+	PodTemplate PodTemplate `json:"podTemplate"`
 
 	// Container in the template to checkpoint. Defaults to the first.
 	// +optional

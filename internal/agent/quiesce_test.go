@@ -6,15 +6,14 @@ import (
 	"strconv"
 	"testing"
 
-	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	snapv1 "pod-snapshotter/api/v1alpha1"
 	"pod-snapshotter/internal/artifact"
 )
 
-func podTemplateWithAnnotations(a map[string]string) corev1.PodTemplateSpec {
-	return corev1.PodTemplateSpec{ObjectMeta: metav1.ObjectMeta{Annotations: a}}
+func podTemplateWithAnnotations(a map[string]string) snapv1.PodTemplate {
+	return snapv1.PodTemplate{Metadata: snapv1.EmbeddedObjectMeta{Annotations: a}}
 }
 
 func TestResolveResumeDir(t *testing.T) {
