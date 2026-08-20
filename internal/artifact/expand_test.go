@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -52,7 +53,7 @@ func TestExpandTarToDir(t *testing.T) {
 	writeCheckpointTar(t, tarPath, content)
 
 	dst := filepath.Join(dir, "artifact")
-	m, err := ExpandTarToDir(tarPath, dst, &QuiesceInfo{Mode: "presence-file", Dir: "/snapshot"})
+	m, err := ExpandTarToDir(tarPath, dst, &QuiesceInfo{Mode: "presence-file", Dir: "/snapshot"}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -156,7 +157,7 @@ func TestExpandTarToDirClearsStaleManifest(t *testing.T) {
 	tw.Close()
 	f.Close()
 
-	if _, err := ExpandTarToDir(tarPath, dst, nil); err == nil {
+	if _, err := ExpandTarToDir(tarPath, dst, nil, nil); err == nil {
 		t.Fatal("expected the symlink entry to be rejected")
 	}
 	if _, err := os.Stat(filepath.Join(dst, ManifestName)); !os.IsNotExist(err) {
@@ -181,7 +182,7 @@ func TestExpandTarToDirRejectsTraversal(t *testing.T) {
 	tw.Close()
 	f.Close()
 
-	if _, err := ExpandTarToDir(tarPath, filepath.Join(dir, "out"), nil); err == nil {
+	if _, err := ExpandTarToDir(tarPath, filepath.Join(dir, "out"), nil, nil); err == nil {
 		t.Fatal("expected traversal to be rejected")
 	}
 }
@@ -196,7 +197,7 @@ func TestPrefetchWarmAndStage(t *testing.T) {
 	}
 	writeCheckpointTar(t, tarPath, content)
 	src := filepath.Join(dir, "artifact")
-	m, err := ExpandTarToDir(tarPath, src, nil)
+	m, err := ExpandTarToDir(tarPath, src, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -235,7 +236,7 @@ func TestPrefetchDetectsTruncatedFile(t *testing.T) {
 	tarPath := filepath.Join(dir, "checkpoint.tar")
 	writeCheckpointTar(t, tarPath, map[string]string{"checkpoint/pages-1.img": "0123456789"})
 	src := filepath.Join(dir, "artifact")
-	m, err := ExpandTarToDir(tarPath, src, nil)
+	m, err := ExpandTarToDir(tarPath, src, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -253,3 +254,59 @@ func TestDecodeManifestRejectsTraversal(t *testing.T) {
 		t.Fatal("expected a traversing manifest entry to be rejected")
 	}
 }
+
+func TestExpandTarToDirContributedFiles(t *testing.T) {
+	dir := t.TempDir()
+	tarPath := filepath.Join(dir, "checkpoint.tar")
+	writeCheckpointTar(t, tarPath, map[string]string{
+		"checkpoint/pages-1.img": "PAGES",
+		"spec.dump":              `{"ociVersion":"1.0.0"}`,
+	})
+	dst := filepath.Join(dir, "artifact")
+
+	// A contributor sees the expanded tree (so it can read spec.dump) and
+	// adds state the CRI archive does not carry.
+	contribute := func(dstDir string) ([]ManifestFile, error) {
+		if _, err := os.Stat(filepath.Join(dstDir, "spec.dump")); err != nil {
+			t.Errorf("contributor ran before the archive was expanded: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(dstDir, "shm-diff.tar"), []byte("SHM"), 0o644); err != nil {
+			return nil, err
+		}
+		e, err := DescribeFile(dstDir, "shm-diff.tar")
+		return []ManifestFile{e}, err
+	}
+
+	m, err := ExpandTarToDir(tarPath, dst, nil, contribute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var found *ManifestFile
+	for i := range m.Files {
+		if m.Files[i].Path == "shm-diff.tar" {
+			found = &m.Files[i]
+		}
+	}
+	if found == nil {
+		t.Fatalf("contributed file missing from the manifest: %+v", m.Files)
+	}
+	if found.Size != 3 || found.SHA256 == "" {
+		t.Errorf("contributed entry not described: %+v", *found)
+	}
+	if m.TotalBytes != int64(len("PAGES")+len(`{"ociVersion":"1.0.0"}`)+3) {
+		t.Errorf("TotalBytes = %d, does not include the contributed file", m.TotalBytes)
+	}
+
+	// A contributor failure leaves the artifact uncommitted.
+	dst2 := filepath.Join(dir, "artifact2")
+	if _, err := ExpandTarToDir(tarPath, dst2, nil, func(string) ([]ManifestFile, error) {
+		return nil, errContributor
+	}); err == nil {
+		t.Fatal("expected the contributor error to fail the expansion")
+	}
+	if _, err := os.Stat(filepath.Join(dst2, ManifestName)); !os.IsNotExist(err) {
+		t.Error("a failed contributor must leave the prefix uncommitted")
+	}
+}
+
+var errContributor = errors.New("contributor blew up")

@@ -22,6 +22,7 @@ import (
 
 	snapv1 "pod-snapshotter/api/v1alpha1"
 	"pod-snapshotter/internal/artifact"
+	"pod-snapshotter/internal/restore"
 )
 
 // UploadReconciler moves kubelet checkpoint tars from
@@ -41,6 +42,9 @@ type UploadReconciler struct {
 	// CheckpointsHostPath is where kubelet tars appear inside the agent
 	// container (hostPath mount of /var/lib/kubelet/checkpoints).
 	CheckpointsHostPath string
+	// HostRoot is where the host's / is mounted (read-only), used to reach
+	// container mount sources the agent does not mount directly.
+	HostRoot string
 	// VerifyFuse optionally HEADs the uploaded file via the local fuse-client
 	// API to confirm visibility; nil disables verification.
 	VerifyFuse func(ctx context.Context, fusePath string) (int64, error)
@@ -115,7 +119,7 @@ func (r *UploadReconciler) upload(ctx context.Context, snap *snapv1.PodSnapshot)
 		if snap.Status.Quiesce != nil {
 			q = &artifact.QuiesceInfo{Mode: snap.Status.Quiesce.Mode, Dir: snap.Status.Quiesce.Dir}
 		}
-		m, err := artifact.ExpandTarToDir(src, dst, q)
+		m, err := artifact.ExpandTarToDir(src, dst, q, r.captureShm)
 		if err != nil {
 			return r.retryUpload(ctx, snap, err)
 		}
@@ -152,6 +156,28 @@ func (r *UploadReconciler) upload(ctx context.Context, snap *snapv1.PodSnapshot)
 	return ctrl.Result{}, r.Status().Update(ctx, snap)
 }
 
+// captureShm adds the checkpointed container's /dev/shm to the artifact.
+// It runs while the source pod is still alive — the tmpfs disappears with it,
+// and CRIU's link-remap files live there (see restore.CaptureShm).
+func (r *UploadReconciler) captureShm(dstDir string) ([]artifact.ManifestFile, error) {
+	captured, err := restore.CaptureShm(
+		filepath.Join(dstDir, "spec.dump"),
+		r.HostRoot,
+		filepath.Join(dstDir, restore.ShmDiffName),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("capturing %s: %w", restore.ShmPath, err)
+	}
+	if !captured {
+		return nil, nil
+	}
+	entry, err := artifact.DescribeFile(dstDir, restore.ShmDiffName)
+	if err != nil {
+		return nil, err
+	}
+	return []artifact.ManifestFile{entry}, nil
+}
+
 // retryUpload records a transient upload failure and backs off. Upload is
 // idempotent on both paths: the tar is republished by rename, and a directory
 // artifact clears its MANIFEST before rewriting, so a half-written tree is
@@ -185,6 +211,11 @@ func copyAtomic(src, dst string) (sha string, n int64, err error) {
 	defer in.Close()
 
 	tmp := dst + ".part"
+	// The destination filesystem may ignore O_TRUNC (the fuse-client mount
+	// does); unlink any leftover so a shorter tar cannot inherit an old tail.
+	if err := os.Remove(tmp); err != nil && !os.IsNotExist(err) {
+		return "", 0, err
+	}
 	out, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
 	if err != nil {
 		return "", 0, err

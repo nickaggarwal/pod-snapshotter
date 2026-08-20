@@ -93,6 +93,7 @@ func main() {
 		NodeName:            nodeName,
 		FuseMount:           fuseMount,
 		CheckpointsHostPath: checkpointsDir,
+		HostRoot:            hostRoot,
 	}
 	if fuseAPIEndpoint != "" {
 		fuseHTTP := fuseclient.NewHTTPClient(fuseAPIEndpoint)

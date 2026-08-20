@@ -26,7 +26,12 @@ const maxTarEntries = 1 << 20
 //
 // Any MANIFEST left by an earlier attempt is removed first, so a prefix is
 // never observable as committed while it is being rewritten.
-func ExpandTarToDir(tarPath, dstDir string, quiesce *QuiesceInfo) (*Manifest, error) {
+//
+// contribute, when non-nil, runs after every archive member has been written
+// and before the MANIFEST, and may add files of its own to the artifact —
+// state the CRI archive does not carry but the restore needs. It returns the
+// manifest entries for whatever it wrote.
+func ExpandTarToDir(tarPath, dstDir string, quiesce *QuiesceInfo, contribute func(dstDir string) ([]ManifestFile, error)) (*Manifest, error) {
 	if err := os.MkdirAll(dstDir, 0o755); err != nil {
 		return nil, err
 	}
@@ -88,6 +93,14 @@ func ExpandTarToDir(tarPath, dstDir string, quiesce *QuiesceInfo) (*Manifest, er
 		return nil, fmt.Errorf("checkpoint tar %s contained no files", tarPath)
 	}
 
+	if contribute != nil {
+		extra, err := contribute(dstDir)
+		if err != nil {
+			return nil, err
+		}
+		files = append(files, extra...)
+	}
+
 	m := NewManifest(files, filepath.Base(tarPath), quiesce)
 	if err := WriteManifestDir(dstDir, m); err != nil {
 		return nil, err
@@ -102,6 +115,9 @@ func ExpandTarToDir(tarPath, dstDir string, quiesce *QuiesceInfo) (*Manifest, er
 func WriteManifestDir(dir string, m *Manifest) error {
 	manifestPath := filepath.Join(dir, ManifestName)
 	tmp := manifestPath + ".part"
+	if err := os.Remove(tmp); err != nil && !os.IsNotExist(err) { // see writeFile on O_TRUNC
+		return err
+	}
 	out, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
 	if err != nil {
 		return err
@@ -139,6 +155,35 @@ func RenamePublish(tmp, dst string) error {
 	return nil
 }
 
+// DescribeFile builds the manifest entry for a file an external contributor
+// wrote into the artifact.
+func DescribeFile(dstDir, rel string) (ManifestFile, error) {
+	if err := validRelPath(rel); err != nil {
+		return ManifestFile{}, fmt.Errorf("artifact file %q: %w", rel, err)
+	}
+	full := filepath.Join(dstDir, filepath.FromSlash(rel))
+	fi, err := os.Stat(full)
+	if err != nil {
+		return ManifestFile{}, err
+	}
+	f, err := os.Open(full)
+	if err != nil {
+		return ManifestFile{}, err
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil { // #nosec G110 -- size checked above
+		return ManifestFile{}, err
+	}
+	mode := fi.Mode().Perm()
+	return ManifestFile{
+		Path:   rel,
+		Size:   fi.Size(),
+		SHA256: hex.EncodeToString(h.Sum(nil)),
+		Mode:   uint32(mode),
+	}, nil
+}
+
 // writeFile streams r into dst with a sha256 tee and fsyncs. Checkpoint image
 // files are individually multi-GB, so nothing is buffered whole.
 //
@@ -148,6 +193,13 @@ func RenamePublish(tmp, dst string) error {
 // full-size copy of every image file behind.
 func writeFile(dst string, r io.Reader, mode os.FileMode) (sum string, n int64, err error) {
 	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		return "", 0, err
+	}
+	// Unlink first rather than trusting O_TRUNC. The fuse-client mount does
+	// not honor it: re-uploading a revision left every file that had shrunk
+	// with the previous upload's tail still attached, and the restore then
+	// read a longer image than the manifest described.
+	if err := os.Remove(dst); err != nil && !os.IsNotExist(err) {
 		return "", 0, err
 	}
 	out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, mode)

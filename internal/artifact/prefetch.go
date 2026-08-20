@@ -130,6 +130,9 @@ func fetchOne(opts PrefetchOpts, f ManifestFile, buf []byte) (int64, error) {
 		if mode == 0 {
 			mode = 0o644
 		}
+		if err := os.Remove(staged); err != nil && !os.IsNotExist(err) {
+			return 0, err
+		}
 		out, err := os.OpenFile(staged, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, mode)
 		if err != nil {
 			return 0, err

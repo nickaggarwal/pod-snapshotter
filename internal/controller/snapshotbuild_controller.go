@@ -105,7 +105,8 @@ func (r *SnapshotBuildReconciler) reconcileBuildPending(ctx context.Context, bui
 	podName := buildPodName(build)
 	var pod corev1.Pod
 	err = r.Get(ctx, types.NamespacedName{Namespace: build.Namespace, Name: podName}, &pod)
-	if apierrors.IsNotFound(err) {
+	switch {
+	case apierrors.IsNotFound(err):
 		newPod, buildErr := BuildBuilderPod(build, podName)
 		if buildErr != nil {
 			return r.failBuild(ctx, build, buildErr.Error())
@@ -117,8 +118,18 @@ func (r *SnapshotBuildReconciler) reconcileBuildPending(ctx context.Context, bui
 			return ctrl.Result{}, err
 		}
 		logger.Info("created build pod", "pod", podName, "revision", build.Spec.Revision)
-	} else if err != nil {
+	case err != nil:
 		return ctrl.Result{}, err
+	case !metav1.IsControlledBy(&pod, build) || pod.DeletionTimestamp != nil:
+		// A leftover from a previous SnapshotBuild of the same name, still
+		// terminating. Never adopt it: its container has already been
+		// checkpointed once, and dumping it again fails deep inside
+		// containerd. Wait for it to go, then create our own.
+		build.Status.Message = fmt.Sprintf("waiting for stale build pod %s to terminate", pod.Name)
+		if err := r.Status().Update(ctx, build); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 	}
 
 	build.Status.BuildPodName = podName

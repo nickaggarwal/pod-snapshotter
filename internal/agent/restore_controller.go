@@ -294,6 +294,11 @@ func (r *RestoreReconciler) restore(ctx context.Context, pr *snapv1.PodRestore) 
 	if err := restore.ValidateGPUDevices(spec); err != nil {
 		return r.fail(ctx, pr, err.Error())
 	}
+	// The rewritten spec now names the NEW pod's /dev/shm, which is where the
+	// checkpointed tmpfs — CRIU's link-remap files included — has to land.
+	if err := restore.ApplyShm(bundle.Dir, spec); err != nil {
+		return r.fail(ctx, pr, err.Error())
+	}
 
 	// Quiesce/resume: the checkpointed process is parked in a poll loop
 	// waiting for the resume file. Write it BEFORE runc restore so it is
