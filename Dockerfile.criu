@@ -1,0 +1,69 @@
+# Builds pod-snapshotter's CRIU fork: upstream v4.2.1 plus the restore-path
+# patches in hack/criu/patches (docs/design-v2.md §6b).
+#
+# v4.2.1 is the base on purpose — it is what the AKS Ubuntu 24.04 GPU nodes
+# already run, so the CUDA plugin, the NVIDIA driver and the CRIU image format
+# all stay at a combination that is known to work end to end. The patches only
+# touch the restore read path.
+#
+# The output is a tarball of just the pieces a node needs, so the installer
+# DaemonSet can lay them down beside the distro package rather than replacing
+# it: /usr/local wins on PATH, and reverting is `rm`.
+ARG UBUNTU_VERSION=24.04
+FROM ubuntu:${UBUNTU_VERSION} AS build
+
+ARG CRIU_VERSION=4.2.1
+ENV DEBIAN_FRONTEND=noninteractive
+
+# CRIU's own build deps (see its INSTALL.md). libaio-dev is not among them —
+# the AIO patch calls io_setup/io_submit/io_getevents by raw syscall so that
+# the fork does not add a link-time dependency the distro package lacks.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential ca-certificates curl git pkg-config \
+        libprotobuf-dev libprotobuf-c-dev protobuf-c-compiler protobuf-compiler \
+        python3-minimal python3-protobuf \
+        libcap-dev libnl-3-dev libnet1-dev libbsd-dev libnftables-dev \
+        libgnutls28-dev libdrm-dev uuid-dev iproute2 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+RUN curl -fsSL "https://github.com/checkpoint-restore/criu/archive/refs/tags/v${CRIU_VERSION}.tar.gz" \
+      -o criu.tar.gz \
+ && tar xzf criu.tar.gz --strip-components=1 \
+ && rm criu.tar.gz
+
+# Applied in order; the build fails loudly if any hunk does not apply, so a
+# rebase onto a new upstream base cannot silently drop a patch.
+COPY hack/criu/patches/ /patches/
+RUN set -eux; \
+    for p in $(ls /patches/*.patch 2>/dev/null | sort); do \
+        echo "== applying $(basename "$p")"; \
+        patch -p1 --batch --forward < "$p"; \
+    done
+
+RUN make -j"$(nproc)" criu cuda_plugin
+
+# Sanity: the binary runs, reports a version, and carries our marker.
+RUN ./criu/criu --version && ./criu/criu check --help >/dev/null
+
+# Only the binary ships. The fork's compiled-in plugin directory is
+# /usr/lib/criu -- the same one the distro package uses -- so the patched CRIU
+# loads the node's existing cuda_plugin.so. That is deliberate: the fork is
+# based on the exact version the node already runs, so the plugin ABI matches,
+# and the GPU-critical piece stays byte-identical to what has been validated
+# there. The freshly built plugin is carried alongside only for nodes that do
+# not have one.
+RUN set -eux; \
+    mkdir -p /out/usr/local/sbin; \
+    cp criu/criu /out/usr/local/sbin/criu; \
+    tar -C /out -czf /criu-dist.tar.gz usr; \
+    cp plugins/cuda/cuda_plugin.so /cuda_plugin.so
+
+# The runtime image is the installer payload: the DaemonSet copies the tarball
+# onto the host and unpacks it there.
+FROM ubuntu:${UBUNTU_VERSION}
+COPY --from=build /criu-dist.tar.gz /criu-dist.tar.gz
+COPY --from=build /cuda_plugin.so /cuda_plugin.so
+COPY hack/criu/install.sh /install.sh
+RUN chmod +x /install.sh
+ENTRYPOINT ["/install.sh"]

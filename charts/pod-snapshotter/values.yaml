@@ -30,6 +30,21 @@ nodeSetup:
   # NVIDIA's standalone checkpoint utility, installed on GPU nodes only.
   cudaCheckpointURL: https://github.com/NVIDIA/cuda-checkpoint/raw/main/bin/x86_64_Linux/cuda-checkpoint
 
+# Patched CRIU (docs/design-v2.md §6b). Upstream v4.2.1 plus the restore
+# read-path patches in hack/criu/patches: native AIO for the async page reads
+# and a thread pool for memfd/shmem restore. Installed to /usr/local/sbin,
+# beside the distro package rather than over it.
+#
+# Off by default: it changes the binary every checkpoint and restore on the
+# node goes through. Set uninstall=true to remove it and fall back.
+criu:
+  enabled: false
+  uninstall: false
+  image:
+    repository: pod-snapshotter/criu
+    tag: v4.2.1-ps1
+    pullPolicy: IfNotPresent
+
 agent:
   image:
     repository: pod-snapshotter/agent

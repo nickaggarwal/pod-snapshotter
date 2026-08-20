@@ -320,6 +320,7 @@ func (r *RestoreReconciler) restore(ctx context.Context, pr *snapv1.PodRestore) 
 		ImagePath:   bundle.CheckpointDir,
 		WorkPath:    filepath.Join(workDir, "criu-work"),
 		TCPClose:    tcpClose,
+		Env:         criuTuning(pr),
 	})
 	if err != nil {
 		return r.fail(ctx, pr, fmt.Sprintf("runc restore: %v", err))
@@ -392,6 +393,27 @@ func (r *RestoreReconciler) fail(ctx context.Context, pr *snapv1.PodRestore, msg
 	pr.Status.Message = msg
 	setCond(&pr.Status.Conditions, snapv1.ConditionRestored, metav1.ConditionFalse, "Failed", msg)
 	return ctrl.Result{}, r.Status().Update(ctx, pr)
+}
+
+// criuTuning maps the CRIU restore read-path annotations onto the environment
+// `runc restore` is given. A stock CRIU ignores all of them, so setting them
+// is never a compatibility problem — it just does nothing until the patched
+// build from hack/criu/patches is installed on the node.
+func criuTuning(pr *snapv1.PodRestore) map[string]string {
+	env := map[string]string{}
+	for annotation, name := range map[string]string{
+		snapv1.CRIUAIODepthAnnotation:     "CRIU_AIO_DEPTH",
+		snapv1.CRIUShmemThreadsAnnotation: "CRIU_SHMEM_RESTORE_THREADS",
+		snapv1.CRIUImageIOModeAnnotation:  "CRIU_IMAGE_IO_MODE",
+	} {
+		if v := pr.Annotations[annotation]; v != "" {
+			env[name] = v
+		}
+	}
+	if len(env) == 0 {
+		return nil
+	}
+	return env
 }
 
 // imageStageDir is where a directory artifact is copied when

@@ -31,6 +31,23 @@ const TeardownFinalizer = "podsnapshot.io/restore-teardown"
 // RestoreAnnotation links a placeholder pod back to its PodRestore (ns/name).
 const RestoreAnnotation = "podsnapshot.io/restore"
 
+// Restore read-path tuning for the patched CRIU (hack/criu/patches). These
+// are passed to `runc restore` in its environment, so they take effect for
+// one restore without changing anything on the node — and they are simply
+// ignored by a stock CRIU, which makes them safe to set unconditionally.
+const (
+	// CRIUAIODepthAnnotation is how many page reads the async read path
+	// keeps in flight. "0" or "1" falls back to the one-at-a-time preadv
+	// loop, which is what stock CRIU does.
+	CRIUAIODepthAnnotation = "podsnapshot.io/criu-aio-depth"
+	// CRIUShmemThreadsAnnotation is how many shmem/memfd objects are
+	// restored concurrently. "1" disables the thread pool.
+	CRIUShmemThreadsAnnotation = "podsnapshot.io/criu-shmem-threads"
+	// CRIUImageIOModeAnnotation is "writeback" (buffered, default) or
+	// "direct" (O_DIRECT for the block-aligned reads).
+	CRIUImageIOModeAnnotation = "podsnapshot.io/criu-image-io-mode"
+)
+
 // PodRestoreSpec defines the desired state of PodRestore.
 type PodRestoreSpec struct {
 	// ArtifactURI points at the checkpoint (fuse:// or file:// scheme); a

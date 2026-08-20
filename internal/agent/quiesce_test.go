@@ -125,3 +125,36 @@ func TestWriteResumeMarkerContent(t *testing.T) {
 		t.Errorf("resume marker not created: %v", err)
 	}
 }
+
+func TestCRIUTuning(t *testing.T) {
+	if got := criuTuning(&snapv1.PodRestore{}); got != nil {
+		t.Errorf("a restore with no tuning annotations should set no environment, got %v", got)
+	}
+
+	pr := &snapv1.PodRestore{ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{
+		snapv1.CRIUAIODepthAnnotation:     "256",
+		snapv1.CRIUShmemThreadsAnnotation: "1",
+		snapv1.CRIUImageIOModeAnnotation:  "direct",
+		"unrelated":                       "ignored",
+	}}}
+	got := criuTuning(pr)
+	want := map[string]string{
+		"CRIU_AIO_DEPTH":             "256",
+		"CRIU_SHMEM_RESTORE_THREADS": "1",
+		"CRIU_IMAGE_IO_MODE":         "direct",
+	}
+	if len(got) != len(want) {
+		t.Fatalf("criuTuning = %v, want %v", got, want)
+	}
+	for k, v := range want {
+		if got[k] != v {
+			t.Errorf("%s = %q, want %q", k, got[k], v)
+		}
+	}
+
+	// An empty annotation value must not shadow CRIU's own default.
+	pr.Annotations[snapv1.CRIUAIODepthAnnotation] = ""
+	if _, ok := criuTuning(pr)["CRIU_AIO_DEPTH"]; ok {
+		t.Error("an empty annotation should be left unset, not exported as empty")
+	}
+}

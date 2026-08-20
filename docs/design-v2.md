@@ -1,6 +1,6 @@
 # Design v2 — aligning with NVIDIA Dynamo Snapshot
 
-Status: **§3–§5 implemented and verified on A100; §6 not started.** v1 (tar
+Status: **§3–§5 and §6b implemented and verified on A100.** v1 (tar
 artifacts, live-pod checkpoints) keeps working unchanged — `artifactFormat`
 defaults to `tar`, and a pod without the quiesce annotation takes the v1 path.
 
@@ -10,7 +10,7 @@ defaults to `tar`, and a pod without the quiesce annotation takes the v1 path.
 | §4 quiesce/resume | shipped — `podsnapshot.io/quiesce`, `Quiescing` phase, [hack/snapshot-shim.py](../hack/snapshot-shim.py) |
 | §5 build artifacts | shipped — `SnapshotBuild` CRD, `PodRestore.spec.buildRef`, compatibility-constrained placement |
 | §6a `--stream` restore | not started — `criu-image-streamer` is not on the node images |
-| §6b forked CRIU | not started, deliberately conditional |
+| §6b forked CRIU | shipped — v4.2.1 + 3 patches, opt-in DaemonSet, per-restore tunables |
 | §7 weight decoupling | not started |
 
 Measured numbers are in [§8](#8-rollout). What running §4 against a real vLLM
@@ -404,6 +404,82 @@ merge; a rebase onto CRIU v4.3+ may hand us the whole thing for free, and a
 private fork means owning driver/plugin compatibility for every node image.
 Concretely: check the CRIU tree at the start of this workstream, and only fork
 if the patches are still unmerged *and* 6a measured short.
+
+### What shipped
+
+The upstream check came back the wrong way. The AIO work **is** merged
+(checkpoint-restore/criu#3022 and #3066) but there is no release carrying it:
+the newest tag is still v4.2.1, which is exactly what the node images run. So
+the choice was not fork-vs-upstream, it was fork-vs-wait. We forked.
+
+The fork is not a fork of the tree. It is three patch files against the
+v4.2.1 tarball, applied at image build time:
+
+| File | What it changes |
+|---|---|
+| `hack/criu/patches/0001-pagemap-native-aio-async-page-reads.patch` | `criu/pagemap.c` — the async read path gets an `io_submit`/`io_getevents` sliding window |
+| `hack/criu/patches/0002-shmem-parallel-restore.patch` | `criu/shmem.c` — a thread pool that creates, sizes and fills shmem objects concurrently |
+| `hack/criu/patches/0003-memfd-parallel-inode-restore.patch` | `criu/memfd.c` — the same pool shape for memfd inodes |
+
+Keeping them as patches rather than a checked-out fork is the point:
+`patch --forward` fails loudly if a hunk stops applying, so rebasing onto a
+newer CRIU can't silently drop one, and the diff a reviewer has to read is 1
+000 lines instead of a whole source tree. [Dockerfile.criu](../Dockerfile.criu)
+applies them in sorted order and builds `criu` and `cuda_plugin`.
+
+**The CUDA plugin is deliberately not replaced.** The fork is based on the
+exact CRIU version the node already runs, so the plugin ABI is unchanged and
+the patched binary loads the node's existing
+`/usr/lib/criu/cuda_plugin.so`. The GPU-critical piece — the one whose
+interaction with the driver was validated the hard way — stays byte-identical.
+A freshly built plugin ships alongside and is only laid down on a node that
+has none.
+
+Installation goes to `/usr/local/sbin`, which precedes `/usr/sbin` on the
+default PATH, so runc picks up the patched binary without the distro package
+being touched. Uninstalling is `rm`. The installer
+([hack/criu/install.sh](../hack/criu/install.sh), run by an opt-in DaemonSet
+gated on `criu.enabled`) refuses to leave a binary behind that the host cannot
+execute: it runs `criu --version` under `chroot` and rolls back on failure,
+because a missing shared library would otherwise surface as a failed restore
+minutes later on a different code path.
+
+### Per-restore tuning, not per-node
+
+All three patches read their settings from the environment, and
+`runc restore` is given that environment per restore
+([internal/restore/runc.go](../internal/restore/runc.go)):
+
+| Annotation | Env | Meaning |
+|---|---|---|
+| `podsnapshot.io/criu-aio-depth` | `CRIU_AIO_DEPTH` | reads in flight; `0`/`1` = stock serial `preadv` loop |
+| `podsnapshot.io/criu-shmem-threads` | `CRIU_SHMEM_RESTORE_THREADS` | shmem/memfd objects restored concurrently; `1` = stock serial loop |
+| `podsnapshot.io/criu-image-io-mode` | `CRIU_IMAGE_IO_MODE` | `writeback` (default) or `direct` for `O_DIRECT` |
+
+That shape was chosen for one reason: **A/B on the same binary.** Setting
+depth `0` and threads `1` makes both patches inert, so a regression can be
+attributed to the patches rather than to the rebuild, without reinstalling
+anything on the node. It also means a stock CRIU can be handed the same
+annotations and will simply ignore them, which is why the agent sets them
+unconditionally rather than probing for the fork first.
+
+### What the async patch may not do
+
+`process_async_reads_aio()` deliberately declines the AIO path when
+`opts.auto_dedup` is on — dedup rewrites the image as it reads, and the
+sliding window would have several reads outstanding against a file that is
+being punched underneath them.
+
+Making shmem and memfd page reads `PR_ASYNC` — so the pool and the AIO window
+compose — was tried and reverted. CRIU merges adjacent async read jobs, and
+merging across objects produced a single read spanning past the end of an
+object's pages image: `AIO read returned 0 at 268435456, 1 iovs left`, then
+`BUG at criu/pagemap.c:963`. The two patches now cover disjoint ground: AIO
+accelerates the private-VMA read path, the pools accelerate shmem/memfd. For
+the 14B artifact that split is lopsided — 205 of the 208 page images belong to
+memfds — so the pools are the half that matters and the AIO window is nearly
+idle. On a workload whose memory is mostly private anonymous VMAs it would be
+the other way round.
 
 ---
 

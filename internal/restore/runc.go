@@ -3,13 +3,21 @@ package restore
 import (
 	"context"
 	"fmt"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
 )
+
+// CRIURestoreLogName is the log file runc tells CRIU to write inside the
+// work path. It is CRIU's own diagnostic output and the only place the real
+// reason for a failed restore appears; runc's wrapper error is always the
+// uninformative "criu failed: type RESTORE errno 0".
+const CRIURestoreLogName = "restore.log"
 
 // RuncRunner abstracts runc invocations so the restore controller is testable
 // without a Linux host.
@@ -33,6 +41,12 @@ type RestoreOpts struct {
 	// preserve established TCP connections (escape hatch when peers are
 	// gone; runc.conf's tcp-established handles the normal case).
 	TCPClose bool
+	// Env is added to the environment runc, and through it CRIU, runs
+	// with. runc execs criu directly and nsenter does not sanitize the
+	// environment, so this is how the restore read-path tunables of the
+	// patched CRIU (hack/criu/patches) are set per-restore rather than
+	// per-node.
+	Env map[string]string
 }
 
 // HostRunc executes the node's runc/criu through nsenter into the host mount
@@ -100,6 +114,12 @@ func (h *HostRunc) Restore(ctx context.Context, opts RestoreOpts) (int, error) {
 	args = append(args, opts.ContainerID)
 
 	cmd := h.command(ctx, []string{"--log", logFile, "--log-format", "json"}, args...)
+	if len(opts.Env) > 0 {
+		cmd.Env = os.Environ()
+		for _, k := range slices.Sorted(maps.Keys(opts.Env)) {
+			cmd.Env = append(cmd.Env, k+"="+opts.Env[k])
+		}
+	}
 	// The detached container inherits runc's stdio: never hand it in-process
 	// pipes (CombinedOutput) — the restored workload keeps the write end open
 	// forever and the agent would block on EOF long after runc exits. Point
@@ -117,7 +137,16 @@ func (h *HostRunc) Restore(ctx context.Context, opts RestoreOpts) (int, error) {
 	if runErr != nil {
 		// Tail only: the output file doubles as the restored workload's log
 		// and can be arbitrarily large; this error lands in the CR status.
-		return 0, fmt.Errorf("runc restore failed: %w\noutput tail: %s\nrunc log tail: %s", runErr, strings.TrimSpace(tailFile(outPath, 4096)), tailFile(logFile, 4096))
+		//
+		// criuLogTail is the one that actually says why a restore failed —
+		// runc only ever reports "criu failed: type RESTORE errno 0". It is
+		// listed last so that if a status message is truncated somewhere
+		// downstream, the least useful text is what gets cut.
+		return 0, fmt.Errorf("runc restore failed: %w\noutput tail: %s\nrunc log tail: %s\n%s",
+			runErr,
+			strings.TrimSpace(tailFile(outPath, 4096)),
+			tailFile(logFile, 4096),
+			CRIULogTail(opts.WorkPath, 8192, opts.ImagePath))
 	}
 
 	raw, err := os.ReadFile(pidFile)
@@ -178,4 +207,37 @@ func tailFile(p string, n int64) string {
 		return ""
 	}
 	return string(buf)
+}
+
+// CRIULogTail returns the tail of the CRIU log runc asked for, or — when
+// there is no such file — an inventory of the work directory so a failed
+// restore is still diagnosable after the fact.
+//
+// runc names the log "restore.log" and hands CRIU an fd to the work dir, so
+// that is normally where it lands; alsoLook covers the builds that resolve it
+// against the images directory instead. It is checked for by name rather than
+// globbed because a partial write is still worth reading.
+func CRIULogTail(workPath string, n int64, alsoLook ...string) string {
+	for _, dir := range append([]string{workPath}, alsoLook...) {
+		if dir == "" {
+			continue
+		}
+		if t := tailFile(filepath.Join(dir, CRIURestoreLogName), n); t != "" {
+			return "criu " + filepath.Join(dir, CRIURestoreLogName) + " tail:\n" + strings.TrimSpace(t)
+		}
+	}
+	entries, err := os.ReadDir(workPath)
+	if err != nil {
+		return fmt.Sprintf("no criu %s and work dir %s unreadable: %v", CRIURestoreLogName, workPath, err)
+	}
+	names := make([]string, 0, len(entries))
+	for _, e := range entries {
+		size := int64(-1)
+		if fi, err := e.Info(); err == nil {
+			size = fi.Size()
+		}
+		names = append(names, fmt.Sprintf("%s(%d)", e.Name(), size))
+	}
+	slices.Sort(names)
+	return fmt.Sprintf("no criu %s in %s; work dir holds: %s", CRIURestoreLogName, workPath, strings.Join(names, " "))
 }
