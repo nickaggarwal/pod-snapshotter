@@ -33,6 +33,12 @@ import (
 //
 // GPU checks are skipped (not failed) on nodes without /dev/nvidiactl so the
 // system remains usable for CPU-only checkpoint trials.
+//
+// It also publishes the node's restore-compatibility tuple (GPU model, driver
+// version, CRIU version) as the podsnapshot.io/compat annotation plus a
+// podsnapshot.io/compat-hash label. A restore built against one tuple is
+// confined to nodes carrying the same hash, so an incompatible placement is
+// rejected by the scheduler instead of by CRIU (docs/design-v2.md §5).
 type PrereqChecker struct {
 	Client    client.Client
 	NodeName  string
@@ -47,7 +53,8 @@ type PrereqChecker struct {
 }
 
 var (
-	criuVersionRe = regexp.MustCompile(`Version:\s*(\d+)\.(\d+)`)
+	criuVersionRe     = regexp.MustCompile(`Version:\s*(\d+)\.(\d+)`)
+	criuFullVersionRe = regexp.MustCompile(`Version:\s*(\d+(?:\.\d+)*)`)
 	// nvidia-container-runtime config: mode = "cdi" in the
 	// [nvidia-container-runtime] section (nvidia-ctk config --set writes it
 	// with this exact shape).
@@ -90,7 +97,12 @@ func (p *PrereqChecker) checkAndPublish(ctx context.Context) {
 	if len(failures) > 0 {
 		value = strings.Join(failures, ",")
 	}
-	if node.Annotations[snapv1.PrereqsAnnotation] == value {
+	key := p.compatibility(ctx)
+	compat, hash := key.NodeCompatibility(), key.NodeHash()
+
+	if node.Annotations[snapv1.PrereqsAnnotation] == value &&
+		node.Annotations[snapv1.CompatibilityAnnotation] == compat &&
+		node.Labels[snapv1.CompatibilityHashLabel] == hash {
 		return
 	}
 	patch := client.MergeFrom(node.DeepCopy())
@@ -98,11 +110,45 @@ func (p *PrereqChecker) checkAndPublish(ctx context.Context) {
 		node.Annotations = map[string]string{}
 	}
 	node.Annotations[snapv1.PrereqsAnnotation] = value
+	node.Annotations[snapv1.CompatibilityAnnotation] = compat
+	if hash != "" {
+		if node.Labels == nil {
+			node.Labels = map[string]string{}
+		}
+		node.Labels[snapv1.CompatibilityHashLabel] = hash
+	}
 	if err := p.Client.Patch(ctx, &node, patch); err != nil {
 		logger.Error(err, "patching node annotation")
 		return
 	}
-	logger.Info("published prereq status", "value", value)
+	logger.Info("published prereq status", "value", value, "compat", compat)
+}
+
+// compatibility reads the environment tuple a restore must match. Fields it
+// cannot determine stay empty, and an empty field never blocks a match.
+func (p *PrereqChecker) compatibility(ctx context.Context) *snapv1.CompatibilityKey {
+	var k snapv1.CompatibilityKey
+	if p.SkipHostChecks {
+		return &k
+	}
+	if out, err := p.hostCommand(ctx, "criu", "--version"); err == nil {
+		k.CRIUVersion = parseCriuVersionString(out)
+	}
+	if p.hostFileExists("/dev/nvidiactl") {
+		if out, err := p.hostCommand(ctx, "nvidia-smi", "--query-gpu=name,driver_version", "--format=csv,noheader"); err == nil {
+			name, driver, ok := strings.Cut(strings.TrimSpace(firstLine(out)), ",")
+			if ok {
+				k.GPUModel = strings.TrimSpace(name)
+				k.DriverVersion = strings.TrimSpace(driver)
+			}
+		}
+	}
+	return &k
+}
+
+func firstLine(s string) string {
+	line, _, _ := strings.Cut(s, "\n")
+	return line
 }
 
 // run returns the list of failing check names.
@@ -214,6 +260,17 @@ func (p *PrereqChecker) hostPath(path string) string {
 func (p *PrereqChecker) hostFileExists(path string) bool {
 	_, err := os.Stat(p.hostPath(path))
 	return err == nil
+}
+
+// parseCriuVersionString returns the full version CRIU printed ("4.2.1"),
+// which is the granularity image compatibility actually depends on — unlike
+// parseCriuVersion, which only needs major.minor for the prereq threshold.
+func parseCriuVersionString(out string) string {
+	m := criuFullVersionRe.FindStringSubmatch(out)
+	if len(m) != 2 {
+		return ""
+	}
+	return m[1]
 }
 
 func parseCriuVersion(out string) (major, minor int, ok bool) {

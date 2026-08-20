@@ -3,6 +3,8 @@ package controller
 import (
 	"context"
 	"fmt"
+	"path"
+	"strings"
 	"sync"
 	"time"
 
@@ -86,6 +88,11 @@ func (r *PodSnapshotReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		return r.reconcilePending(ctx, &snap)
 	case snapv1.SnapshotPhaseCheckpointing:
 		return r.reconcileCheckpointing(ctx, &snap)
+	case snapv1.SnapshotPhaseQuiescing:
+		// Agent-owned (it polls the container's rendezvous directory); the
+		// manager only enforces the deadline so a shim that never reports
+		// fails with a specific reason instead of hanging.
+		return r.reconcileQuiescing(ctx, &snap)
 	case snapv1.SnapshotPhaseCheckpointed, snapv1.SnapshotPhaseUploading:
 		// Agent-owned phases; nothing for the manager to do.
 		return ctrl.Result{}, nil
@@ -152,12 +159,14 @@ func (r *PodSnapshotReconciler) reconcilePending(ctx context.Context, snap *snap
 	}
 	setCondition(&snap.Status.Conditions, snapv1.ConditionNodeReady, metav1.ConditionTrue, "PrereqsMet", "")
 
-	// Default artifact URI and validate it.
-	uri := snap.Spec.ArtifactURI
-	if uri == "" {
-		uri = artifact.DefaultURI(snap.Namespace, snap.Name, container)
+	// Default artifact URI and validate it. An explicit URI wins, and its
+	// trailing slash (or absence) decides the format.
+	uriStr := snap.Spec.ArtifactURI
+	if uriStr == "" {
+		uriStr = artifact.DefaultURI(snap.Namespace, snap.Name, container, snap.Spec.ArtifactFormat)
 	}
-	if _, err := artifact.Parse(uri); err != nil {
+	uri, err := artifact.Parse(uriStr)
+	if err != nil {
 		return r.fail(ctx, snap, err.Error())
 	}
 
@@ -165,11 +174,73 @@ func (r *PodSnapshotReconciler) reconcilePending(ctx context.Context, snap *snap
 	snap.Status.PodUID = string(pod.UID)
 	snap.Status.Container = container
 	if snap.Status.Artifact == nil {
-		snap.Status.Artifact = &snapv1.ArtifactStatus{URI: uri}
+		snap.Status.Artifact = &snapv1.ArtifactStatus{URI: uri.String(), Format: uri.Format()}
 	}
+
+	// Quiesce/resume: when the workload opts in, the checkpoint must wait
+	// for its shim to park at a safe point rather than dumping it live
+	// (docs/design-v2.md §4). The node agent owns that wait — it is the only
+	// component that can see inside the container's mount namespace.
+	q, err := resolveQuiesce(&pod)
+	if err != nil {
+		return r.fail(ctx, snap, err.Error())
+	}
+	if q != nil {
+		snap.Status.Quiesce = q
+		snap.Status.Phase = snapv1.SnapshotPhaseQuiescing
+		snap.Status.Message = fmt.Sprintf("waiting for %s/%s from the workload shim", q.Dir, snapv1.ReadyForCheckpointFile)
+		setCondition(&snap.Status.Conditions, snapv1.ConditionQuiesced, metav1.ConditionFalse, "Waiting", snap.Status.Message)
+		return ctrl.Result{}, r.Status().Update(ctx, snap)
+	}
+
 	snap.Status.Phase = snapv1.SnapshotPhaseCheckpointing
 	snap.Status.Message = "calling kubelet checkpoint API"
 	return ctrl.Result{}, r.Status().Update(ctx, snap)
+}
+
+// resolveQuiesce reads the quiesce contract off the pod being snapshotted.
+// Returns nil when the pod has not opted in (the v1 live-dump path).
+func resolveQuiesce(pod *corev1.Pod) (*snapv1.QuiesceStatus, error) {
+	mode := pod.Annotations[snapv1.QuiesceAnnotation]
+	if mode == "" {
+		return nil, nil
+	}
+	if mode != snapv1.QuiesceModePresenceFile {
+		return nil, fmt.Errorf("unsupported %s value %q (only %q is implemented)",
+			snapv1.QuiesceAnnotation, mode, snapv1.QuiesceModePresenceFile)
+	}
+	dir := pod.Annotations[snapv1.QuiesceDirAnnotation]
+	if dir == "" {
+		dir = snapv1.DefaultQuiesceDir
+	}
+	if !strings.HasPrefix(dir, "/") {
+		return nil, fmt.Errorf("%s must be an absolute in-container path, got %q", snapv1.QuiesceDirAnnotation, dir)
+	}
+	timeout := snapv1.DefaultQuiesceTimeout
+	if raw := pod.Annotations[snapv1.QuiesceTimeoutAnnotation]; raw != "" {
+		d, err := time.ParseDuration(raw)
+		if err != nil || d <= 0 {
+			return nil, fmt.Errorf("%s must be a positive Go duration (e.g. \"600s\"), got %q", snapv1.QuiesceTimeoutAnnotation, raw)
+		}
+		timeout = d
+	}
+	deadline := metav1.NewTime(time.Now().Add(timeout))
+	return &snapv1.QuiesceStatus{Mode: mode, Dir: path.Clean(dir), Deadline: &deadline}, nil
+}
+
+func (r *PodSnapshotReconciler) reconcileQuiescing(ctx context.Context, snap *snapv1.PodSnapshot) (ctrl.Result, error) {
+	q := snap.Status.Quiesce
+	if q == nil || q.Deadline == nil {
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+	}
+	if time.Now().Before(q.Deadline.Time) {
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+	}
+	msg := fmt.Sprintf("workload never wrote %s/%s before the quiesce deadline; "+
+		"check the shim in container %q (annotation %s)",
+		q.Dir, snapv1.ReadyForCheckpointFile, snap.Status.Container, snapv1.QuiesceTimeoutAnnotation)
+	setCondition(&snap.Status.Conditions, snapv1.ConditionQuiesced, metav1.ConditionFalse, "QuiesceTimeout", msg)
+	return r.fail(ctx, snap, msg)
 }
 
 func (r *PodSnapshotReconciler) reconcileCheckpointing(ctx context.Context, snap *snapv1.PodSnapshot) (ctrl.Result, error) {

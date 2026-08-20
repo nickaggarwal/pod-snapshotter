@@ -45,12 +45,72 @@ func TestParse(t *testing.T) {
 }
 
 func TestDefaultURI(t *testing.T) {
-	got := DefaultURI("default", "snap1", "vllm")
-	want := "fuse:///snapshots/default/snap1/vllm.tar"
-	if got != want {
-		t.Errorf("DefaultURI = %q, want %q", got, want)
+	for _, tc := range []struct{ format, want string }{
+		{FormatTar, "fuse:///snapshots/default/snap1/vllm.tar"},
+		{"", "fuse:///snapshots/default/snap1/vllm.tar"},
+		{FormatDir, "fuse:///snapshots/default/snap1/vllm/"},
+	} {
+		got := DefaultURI("default", "snap1", "vllm", tc.format)
+		if got != tc.want {
+			t.Errorf("DefaultURI(format=%q) = %q, want %q", tc.format, got, tc.want)
+		}
+		u, err := Parse(got)
+		if err != nil {
+			t.Fatalf("DefaultURI output %q does not parse: %v", got, err)
+		}
+		wantFormat := tc.format
+		if wantFormat == "" {
+			wantFormat = FormatTar
+		}
+		if u.Format() != wantFormat {
+			t.Errorf("Parse(%q).Format() = %q, want %q", got, u.Format(), wantFormat)
+		}
+		if u.String() != got {
+			t.Errorf("round-trip of %q gave %q", got, u.String())
+		}
 	}
-	if _, err := Parse(got); err != nil {
-		t.Errorf("DefaultURI output does not parse: %v", err)
+}
+
+func TestParseDirPrefix(t *testing.T) {
+	u, err := Parse("fuse:///snapshots/ns/name/ctr/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !u.Dir {
+		t.Fatalf("trailing slash should mark a directory prefix: %+v", u)
+	}
+	if u.Path != "/snapshots/ns/name/ctr" {
+		t.Errorf("Path = %q, want the cleaned path without the trailing slash", u.Path)
+	}
+	if got := u.HostPath("/mnt/fuse"); got != "/mnt/fuse/snapshots/ns/name/ctr" {
+		t.Errorf("HostPath = %q", got)
+	}
+	if got := u.CommitPath().String(); got != "fuse:///snapshots/ns/name/ctr/MANIFEST" {
+		t.Errorf("CommitPath = %q, want the MANIFEST", got)
+	}
+
+	f, err := u.Join("checkpoint/pages-1.img")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f.String() != "fuse:///snapshots/ns/name/ctr/checkpoint/pages-1.img" {
+		t.Errorf("Join = %q", f.String())
+	}
+	if _, err := u.Join("../../escape"); err == nil {
+		t.Error("Join should reject traversal out of the prefix")
+	}
+
+	tarURI, err := Parse("fuse:///snapshots/ns/name/ctr.tar")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tarURI.Dir {
+		t.Error("a plain object URI must not be a directory prefix")
+	}
+	if _, err := tarURI.Join("x"); err == nil {
+		t.Error("Join on a non-directory URI should fail")
+	}
+	if tarURI.CommitPath() != tarURI {
+		t.Error("CommitPath of a tar artifact is the tar itself")
 	}
 }

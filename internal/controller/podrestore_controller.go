@@ -7,8 +7,8 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -40,6 +40,8 @@ type PodRestoreReconciler struct {
 // +kubebuilder:rbac:groups=podsnapshot.io,resources=podrestores/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=podsnapshot.io,resources=podrestores/finalizers,verbs=update
 // +kubebuilder:rbac:groups=podsnapshot.io,resources=podsnapshots,verbs=get;list;watch
+// +kubebuilder:rbac:groups=podsnapshot.io,resources=snapshotbuilds,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=nodes,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;create;delete
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 
@@ -92,12 +94,31 @@ func (r *PodRestoreReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 }
 
 func (r *PodRestoreReconciler) reconcilePending(ctx context.Context, restore *snapv1.PodRestore) (ctrl.Result, error) {
-	// Resolve the artifact URI.
+	// Resolve the artifact URI from whichever source was given.
 	uriStr := restore.Spec.ArtifactURI
-	if uriStr == "" {
-		if restore.Spec.SnapshotRef == nil {
-			return r.fail(ctx, restore, "one of spec.artifactURI or spec.snapshotRef is required")
+	switch {
+	case uriStr != "":
+	case restore.Spec.BuildRef != nil:
+		var build snapv1.SnapshotBuild
+		if err := r.Get(ctx, types.NamespacedName{Namespace: restore.Namespace, Name: restore.Spec.BuildRef.Name}, &build); err != nil {
+			if apierrors.IsNotFound(err) {
+				return r.fail(ctx, restore, fmt.Sprintf("buildRef %q not found", restore.Spec.BuildRef.Name))
+			}
+			return ctrl.Result{}, err
 		}
+		if build.Status.Phase != snapv1.BuildPhaseCompleted || build.Status.Artifact == nil {
+			restore.Status.Message = fmt.Sprintf("waiting for SnapshotBuild %s to complete (phase %s)", build.Name, build.Status.Phase)
+			if err := r.Status().Update(ctx, restore); err != nil {
+				return ctrl.Result{}, err
+			}
+			return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
+		}
+		uriStr = build.Status.Artifact.URI
+		// Carrying the tuple onto the restore is what lets placement be
+		// constrained before the pod is scheduled, instead of discovering the
+		// mismatch inside runc restore (docs/design-v2.md §5).
+		restore.Status.Compatibility = build.Status.Compatibility.DeepCopy()
+	case restore.Spec.SnapshotRef != nil:
 		var snap snapv1.PodSnapshot
 		if err := r.Get(ctx, types.NamespacedName{Namespace: restore.Namespace, Name: restore.Spec.SnapshotRef.Name}, &snap); err != nil {
 			if apierrors.IsNotFound(err) {
@@ -113,6 +134,8 @@ func (r *PodRestoreReconciler) reconcilePending(ctx context.Context, restore *sn
 			return ctrl.Result{RequeueAfter: 10 * time.Second}, nil
 		}
 		uriStr = snap.Status.Artifact.URI
+	default:
+		return r.fail(ctx, restore, "one of spec.artifactURI, spec.snapshotRef or spec.buildRef is required")
 	}
 
 	uri, err := artifact.Parse(uriStr)
@@ -144,6 +167,14 @@ func (r *PodRestoreReconciler) reconcilePending(ctx context.Context, restore *sn
 	// If the node is pinned and pre-warm is requested, warm before creating
 	// the placeholder pod (the GPU stays free while bytes stream in). With
 	// scheduler-chosen nodes we must create the pod first to learn the node.
+	// A pinned node bypasses the scheduler, so the compat label cannot do the
+	// filtering — check it here instead.
+	if restore.Spec.NodeName != "" {
+		if handled, res, err := r.checkNodeCompatibility(ctx, restore, restore.Spec.NodeName); handled {
+			return res, err
+		}
+	}
+
 	if restore.Spec.NodeName != "" && boolOrTrue(restore.Spec.Prewarm) {
 		restore.Status.TargetNode = restore.Spec.NodeName
 		restore.Status.Phase = snapv1.RestorePhasePreWarming
@@ -152,6 +183,34 @@ func (r *PodRestoreReconciler) reconcilePending(ctx context.Context, restore *sn
 		restore.Status.Phase = snapv1.RestorePhasePreparing
 	}
 	return ctrl.Result{}, r.Status().Update(ctx, restore)
+}
+
+// checkNodeCompatibility fails the restore when the target node's environment
+// tuple contradicts the one the artifact was built against. handled is false
+// when there is nothing to check (no build reference, or the node has not
+// reported a tuple), so the caller carries on.
+//
+// The label selector on the placeholder pod already keeps the scheduler off
+// incompatible nodes; this turns the remaining cases — a pinned nodeName, an
+// unlabeled node — into an explicit message instead of a CRIU failure.
+func (r *PodRestoreReconciler) checkNodeCompatibility(ctx context.Context, restore *snapv1.PodRestore, nodeName string) (handled bool, res ctrl.Result, err error) {
+	want := restore.Status.Compatibility
+	if want == nil || nodeName == "" {
+		return false, ctrl.Result{}, nil
+	}
+	var node corev1.Node
+	if err := r.Get(ctx, types.NamespacedName{Name: nodeName}, &node); err != nil {
+		return true, ctrl.Result{}, err
+	}
+	raw, ok := node.Annotations[snapv1.CompatibilityAnnotation]
+	if !ok {
+		return false, ctrl.Result{}, nil
+	}
+	if match, why := want.Matches(snapv1.ParseCompatibility(raw)); !match {
+		res, err := r.fail(ctx, restore, fmt.Sprintf("node %s cannot restore this artifact: %s", nodeName, why))
+		return true, res, err
+	}
+	return false, ctrl.Result{}, nil
 }
 
 func (r *PodRestoreReconciler) reconcilePreparing(ctx context.Context, restore *snapv1.PodRestore) (ctrl.Result, error) {
@@ -212,6 +271,10 @@ func (r *PodRestoreReconciler) reconcilePreparing(ctx context.Context, restore *
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 	}
 
+	if handled, res, err := r.checkNodeCompatibility(ctx, restore, pod.Spec.NodeName); handled {
+		return res, err
+	}
+
 	restore.Status.PodName = pod.Name
 	restore.Status.PodUID = string(pod.UID)
 	restore.Status.TargetNode = pod.Spec.NodeName
@@ -270,8 +333,30 @@ func (r *PodRestoreReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		For(&snapv1.PodRestore{}).
 		Owns(&corev1.Pod{}).
 		Watches(&snapv1.PodSnapshot{}, handler.EnqueueRequestsFromMapFunc(r.restoresForSnapshot)).
+		Watches(&snapv1.SnapshotBuild{}, handler.EnqueueRequestsFromMapFunc(r.restoresForBuild)).
 		Named("podrestore").
 		Complete(r)
+}
+
+// restoresForBuild requeues PodRestores whose buildRef matches an updated
+// SnapshotBuild.
+func (r *PodRestoreReconciler) restoresForBuild(ctx context.Context, obj client.Object) []reconcile.Request {
+	build, ok := obj.(*snapv1.SnapshotBuild)
+	if !ok {
+		return nil
+	}
+	var list snapv1.PodRestoreList
+	if err := r.List(ctx, &list, client.InNamespace(build.Namespace)); err != nil {
+		return nil
+	}
+	var reqs []reconcile.Request
+	for i := range list.Items {
+		pr := &list.Items[i]
+		if pr.Spec.BuildRef != nil && pr.Spec.BuildRef.Name == build.Name {
+			reqs = append(reqs, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: pr.Namespace, Name: pr.Name}})
+		}
+	}
+	return reqs
 }
 
 // restoresForSnapshot requeues PodRestores whose snapshotRef matches an

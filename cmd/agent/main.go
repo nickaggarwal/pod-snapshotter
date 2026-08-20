@@ -1,8 +1,9 @@
 // The pod-snapshotter agent runs as a privileged DaemonSet on every
-// checkpoint-capable node. It uploads kubelet checkpoint tars to the
-// fuse-client mount, pre-warms and pins artifacts, performs runc/CRIU
-// restores into placeholder pod sandboxes, and publishes node prerequisite
-// status.
+// checkpoint-capable node. It publishes checkpoints to the fuse-client mount
+// (as a tar or an expanded image directory), waits for quiesce-capable
+// workloads to reach their checkpoint-safe point, pre-warms and pins
+// artifacts, performs runc/CRIU restores into placeholder pod sandboxes, and
+// publishes node prerequisite status.
 package main
 
 import (
@@ -47,6 +48,8 @@ func main() {
 		criSocket       string
 		hostRoot        string
 		skipHostChecks  bool
+		stageImageLocal bool
+		prefetchWorkers int
 	)
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8083", "Metrics endpoint address (0 to disable).")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8084", "Health probe endpoint address.")
@@ -59,6 +62,8 @@ func main() {
 	flag.StringVar(&criSocket, "cri-socket", "/run/containerd/containerd.sock", "CRI runtime socket.")
 	flag.StringVar(&hostRoot, "host-root", "", "Host filesystem mount for file checks (e.g. /host).")
 	flag.BoolVar(&skipHostChecks, "skip-host-checks", false, "Skip nsenter-based prereq checks (dev only).")
+	flag.BoolVar(&stageImageLocal, "stage-image-local", false, "Copy directory artifacts to node-local storage during pre-warm instead of restoring in place through the fuse mount.")
+	flag.IntVar(&prefetchWorkers, "prefetch-parallelism", 0, "Files fetched concurrently from a directory artifact (0 = default).")
 
 	opts := zap.Options{Development: false}
 	opts.BindFlags(flag.CommandLine)
@@ -105,13 +110,15 @@ func main() {
 		os.Exit(1)
 	}
 	restoreCtrl := &agent.RestoreReconciler{
-		Client:    mgr.GetClient(),
-		NodeName:  nodeName,
-		FuseMount: fuseMount,
-		WorkRoot:  workRoot,
-		HostRoot:  hostRoot,
-		Resolver:  resolver,
-		Runc:      restore.NewHostRunc(),
+		Client:              mgr.GetClient(),
+		NodeName:            nodeName,
+		FuseMount:           fuseMount,
+		WorkRoot:            workRoot,
+		HostRoot:            hostRoot,
+		StageImageLocal:     stageImageLocal,
+		PrefetchParallelism: prefetchWorkers,
+		Resolver:            resolver,
+		Runc:                restore.NewHostRunc(),
 	}
 	if fuseAgentSocket != "" {
 		if pinner, err := fuseclient.DialSession(fuseAgentSocket); err != nil {
@@ -122,6 +129,17 @@ func main() {
 	}
 	if err := restoreCtrl.SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "agent-restore")
+		os.Exit(1)
+	}
+
+	// Quiesce controller: waits for the workload shim's presence file before
+	// the manager issues the checkpoint.
+	if err := (&agent.QuiesceReconciler{
+		Client:   mgr.GetClient(),
+		NodeName: nodeName,
+		Resolver: resolver,
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "agent-quiesce")
 		os.Exit(1)
 	}
 

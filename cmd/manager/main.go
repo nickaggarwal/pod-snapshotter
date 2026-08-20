@@ -1,6 +1,7 @@
-// The pod-snapshotter manager runs the PodSnapshot and PodRestore
-// controllers: it calls the kubelet checkpoint API, creates placeholder pods
-// for restores, and coordinates with the node agents through CRD status.
+// The pod-snapshotter manager runs the PodSnapshot, PodRestore and
+// SnapshotBuild controllers: it calls the kubelet checkpoint API, runs
+// one-shot build pods, creates placeholder pods for restores, and coordinates
+// with the node agents through CRD status.
 package main
 
 import (
@@ -34,14 +35,14 @@ func init() {
 
 func main() {
 	var (
-		metricsAddr         string
-		probeAddr           string
+		metricsAddr          string
+		probeAddr            string
 		enableLeaderElection bool
-		kubeletPort         int
-		kubeletInsecureTLS  bool
-		kubeletCAFile       string
-		fuseAPIEndpoint     string
-		requirePrereqs      bool
+		kubeletPort          int
+		kubeletInsecureTLS   bool
+		kubeletCAFile        string
+		fuseAPIEndpoint      string
+		requirePrereqs       bool
 	)
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "Metrics endpoint address (0 to disable).")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8082", "Health probe endpoint address.")
@@ -97,6 +98,13 @@ func main() {
 		Artifacts: store,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "PodRestore")
+		os.Exit(1)
+	}
+	if err := (&controller.SnapshotBuildReconciler{
+		Client:    mgr.GetClient(),
+		Artifacts: store,
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "SnapshotBuild")
 		os.Exit(1)
 	}
 

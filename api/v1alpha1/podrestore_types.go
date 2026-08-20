@@ -33,8 +33,9 @@ const RestoreAnnotation = "podsnapshot.io/restore"
 
 // PodRestoreSpec defines the desired state of PodRestore.
 type PodRestoreSpec struct {
-	// ArtifactURI points at the checkpoint tar (fuse:// or file:// scheme).
-	// Exactly one of ArtifactURI or SnapshotRef must be set.
+	// ArtifactURI points at the checkpoint (fuse:// or file:// scheme); a
+	// trailing slash means an image-directory artifact. Exactly one of
+	// ArtifactURI, SnapshotRef or BuildRef must be set.
 	// +optional
 	ArtifactURI string `json:"artifactURI,omitempty"`
 
@@ -42,6 +43,13 @@ type PodRestoreSpec struct {
 	// status.artifact.uri is used.
 	// +optional
 	SnapshotRef *corev1.LocalObjectReference `json:"snapshotRef,omitempty"`
+
+	// BuildRef names a completed SnapshotBuild in the same namespace. Its
+	// artifact is used, and its compatibility tuple constrains placement:
+	// the placeholder pod is confined to nodes whose environment matches,
+	// instead of discovering the mismatch inside `runc restore`.
+	// +optional
+	BuildRef *corev1.LocalObjectReference `json:"buildRef,omitempty"`
 
 	// PodTemplate for the target pod. The image MUST match the checkpointed
 	// container's image and the template must request the same GPU count.
@@ -111,6 +119,11 @@ type PodRestoreStatus struct {
 	// PrewarmBytes read through the cache during pre-warm.
 	// +optional
 	PrewarmBytes int64 `json:"prewarmBytes,omitempty"`
+
+	// Compatibility is the environment tuple the artifact was built against,
+	// when it came from a SnapshotBuild.
+	// +optional
+	Compatibility *CompatibilityKey `json:"compatibility,omitempty"`
 
 	// +optional
 	Conditions []metav1.Condition `json:"conditions,omitempty"`

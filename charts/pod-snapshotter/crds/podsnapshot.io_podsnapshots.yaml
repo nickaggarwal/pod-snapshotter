@@ -26,6 +26,9 @@ spec:
     - jsonPath: .status.artifact.uri
       name: Artifact
       type: string
+    - jsonPath: .status.artifact.format
+      name: Format
+      type: string
     - jsonPath: .status.artifact.sizeBytes
       name: Size
       type: integer
@@ -58,12 +61,30 @@ spec:
           spec:
             description: PodSnapshotSpec defines the desired state of PodSnapshot.
             properties:
+              artifactFormat:
+                default: tar
+                description: |-
+                  ArtifactFormat selects the on-storage layout:
+
+                    tar — one CRI checkpoint archive (v1 default; restore untars it)
+                    dir — the archive expanded into per-file objects under a prefix,
+                          committed by a MANIFEST written last. Restore reads the CRIU
+                          images in place, so the untar disappears from the restore
+                          critical path (docs/design-v2.md §3).
+
+                  Ignored when artifactURI is set explicitly — the trailing slash decides.
+                enum:
+                - tar
+                - dir
+                type: string
               artifactURI:
                 description: |-
-                  ArtifactURI is where the checkpoint tar is stored. Supported schemes:
+                  ArtifactURI is where the checkpoint is stored. Supported schemes:
                     fuse:///<path>  — a path under the fuse-client mount (/mnt/fuse/<path> on nodes)
                     file:///<path>  — an absolute node-local path (testing only)
-                  Defaults to fuse:///snapshots/<namespace>/<name>/<container>.tar
+                  A trailing slash makes it a directory prefix (artifactFormat: dir).
+                  Defaults to fuse:///snapshots/<namespace>/<name>/<container>.tar,
+                  or .../<container>/ when artifactFormat is dir.
                 type: string
               container:
                 description: |-
@@ -99,12 +120,25 @@ spec:
             description: PodSnapshotStatus defines the observed state of PodSnapshot.
             properties:
               artifact:
-                description: Artifact describes the uploaded tar.
+                description: Artifact describes the uploaded checkpoint.
                 properties:
                   createdAt:
                     format: date-time
                     type: string
+                  fileCount:
+                    description: FileCount is the number of objects in a directory
+                      artifact.
+                    format: int32
+                    type: integer
+                  format:
+                    description: |-
+                      Format is "tar" or "dir"; absent means "tar" so v1 artifacts and the
+                      PodRestores pointing at them keep working unchanged.
+                    type: string
                   sha256:
+                    description: |-
+                      SHA256 of the tar. Empty for directory artifacts — their per-file
+                      digests live in the MANIFEST.
                     type: string
                   sizeBytes:
                     format: int64
@@ -196,6 +230,26 @@ spec:
               podUID:
                 description: PodUID of the checkpointed pod at snapshot time.
                 type: string
+              quiesce:
+                description: Quiesce is set when the target pod opted into the quiesce
+                  protocol.
+                properties:
+                  deadline:
+                    description: Deadline is when the wait for ready-for-checkpoint
+                      gives up.
+                    format: date-time
+                    type: string
+                  dir:
+                    description: Dir is the in-container rendezvous directory.
+                    type: string
+                  mode:
+                    description: Mode is the protocol in use ("presence-file").
+                    type: string
+                  readyAt:
+                    description: ReadyAt is when the presence file appeared.
+                    format: date-time
+                    type: string
+                type: object
               startedAt:
                 format: date-time
                 type: string

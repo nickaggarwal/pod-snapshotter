@@ -1,9 +1,11 @@
 // Package restore implements the node-local restore pipeline:
 //
-//	unpack checkpoint tar -> build OCI bundle -> rewrite spec.dump ->
+//	materialize checkpoint -> build OCI bundle -> rewrite spec.dump ->
 //	runc restore (joining the placeholder pod's sandbox namespaces)
 //
-// The kubelet checkpoint tar (CRI archive) contains:
+// A checkpoint is the CRI archive layout, either inside a tar (v1 artifacts,
+// which must be extracted first — Unpack) or already expanded as a directory
+// (v2 artifacts, read in place — Open):
 //
 //	checkpoint/       CRIU image files (incl. CUDA plugin dumps)
 //	config.dump       container runtime metadata (image, id, ...)
@@ -28,15 +30,24 @@ import (
 	"syscall"
 )
 
-// Bundle is an unpacked checkpoint plus a prepared OCI bundle directory.
+// Bundle is a materialized checkpoint plus a prepared OCI bundle directory.
 type Bundle struct {
-	// Dir is the working directory: <root>/<restore-uid>/
+	// Dir is the directory holding the checkpoint layout — a node-local
+	// working directory for a tar artifact, or the artifact prefix itself
+	// for a directory artifact.
 	Dir string
-	// CheckpointDir contains the CRIU images (<Dir>/checkpoint).
+	// CheckpointDir contains the CRIU images (<Dir>/checkpoint). This is
+	// what runc restore --image-path points at; for a directory artifact it
+	// is read straight out of the artifact with no copy.
 	CheckpointDir string
 	// RootfsDir is the container rootfs the restored process runs over.
 	RootfsDir string
-	// SpecPath is <Dir>/bundle/config.json (rewritten spec.dump).
+	// SpecDumpPath is the checkpointed container's original OCI spec
+	// (<Dir>/spec.dump), the input to RewriteSpec.
+	SpecDumpPath string
+	// SpecPath is <workDir>/bundle/config.json (the rewritten spec.dump).
+	// Always node-local scratch: a directory artifact is shared storage and
+	// must never be written to.
 	SpecPath string
 	// ConfigDump is the parsed config.dump.
 	ConfigDump map[string]any
@@ -121,6 +132,10 @@ const (
 // layout. rootfsDir is where the image rootfs was materialized (by the CRI
 // resolver, from the placeholder container's image mounts); rootfs-diff.tar
 // is applied on top of it.
+//
+// This is the v1 path: every CRIU image file is written out again before
+// runc restore reads its first page. Directory artifacts skip it entirely —
+// see Open and docs/design-v2.md §3.
 func Unpack(tarPath, workDir, rootfsDir string) (*Bundle, error) {
 	if err := os.MkdirAll(workDir, 0o755); err != nil {
 		return nil, err
@@ -134,57 +149,91 @@ func Unpack(tarPath, workDir, rootfsDir string) (*Bundle, error) {
 	if err := extractTar(f, workDir); err != nil {
 		return nil, fmt.Errorf("extracting checkpoint tar: %w", err)
 	}
+	b, err := Open(workDir, workDir, rootfsDir)
+	if err != nil {
+		return nil, fmt.Errorf("checkpoint tar %s: %w", tarPath, err)
+	}
+	return b, nil
+}
 
+// Open builds a Bundle over an already-materialized checkpoint layout:
+//
+//	<imageDir>/checkpoint/       CRIU image files
+//	<imageDir>/spec.dump         original OCI runtime spec
+//	<imageDir>/config.dump       runtime metadata
+//	<imageDir>/rootfs-diff.tar   filesystem writes (applied to rootfsDir)
+//	<imageDir>/dump.log          CRIU dump log
+//
+// imageDir may be shared storage (a fuse:// directory artifact) and is only
+// ever read; everything Open needs to write goes to workDir. rootfsDir is
+// the rootfs the restored process runs over ("" skips the diff).
+func Open(imageDir, workDir, rootfsDir string) (*Bundle, error) {
+	if err := os.MkdirAll(workDir, 0o755); err != nil {
+		return nil, err
+	}
 	b := &Bundle{
-		Dir:           workDir,
-		CheckpointDir: filepath.Join(workDir, "checkpoint"),
+		Dir:           imageDir,
+		CheckpointDir: filepath.Join(imageDir, "checkpoint"),
 		RootfsDir:     rootfsDir,
+		SpecDumpPath:  filepath.Join(imageDir, "spec.dump"),
 		SpecPath:      filepath.Join(workDir, "bundle", "config.json"),
 	}
 	if fi, err := os.Stat(b.CheckpointDir); err != nil || !fi.IsDir() {
-		return nil, fmt.Errorf("checkpoint tar %s has no checkpoint/ directory (not a CRI checkpoint archive?)", tarPath)
+		return nil, fmt.Errorf("no checkpoint/ directory under %s (not a CRI checkpoint layout?)", imageDir)
 	}
 
 	// Parse config.dump (json).
-	if raw, err := os.ReadFile(filepath.Join(workDir, "config.dump")); err == nil {
+	if raw, err := os.ReadFile(filepath.Join(imageDir, "config.dump")); err == nil {
 		_ = json.Unmarshal(raw, &b.ConfigDump)
 	}
 
-	b.ExtraMounts, b.NvidiaHookMounts = scanDumpLog(filepath.Join(workDir, "dump.log"))
+	b.ExtraMounts, b.NvidiaHookMounts = scanDumpLog(filepath.Join(imageDir, "dump.log"))
 
-	// Apply rootfs writes on top of the image rootfs. containerd 2.x writes
-	// this member gzip-compressed despite the .tar name; sniff the magic.
-	diff := filepath.Join(workDir, "rootfs-diff.tar")
-	if _, err := os.Stat(diff); err == nil && rootfsDir != "" {
-		df, err := os.Open(diff)
-		if err != nil {
-			return nil, err
-		}
-		defer df.Close()
-		br := bufio.NewReader(df)
-		var dr io.Reader = br
-		if magic, err := br.Peek(2); err == nil && magic[0] == 0x1f && magic[1] == 0x8b {
-			gz, err := gzip.NewReader(br)
-			if err != nil {
-				return nil, fmt.Errorf("opening gzipped rootfs-diff.tar: %w", err)
-			}
-			defer gz.Close()
-			dr = gz
-		}
-		// tolerateReadOnly: the live rootfs contains read-only bind mounts
-		// injected by the runtime (NVIDIA CDI files like
-		// /etc/vulkan/icd.d/nvidia_icd.json, resolv.conf, etc.) that also
-		// show up in the diff; they are re-injected identically in the new
-		// pod, so EROFS on those paths is expected and safe to skip.
-		if err := extractTarOpts(dr, rootfsDir, true); err != nil {
-			return nil, fmt.Errorf("applying rootfs-diff.tar: %w", err)
-		}
+	if err := applyRootfsDiff(filepath.Join(imageDir, "rootfs-diff.tar"), rootfsDir); err != nil {
+		return nil, err
 	}
 
 	if err := os.MkdirAll(filepath.Dir(b.SpecPath), 0o755); err != nil {
 		return nil, err
 	}
 	return b, nil
+}
+
+// applyRootfsDiff lays the checkpointed container's filesystem writes over
+// the image rootfs. containerd 2.x writes this member gzip-compressed
+// despite the .tar name; sniff the magic.
+func applyRootfsDiff(diff, rootfsDir string) error {
+	if rootfsDir == "" {
+		return nil
+	}
+	df, err := os.Open(diff)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	defer df.Close()
+
+	br := bufio.NewReader(df)
+	var dr io.Reader = br
+	if magic, err := br.Peek(2); err == nil && magic[0] == 0x1f && magic[1] == 0x8b {
+		gz, err := gzip.NewReader(br)
+		if err != nil {
+			return fmt.Errorf("opening gzipped rootfs-diff.tar: %w", err)
+		}
+		defer gz.Close()
+		dr = gz
+	}
+	// tolerateReadOnly: the live rootfs contains read-only bind mounts
+	// injected by the runtime (NVIDIA CDI files like
+	// /etc/vulkan/icd.d/nvidia_icd.json, resolv.conf, etc.) that also show up
+	// in the diff; they are re-injected identically in the new pod, so EROFS
+	// on those paths is expected and safe to skip.
+	if err := extractTarOpts(dr, rootfsDir, true); err != nil {
+		return fmt.Errorf("applying rootfs-diff.tar: %w", err)
+	}
+	return nil
 }
 
 // extractTar safely extracts a tar stream into dir, rejecting path escapes.

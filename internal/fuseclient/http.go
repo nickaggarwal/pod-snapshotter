@@ -84,6 +84,26 @@ func (c *HTTPClient) Stat(ctx context.Context, fusePath string) (int64, error) {
 	return 0, nil
 }
 
+// Get opens a file for reading. The caller closes the body.
+func (c *HTTPClient) Get(ctx context.Context, fusePath string) (io.ReadCloser, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.fileURL(fusePath), nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("get %s: %w", fusePath, err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		resp.Body.Close()
+		if resp.StatusCode == http.StatusNotFound {
+			return nil, fmt.Errorf("artifact %s not found on fuse-client", fusePath)
+		}
+		return nil, fmt.Errorf("get %s returned %d", fusePath, resp.StatusCode)
+	}
+	return resp.Body, nil
+}
+
 // Delete removes a file.
 func (c *HTTPClient) Delete(ctx context.Context, fusePath string) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, c.fileURL(fusePath), nil)
