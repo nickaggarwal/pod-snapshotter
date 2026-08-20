@@ -1,5 +1,5 @@
 diff --git a/criu/include/shmem.h b/criu/include/shmem.h
-index 15cab11..c472639 100644
+index 15cab11..7594cb6 100644
 --- a/criu/include/shmem.h
 +++ b/criu/include/shmem.h
 @@ -7,8 +7,17 @@
@@ -11,8 +11,8 @@ index 15cab11..c472639 100644
  extern int collect_shmem(int pid, struct vma_area *vma);
 +/*
 + * Restore the contents of this task's own shmem objects on a thread pool,
-+ * ahead of the VMA walk. Best-effort: anything it does not claim, or fails
-+ * on, open_shmem() still handles inline.
++ * ahead of the serial VMA walk. Best-effort: anything it does not claim, or
++ * fails on, open_shmem() still handles inline.
 + */
 +extern int shmem_restore_parallel(int pid, struct list_head *vmas);
 +/* How many objects the restore-side thread pools work on at once. */
@@ -21,26 +21,27 @@ index 15cab11..c472639 100644
  extern int cr_dump_shmem(void);
  extern int add_shmem_area(pid_t pid, VmaEntry *vma, pmc_t *pmc);
 diff --git a/criu/mem.c b/criu/mem.c
-index 9e8740c..2356a54 100644
+index 9e8740c..4089fbd 100644
 --- a/criu/mem.c
 +++ b/criu/mem.c
-@@ -1454,6 +1454,14 @@ int open_vmas(struct pstree_item *t)
- 	struct vma_area *vma;
- 	struct vm_area_list *vmas = &rsti(t)->vmas;
+@@ -1456,6 +1456,15 @@ int open_vmas(struct pstree_item *t)
  
-+	/*
-+	 * Shmem contents do not depend on each other or on the order VMAs are
-+	 * opened in, so get them read in parallel before the serial walk below
-+	 * has to do it one object at a time.
-+	 */
-+	if (shmem_restore_parallel(pid, &vmas->h))
-+		return -1;
-+
  	filemap_ctx_init(false);
  
++	/*
++	 * Best-effort pre-pass: fill this task's shared anonymous mappings on
++	 * several threads, so the walk below only has to adopt them. Anything
++	 * it does not manage is restored inline by vm_open() exactly as
++	 * before, so a failure here is not one worth aborting the restore for.
++	 */
++	if (shmem_restore_parallel(pid, &vmas->h))
++		pr_warn("Parallel shmem restore unavailable; restoring inline\n");
++
  	list_for_each_entry(vma, &vmas->h, list) {
+ 		if (!vma_area_is(vma, VMA_AREA_REGULAR) || !vma->vm_open)
+ 			continue;
 diff --git a/criu/shmem.c b/criu/shmem.c
-index bc7aa36..03a5679 100644
+index bc7aa36..5cf5d85 100644
 --- a/criu/shmem.c
 +++ b/criu/shmem.c
 @@ -3,6 +3,7 @@
@@ -51,24 +52,30 @@ index bc7aa36..03a5679 100644
  
  #include "common/config.h"
  #include "common/list.h"
-@@ -68,6 +69,16 @@ struct shmem_info {
+@@ -68,6 +69,22 @@ struct shmem_info {
  			 */
  			int fd;
  
 +			/*
-+			 * A memfd whose contents have already been restored,
-+			 * out of line, by shmem_restore_parallel(). Only ever
-+			 * set and consumed by the owner process (si->pid), so
-+			 * although shmem_info lives in shared memory this
-+			 * descriptor is never read by anyone it is not valid
-+			 * in. -1 means "nothing prepared".
++			 * A memfd already created and filled by
++			 * shmem_restore_parallel(), for open_shmem() to
++			 * adopt. -1 means nothing prepared, -2 means claimed
++			 * but not yet filled.
++			 *
++			 * Unlike the memfd inode's equivalent this may be a
++			 * plain descriptor: shmem_restore_parallel() runs
++			 * from open_vmas(), i.e. already inside the forked
++			 * task that will consume it, so it never crosses a
++			 * fork. (prepare_memfd_inodes() runs in CRIU's main
++			 * process, before the tasks exist, which is why that
++			 * side has to go through the fdstore.)
 +			 */
 +			int prep_fd;
 +
  			/*
  			 * 0. lock is initialized to zero
  			 * 1. the master opens a descriptor and set lock to 1
-@@ -440,6 +451,7 @@ int collect_shmem(int pid, struct vma_area *vma)
+@@ -440,6 +457,7 @@ int collect_shmem(int pid, struct vma_area *vma)
  	si->pid = pid;
  	si->size = size;
  	si->fd = -1;
@@ -76,56 +83,26 @@ index bc7aa36..03a5679 100644
  	si->count = 1;
  	si->self_count = 1;
  	futex_init(&si->lock);
-@@ -491,6 +503,24 @@ static int do_restore_shmem_content(void *addr, unsigned long size, unsigned lon
- 		if (vaddr + nr_pages * PAGE_SIZE > size)
- 			break;
- 
-+		/*
-+		 * Deliberately a synchronous read.
-+		 *
-+		 * PR_ASYNC would queue these into the page_read's async list
-+		 * and let process_async_reads() issue them together, which is
-+		 * where the AIO patch would pick them up. Measured against a
-+		 * real GPU checkpoint that turned out to build read jobs
-+		 * spanning past the end of the object's pages image -- the
-+		 * queue merges adjacent reads, and the shmem walk's notion of
-+		 * "adjacent" does not hold across the image boundaries the way
-+		 * the private-VMA walk's does. The serial path never builds
-+		 * such a job, so it never noticed.
-+		 *
-+		 * Parallelism for these objects comes from the thread pool in
-+		 * shmem_restore_parallel()/memfd_restore_parallel() instead:
-+		 * whole objects at a time, each with its own page_read, which
-+		 * needs no change to how a read job is put together.
-+		 */
- 		pr.read_pages(&pr, vaddr, nr_pages, addr + vaddr, 0);
- 	}
- 
-@@ -543,6 +573,289 @@ out:
+@@ -543,6 +561,262 @@ out:
  	return ret;
  }
  
 +/*
-+ * Parallel memfd restore.
++ * Parallel shmem restore.
 + *
-+ * open_vmas() walks a process's VMAs one at a time, and for each shared
++ * open_vmas() walks a task's VMAs one at a time, and for each shared
 + * anonymous mapping open_shmem() does the whole of create -> resize -> map ->
 + * read -> next before the walk moves on. Every one of those reads is a
 + * synchronous pread against the pages image, so a task with many shmem
 + * objects restores them strictly one after another and leaves most of the
 + * device's read bandwidth unused.
 + *
-+ * That ordering costs nothing to give up: distinct shmem objects have no
-+ * dependency on each other. This pass restores their contents up front, on a
-+ * pool of threads, and leaves the memfd on si->prep_fd. open_shmem() then
-+ * adopts it and skips straight to the part that does have ordering
-+ * constraints -- publishing si->fd and the futex handshake with the slave
-+ * processes, which stays exactly as it was, on the main thread.
-+ *
-+ * It matters most where it was measured: a GPU checkpoint. cuda-checkpoint
-+ * parks device memory in host buffers that CRIU sees as memfds, so on a
-+ * checkpoint of a 14B-parameter vLLM engine 205 of the 208 page images were
-+ * shmem ones -- essentially the whole 52 GiB.
++ * Distinct shmem objects have no dependency on each other, so that ordering
++ * costs nothing to give up. This pass fills them up front on a pool of
++ * threads and leaves the memfd on si->prep_fd; open_shmem() adopts it and
++ * skips to the part that does have ordering constraints -- publishing si->fd
++ * and the futex handshake with the slave processes, which stays exactly as it
++ * was, on this task's own thread.
 + */
 +
 +#define SHMEM_RESTORE_THREADS_MAX 32
@@ -144,15 +121,15 @@ index bc7aa36..03a5679 100644
 +
 +/*
 + * How many objects to restore at once. Shared with the memfd pass, which has
-+ * exactly the same shape of work and no reason to be tuned separately. Bounded by the number of CPUs the
-+ * restore is allowed to use; CRIU_SHMEM_RESTORE_THREADS overrides it, and 1
-+ * turns the pass off entirely (open_shmem() then does the work inline, as
-+ * before).
++ * the same shape of work and no reason to be tuned separately.
++ * CRIU_SHMEM_RESTORE_THREADS overrides the default, and 1 turns both passes
++ * off entirely -- which is what makes an A/B against the unpatched behavior
++ * possible on one binary.
 + */
 +unsigned int shmem_restore_threads(void)
 +{
 +	const char *env = getenv("CRIU_SHMEM_RESTORE_THREADS");
-+	long nr;
++	long nr = 0;
 +
 +	if (env && *env) {
 +		char *end;
@@ -162,8 +139,6 @@ index bc7aa36..03a5679 100644
 +			pr_warn("Ignoring bad CRIU_SHMEM_RESTORE_THREADS=%s\n", env);
 +			nr = 0;
 +		}
-+	} else {
-+		nr = 0;
 +	}
 +
 +	if (!nr) {
@@ -182,9 +157,9 @@ index bc7aa36..03a5679 100644
 +
 +/*
 + * Fill one memfd with its checkpointed contents. Everything here is
-+ * per-object state: the memfd, its mapping, and the page_read that
-+ * restore_shmem_content() opens against this object's own image files. No
-+ * two workers touch the same shmem_info.
++ * per-object: the memfd, its mapping, and the page_read that
++ * restore_shmem_content() opens against this object's own image files. No two
++ * workers touch the same shmem_info.
 + */
 +static int shmem_prep_one(struct shmem_info *si)
 +{
@@ -243,19 +218,32 @@ index bc7aa36..03a5679 100644
 +	return NULL;
 +}
 +
++static void shmem_unclaim(struct list_head *vmas)
++{
++	struct vma_area *vma;
++
++	list_for_each_entry(vma, vmas, list) {
++		struct shmem_info *si;
++
++		if (!vma_area_is(vma, VMA_AREA_REGULAR) || vma->vm_open != open_shmem)
++			continue;
++		si = shmem_find(vma->e->shmid);
++		if (si && si->prep_fd == -2)
++			si->prep_fd = -1;
++	}
++}
++
 +/*
-+ * Restore, in parallel, the contents of every shmem object this process owns
-+ * and will have to create itself.
++ * Restore, in parallel, the contents of every shmem object this task owns and
++ * will have to create itself.
 + *
 + * Deliberately conservative about what it claims. Hugetlb mappings and the
 + * no-memfd fallback both need open_shmem()'s original path, and an object
-+ * another process owns is that process's job -- anything not claimed here is
-+ * simply left for open_shmem() to do inline, so the worst case is the old
-+ * behavior rather than a broken restore.
-+ *
-+ * A failure is not fatal either: the object keeps prep_fd == -1 and
-+ * open_shmem() retries it inline, where the error is reported in the context
-+ * that has always reported it.
++ * another task owns is that task's job -- anything not claimed here is simply
++ * left for open_shmem() to do inline, so the worst case is the old behavior
++ * rather than a broken restore. A failure is not fatal either: the object
++ * goes back to prep_fd == -1 and open_shmem() retries it inline, where the
++ * error is reported in the context that has always reported it.
 + */
 +int shmem_restore_parallel(int pid, struct list_head *vmas)
 +{
@@ -263,7 +251,6 @@ index bc7aa36..03a5679 100644
 +	pthread_t threads[SHMEM_RESTORE_THREADS_MAX];
 +	unsigned int nr_threads, i, started = 0;
 +	struct vma_area *vma;
-+	int ret = 0;
 +
 +	if (!kdat.has_memfd)
 +		return 0;
@@ -272,7 +259,7 @@ index bc7aa36..03a5679 100644
 +	if (nr_threads < 2)
 +		return 0;
 +
-+	/* Count first so the job array can be allocated in one go. */
++	/* Count first, so the job array can be allocated in one go. */
 +	list_for_each_entry(vma, vmas, list) {
 +		struct shmem_info *si;
 +
@@ -296,22 +283,14 @@ index bc7aa36..03a5679 100644
 +
 +	if (pool.nr_jobs < 2) {
 +		/* Nothing to overlap; undo the claims and let open_shmem work. */
-+		list_for_each_entry(vma, vmas, list) {
-+			struct shmem_info *si;
-+
-+			if (!vma_area_is(vma, VMA_AREA_REGULAR) || vma->vm_open != open_shmem)
-+				continue;
-+			si = shmem_find(vma->e->shmid);
-+			if (si && si->prep_fd == -2)
-+				si->prep_fd = -1;
-+		}
++		shmem_unclaim(vmas);
 +		return 0;
 +	}
 +
 +	pool.jobs = xzalloc(pool.nr_jobs * sizeof(*pool.jobs));
 +	if (!pool.jobs) {
-+		ret = -1;
-+		goto out_unclaim;
++		shmem_unclaim(vmas);
++		return -1;
 +	}
 +
 +	pool.nr_jobs = 0;
@@ -344,29 +323,17 @@ index bc7aa36..03a5679 100644
 +		started++;
 +	}
 +
-+	if (started == 0) {
-+		/* Could not start a single thread; do it all here. */
-+		shmem_prep_worker(&pool);
-+	} else {
-+		/*
-+		 * The caller's thread is one more pair of hands, and taking
-+		 * jobs here means a failure to start every thread still makes
-+		 * progress.
-+		 */
-+		shmem_prep_worker(&pool);
-+		for (i = 0; i < started; i++)
-+			pthread_join(threads[i], NULL);
-+	}
++	/* This thread is one more pair of hands, and covers started == 0. */
++	shmem_prep_worker(&pool);
++
++	for (i = 0; i < started; i++)
++		pthread_join(threads[i], NULL);
 +
 +	pthread_mutex_destroy(&pool.lock);
 +
 +	for (i = 0; i < pool.nr_jobs; i++) {
 +		if (pool.jobs[i].ret == 0)
 +			continue;
-+		/*
-+		 * Leave it to open_shmem(): whatever went wrong will go wrong
-+		 * again there, with the original error handling around it.
-+		 */
 +		pr_warn("Parallel restore of shmem 0x%lx failed; falling back to inline restore\n",
 +			pool.jobs[i].si->shmid);
 +		pool.jobs[i].si->prep_fd = -1;
@@ -374,32 +341,20 @@ index bc7aa36..03a5679 100644
 +
 +	xfree(pool.jobs);
 +	return 0;
-+
-+out_unclaim:
-+	list_for_each_entry(vma, vmas, list) {
-+		struct shmem_info *si;
-+
-+		if (!vma_area_is(vma, VMA_AREA_REGULAR) || vma->vm_open != open_shmem)
-+			continue;
-+		si = shmem_find(vma->e->shmid);
-+		if (si && si->prep_fd == -2)
-+			si->prep_fd = -1;
-+	}
-+	return ret;
 +}
 +
  struct open_map_file_args {
  	unsigned long addr, size;
  };
-@@ -593,6 +906,17 @@ static int open_shmem(int pid, struct vma_area *vma)
+@@ -593,6 +867,17 @@ static int open_shmem(int pid, struct vma_area *vma)
  		memfd_flag |= MFD_HUGETLB | size_flag;
  	}
  
 +	if (si->prep_fd >= 0) {
 +		/*
 +		 * shmem_restore_parallel() already created the memfd and read
-+		 * the contents into it. Everything below up to the handshake
-+		 * is exactly that work, so skip to the handshake.
++		 * the contents into it; everything up to the handshake is
++		 * exactly that work.
 +		 */
 +		f = si->prep_fd;
 +		si->prep_fd = -1;
@@ -409,7 +364,7 @@ index bc7aa36..03a5679 100644
  	if (kdat.has_memfd && (!is_hugetlb || kdat.has_memfd_hugetlb)) {
  		f = memfd_create("", memfd_flag);
  		if (f < 0) {
-@@ -636,7 +960,9 @@ static int open_shmem(int pid, struct vma_area *vma)
+@@ -636,7 +921,9 @@ static int open_shmem(int pid, struct vma_area *vma)
  			goto err;
  	}
  	munmap(addr, si->size);

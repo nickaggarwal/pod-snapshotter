@@ -1,37 +1,15 @@
 diff --git a/criu/memfd.c b/criu/memfd.c
-index 9d9f062..902afbd 100644
+index 9d9f062..3e9033f 100644
 --- a/criu/memfd.c
 +++ b/criu/memfd.c
-@@ -1,5 +1,7 @@
+@@ -1,5 +1,6 @@
  #include <unistd.h>
  #include <linux/memfd.h>
 +#include <pthread.h>
-+#include <stdlib.h>
  
  #include "common/compiler.h"
  #include "common/lock.h"
-@@ -47,6 +49,12 @@ struct memfd_restore_inode {
- 	unsigned int pending_seals;
- 	MemfdInodeEntry *mie;
- 	bool was_opened_rw;
-+	/*
-+	 * A memfd already created and filled by memfd_restore_parallel().
-+	 * -1 means nothing prepared; memfd_open_inode_nocache() adopts it and
-+	 * carries on with the parts that have to stay serial.
-+	 */
-+	int prep_fd;
- };
- 
- static LIST_HEAD(memfd_inodes);
-@@ -235,6 +243,7 @@ static int collect_one_memfd_inode(void *o, ProtobufCMessage *base, struct cr_im
- 	inode->fdstore_id = -1;
- 	inode->pending_seals = 0;
- 	inode->was_opened_rw = false;
-+	inode->prep_fd = -1;
- 
- 	list_add_tail(&inode->list, &memfd_inodes);
- 
-@@ -249,19 +258,169 @@ static struct collect_image_info memfd_inode_cinfo = {
+@@ -249,19 +250,205 @@ static struct collect_image_info memfd_inode_cinfo = {
  	.flags = COLLECT_SHARED | COLLECT_NOFREE,
  };
  
@@ -39,25 +17,35 @@ index 9d9f062..902afbd 100644
 + * Parallel memfd restore.
 + *
 + * Every memfd inode is otherwise created and filled the first time some task
-+ * happens to open it, one at a time, deep inside the serial file-restore
-+ * walk. The contents come from independent page images and nothing about them
-+ * depends on the order, so the whole set can be read at once instead.
++ * happens to open it -- one at a time, deep inside the serial file-restore
++ * walk, each fill a synchronous read against its own pages image. The
++ * contents of distinct inodes have no dependency on each other, so the whole
++ * set can be read at once instead.
 + *
 + * This is the half of the restore that matters on a GPU checkpoint:
 + * cuda-checkpoint parks device memory in host buffers that CRIU records as
 + * memfds, so on a checkpoint of a 14B-parameter vLLM engine 205 of the 208
 + * page images were memfd ones -- essentially the entire 52 GiB.
 + *
-+ * Only the create-and-fill part is done here. Permissions, the seal
-+ * bookkeeping and fdstore_add() stay in memfd_open_inode_nocache() on the
-+ * main thread, so nothing this pass touches is shared with the rest of the
-+ * restore beyond the inode it owns.
++ * The result is published through the fdstore, NOT as an fd number on the
++ * shared inode. memfd_open_inode_nocache() runs inside forked tasks that have
++ * already rebuilt their fd tables (setup_newborn_fds -> close_old_fds), so a
++ * descriptor opened here is not valid there and would be either closed or
++ * some unrelated file. fdstore_add() is exactly the mechanism CRIU already
++ * uses to hand a descriptor across that boundary, and memfd_open_inode()
++ * already prefers fdstore_id when it is set -- so a prepared inode needs no
++ * new lookup path, it simply arrives already cached.
 + *
-+ * Best-effort throughout: an inode that is not claimed, or that fails here,
-+ * keeps prep_fd == -1 and is restored inline exactly as before.
++ * Best-effort: an inode that is not claimed, or that fails here, is left
++ * exactly as it was and gets restored inline as before.
 + */
 +
++/*
++ * Defined below, next to the serial path it shares the seal decision with.
++ */
 +static int memfd_create_inode(struct memfd_restore_inode *inode);
++
++#define MEMFD_RESTORE_THREADS_MAX 32
 +
 +struct memfd_prep_job {
 +	struct memfd_restore_inode *inode;
@@ -74,7 +62,7 @@ index 9d9f062..902afbd 100644
 +static int memfd_prep_one(struct memfd_restore_inode *inode)
 +{
 +	MemfdInodeEntry *mie = inode->mie;
-+	int fd;
++	int fd, ret;
 +
 +	fd = memfd_create_inode(inode);
 +	if (fd < 0) {
@@ -87,7 +75,27 @@ index 9d9f062..902afbd 100644
 +		return -1;
 +	}
 +
-+	inode->prep_fd = fd;
++	if (mie->has_mode)
++		ret = cr_fchperm(fd, mie->uid, mie->gid, mie->mode);
++	else
++		ret = cr_fchown(fd, mie->uid, mie->gid);
++	if (ret) {
++		pr_perror("Can't set permissions { uid %d gid %d mode %#o } of memfd:%s", (int)mie->uid,
++			  (int)mie->gid, mie->has_mode ? (int)mie->mode : -1, mie->name);
++		close(fd);
++		return -1;
++	}
++
++	/*
++	 * fdstore_add() sends the descriptor over a unix socket that every
++	 * forked task inherits, and takes desc->lock while doing so, so it is
++	 * safe to call from several workers at once.
++	 */
++	inode->fdstore_id = fdstore_add(fd);
++	close(fd);
++	if (inode->fdstore_id < 0)
++		return -1;
++
 +	return 0;
 +}
 +
@@ -115,7 +123,7 @@ index 9d9f062..902afbd 100644
 +static int memfd_restore_parallel(void)
 +{
 +	struct memfd_prep_pool pool = {};
-+	pthread_t threads[32];
++	pthread_t threads[MEMFD_RESTORE_THREADS_MAX];
 +	unsigned int nr_threads, i, started = 0;
 +	struct memfd_restore_inode *inode;
 +
@@ -126,7 +134,7 @@ index 9d9f062..902afbd 100644
 +		nr_threads = ARRAY_SIZE(threads);
 +
 +	list_for_each_entry(inode, &memfd_inodes, list) {
-+		if (inode->fdstore_id == -1 && inode->prep_fd == -1 && inode->mie->size)
++		if (inode->fdstore_id == -1 && inode->mie->size)
 +			pool.nr_jobs++;
 +	}
 +
@@ -139,7 +147,7 @@ index 9d9f062..902afbd 100644
 +
 +	pool.nr_jobs = 0;
 +	list_for_each_entry(inode, &memfd_inodes, list) {
-+		if (inode->fdstore_id == -1 && inode->prep_fd == -1 && inode->mie->size) {
++		if (inode->fdstore_id == -1 && inode->mie->size) {
 +			pool.jobs[pool.nr_jobs].inode = inode;
 +			pool.jobs[pool.nr_jobs].ret = -1;
 +			pool.nr_jobs++;
@@ -171,9 +179,15 @@ index 9d9f062..902afbd 100644
 +	for (i = 0; i < pool.nr_jobs; i++) {
 +		if (pool.jobs[i].ret == 0)
 +			continue;
-+		pr_warn("Parallel restore of memfd inode %" PRIu64 " failed; falling back to inline restore\n",
-+			(uint64_t)pool.jobs[i].inode->mie->inode_id);
-+		pool.jobs[i].inode->prep_fd = -1;
++		/*
++		 * Whatever went wrong will go wrong again inline, with the
++		 * original error handling around it. Reset the seal decision
++		 * this pass may have recorded so the retry starts clean.
++		 */
++		pr_warn("Parallel restore of memfd %s failed; falling back to inline restore\n",
++			pool.jobs[i].inode->mie->name);
++		pool.jobs[i].inode->fdstore_id = -1;
++		pool.jobs[i].inode->pending_seals = 0;
 +	}
 +
 +	xfree(pool.jobs);
@@ -191,9 +205,9 @@ index 9d9f062..902afbd 100644
  
 -static int memfd_open_inode_nocache(struct memfd_restore_inode *inode)
 +/*
-+ * Create the memfd this inode will be restored into. Also decides when the
-+ * seals get applied, which is why it is shared rather than duplicated: the
-+ * parallel pass and the serial one have to agree.
++ * Create the memfd this inode restores into, and record the seal decision
++ * that goes with the flags chosen here. Shared between the parallel pass and
++ * the serial one so the two cannot disagree about either.
 + */
 +static int memfd_create_inode(struct memfd_restore_inode *inode)
  {
@@ -207,20 +221,14 @@ index 9d9f062..902afbd 100644
  	if (mie->seals == F_SEAL_SEAL) {
  		inode->pending_seals = 0;
  		flags = 0;
-@@ -274,14 +433,35 @@ static int memfd_open_inode_nocache(struct memfd_restore_inode *inode)
+@@ -274,7 +461,18 @@ static int memfd_open_inode_nocache(struct memfd_restore_inode *inode)
  	if (mie->has_hugetlb_flag)
  		flags |= mie->hugetlb_flag;
  
 -	fd = memfd_create(mie->name, flags);
--	if (fd < 0) {
--		pr_perror("Can't create memfd:%s", mie->name);
--		goto out;
--	}
 +	return memfd_create(mie->name, flags);
 +}
- 
--	if (restore_memfd_shmem_content(fd, mie->shmid, mie->size))
--		goto out;
++
 +static int memfd_open_inode_nocache(struct memfd_restore_inode *inode)
 +{
 +	MemfdInodeEntry *mie = NULL;
@@ -229,24 +237,7 @@ index 9d9f062..902afbd 100644
 +
 +	mie = inode->mie;
 +
-+	if (inode->prep_fd >= 0) {
-+		/*
-+		 * memfd_restore_parallel() already created this memfd and read
-+		 * its contents in. Everything below is the part that has to
-+		 * stay on this thread.
-+		 */
-+		fd = inode->prep_fd;
-+		inode->prep_fd = -1;
-+	} else {
-+		fd = memfd_create_inode(inode);
-+		if (fd < 0) {
-+			pr_perror("Can't create memfd:%s", mie->name);
-+			goto out;
-+		}
-+
-+		if (restore_memfd_shmem_content(fd, mie->shmid, mie->size))
-+			goto out;
-+	}
- 
- 	if (mie->has_mode)
- 		ret = cr_fchperm(fd, mie->uid, mie->gid, mie->mode);
++	fd = memfd_create_inode(inode);
+ 	if (fd < 0) {
+ 		pr_perror("Can't create memfd:%s", mie->name);
+ 		goto out;

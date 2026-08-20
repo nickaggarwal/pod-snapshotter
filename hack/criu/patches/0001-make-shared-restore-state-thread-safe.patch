@@ -1,0 +1,153 @@
+diff --git a/criu/bfd.c b/criu/bfd.c
+index 2c5f5b6..3009fd0 100644
+--- a/criu/bfd.c
++++ b/criu/bfd.c
+@@ -6,6 +6,7 @@
+ #include <fcntl.h>
+ #include <sys/uio.h>
+ #include <errno.h>
++#include <pthread.h>
+ 
+ #include "int.h"
+ #include "log.h"
+@@ -32,12 +33,28 @@ struct bfd_buf {
+ 
+ static LIST_HEAD(bufs);
+ 
++/*
++ * The buffer free list is process-wide and was only ever touched by the one
++ * thread CRIU used to have. The restore-side thread pools (shmem_restore_
++ * parallel(), memfd_restore_parallel()) open a page_read per worker, and
++ * open_page_read() -> open_image_at() -> bfdopenr() allocates from here, so
++ * several threads now reach it at once. Without this lock two workers can
++ * take the same buffer off the list, or race the refill, and each then reads
++ * its pagemap into memory the other is also using -- which corrupts image
++ * parsing rather than failing, so it is worth being blunt about.
++ *
++ * Contention is irrelevant: this is hit once per image open, not per read.
++ */
++static pthread_mutex_t bufs_lock = PTHREAD_MUTEX_INITIALIZER;
++
+ #define BUFBATCH (16)
+ 
+ static int buf_get(struct xbuf *xb)
+ {
+ 	struct bfd_buf *b;
+ 
++	pthread_mutex_lock(&bufs_lock);
++
+ 	if (list_empty(&bufs)) {
+ 		void *mem;
+ 		int i;
+@@ -45,6 +62,7 @@ static int buf_get(struct xbuf *xb)
+ 		mem = mmap(NULL, BUFBATCH * BUFSIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, 0, 0);
+ 		if (mem == MAP_FAILED) {
+ 			pr_perror("No buf");
++			pthread_mutex_unlock(&bufs_lock);
+ 			return -1;
+ 		}
+ 
+@@ -53,6 +71,7 @@ static int buf_get(struct xbuf *xb)
+ 			if (!b) {
+ 				if (i == 0) {
+ 					pr_err("No buffer for bfd\n");
++					pthread_mutex_unlock(&bufs_lock);
+ 					return -1;
+ 				}
+ 
+@@ -68,6 +87,8 @@ static int buf_get(struct xbuf *xb)
+ 	b = list_first_entry(&bufs, struct bfd_buf, l);
+ 	list_del_init(&b->l);
+ 
++	pthread_mutex_unlock(&bufs_lock);
++
+ 	xb->mem = b->mem;
+ 	xb->data = xb->mem;
+ 	xb->sz = 0;
+@@ -81,7 +102,10 @@ static void buf_put(struct xbuf *xb)
+ 	 * Don't unmap buffer back, it will get reused
+ 	 * by next bfdopen call
+ 	 */
++	pthread_mutex_lock(&bufs_lock);
+ 	list_add(&xb->buf->l, &bufs);
++	pthread_mutex_unlock(&bufs_lock);
++
+ 	xb->buf = NULL;
+ 	xb->mem = NULL;
+ 	xb->data = NULL;
+diff --git a/criu/log.c b/criu/log.c
+index bf6f657..be99b63 100644
+--- a/criu/log.c
++++ b/criu/log.c
+@@ -13,6 +13,7 @@
+ #include <sys/mman.h>
+ 
+ #include <fcntl.h>
++#include <pthread.h>
+ 
+ #include "page.h"
+ #include "common/compiler.h"
+@@ -36,8 +37,19 @@
+ static unsigned int current_loglevel = DEFAULT_LOGLEVEL;
+ static void vprint_on_level(unsigned int, const char *, va_list);
+ 
++/*
++ * One shared formatting buffer, historically safe because CRIU logged from a
++ * single thread. The restore-side thread pools log from workers, so two
++ * messages could otherwise interleave inside this buffer and produce a single
++ * spliced line -- or, worse, a torn read of buf_off past the end of it.
++ *
++ * The lock is taken only around the format-and-write, so the ordering of
++ * whole lines is all that is serialized. Deliberately not recursive: nothing
++ * on the logging path logs.
++ */
+ static char buffer[LOG_BUF_LEN];
+ static char buf_off = 0;
++static pthread_mutex_t buffer_lock = PTHREAD_MUTEX_INITIALIZER;
+ /*
+  * The early_log_buffer is used to store log messages before
+  * logging is set up to make sure no logs are lost.
+@@ -362,20 +374,26 @@ static void vprint_on_level(unsigned int loglevel, const char *format, va_list p
+ 	int fd, size, ret, off = 0;
+ 	int _errno = errno;
+ 
+-	if (unlikely(loglevel == LOG_MSG)) {
+-		fd = STDOUT_FILENO;
+-		off = buf_off; /* skip dangling timestamp */
+-	} else {
+-		/*
+-		 * If logging has not yet been initialized (init_done == 0)
+-		 * make sure all messages are written to the early_log_buffer.
+-		 */
++	/*
++	 * Checked before taking the lock: the early path writes to a
++	 * different buffer and runs long before any thread exists, and a
++	 * filtered-out message should not pay for the lock at all.
++	 */
++	if (likely(loglevel != LOG_MSG)) {
+ 		if (!init_done) {
+ 			early_vprint(format, loglevel, params);
+ 			return;
+ 		}
+ 		if (loglevel > current_loglevel)
+ 			return;
++	}
++
++	pthread_mutex_lock(&buffer_lock);
++
++	if (unlikely(loglevel == LOG_MSG)) {
++		fd = STDOUT_FILENO;
++		off = buf_off; /* skip dangling timestamp */
++	} else {
+ 		fd = log_get_fd();
+ 		if (current_loglevel >= LOG_TIMESTAMP)
+ 			print_ts();
+@@ -395,6 +413,8 @@ static void vprint_on_level(unsigned int loglevel, const char *format, va_list p
+ 	if (loglevel == LOG_ERROR)
+ 		log_note_err(buffer + buf_off);
+ 
++	pthread_mutex_unlock(&buffer_lock);
++
+ 	errno = _errno;
+ }
+ 

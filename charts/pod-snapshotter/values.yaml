@@ -42,7 +42,7 @@ criu:
   uninstall: false
   image:
     repository: pod-snapshotter/criu
-    tag: v4.2.1-ps1
+    tag: v4.2.1-ps4
     pullPolicy: IfNotPresent
 
 agent:
