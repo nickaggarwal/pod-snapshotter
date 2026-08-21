@@ -91,6 +91,30 @@ manager refuses to checkpoint pods on nodes not marked `ok`.
   prereq checker applies the matching threshold per node.
 - `criu check` should pass on the host.
 
+### Optional: the patched CRIU
+
+`criu.enabled=true` adds a second, opt-in DaemonSet that installs
+pod-snapshotter's CRIU fork — upstream v4.2.1 plus the restore read-path
+patches in `hack/criu/patches` (see [design-v2.md §6b](design-v2.md)). It
+lands in `/usr/local/sbin`, which precedes `/usr/sbin` on the default PATH, so
+runc picks it up while the distro package stays where it is; `criu.uninstall=true`
+removes it and the node falls straight back.
+
+It is off by default because it replaces the binary every checkpoint and
+restore on that node goes through. Nothing else in the chart depends on it:
+the tuning annotations below are ignored by a stock CRIU, so a cluster can run
+with it enabled on some nodes and not others.
+
+| Annotation on a PodRestore | Effect |
+|---|---|
+| `podsnapshot.io/criu-aio-depth` | AIO reads in flight; `0`/`1` = stock serial loop |
+| `podsnapshot.io/criu-shmem-threads` | shmem/memfd objects restored at once; `1` = stock serial loop |
+| `podsnapshot.io/criu-image-io-mode` | `writeback` (default) or `direct` |
+
+Setting the first two to their off values makes the patches inert without
+reinstalling anything, which is the supported way to check whether a restore
+problem is the fork's fault.
+
 ## 4. NVIDIA
 
 - Driver ≥ 570 (the blog recommends ≥ 570; the CUDA plugin requires ≥ 550).
