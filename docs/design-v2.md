@@ -172,7 +172,11 @@ and existing `PodRestore`s keep working unchanged.
   promotes every miss to node NVMe) and `runc restore --image-path` then
   points straight at the artifact: no copy anywhere on the restore path.
   `--stage-image-local` copies to node NVMe instead, so the two can be
-  measured against each other.
+  measured against each other. They were, and staging lost badly — it wrote
+  to the OS disk rather than the NVMe (§6c). Better still is
+  `--nvme-cache-root`, which skips pre-warm entirely when fuse-client has
+  already promoted the artifact and points `--image-path` at the cache tier
+  on the device.
 
 ---
 

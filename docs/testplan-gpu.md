@@ -61,10 +61,17 @@ be attributed to the patches rather than to the rebuild.
 | CF-1 | Installer on a node that cannot run the binary | DaemonSet fails, `/usr/local/sbin/criu` is removed, `criu --version` on the host still answers from the distro package |
 | CF-2 | `criu.uninstall=true` | marker and binary gone; the next restore succeeds on the packaged CRIU |
 | CF-3 | Patches inert (`criu-aio-depth: 0`, `criu-shmem-threads: 1`) | restore succeeds and the workload serves — this is the control for CF-4 and the first thing to run after any rebase |
-| CF-4 | Pools on (`criu-shmem-threads: 8`) | restore succeeds; `restore.log` shows `Restoring N memfd inodes on M threads`; CRIU-restore wall time below CF-3 |
+| CF-4 | Pools on (`criu-shmem-threads: 8`) | restore succeeds; `restore.log` shows `Restoring N memfd inodes on M threads`; time to the first `cuda_plugin: resuming devices` line below CF-3 |
 | CF-5 | AIO on (`criu-aio-depth: 128`) | restore succeeds; no `AIO read returned 0` and no `BUG at criu/pagemap.c` |
 | CF-6 | Pools + AIO together | restore succeeds and serves; generation matches QB-5 |
 | CF-7 | Stock CRIU given the annotations | ignored, restore unaffected — the agent sets them unconditionally and must not require the fork |
+
+**Compare the CRIU-proper phase, not the CRIU wall.** On the 14B artifact,
+`cuda_plugin` resuming devices on the GPU worker takes 12.4 s of a 21.3 s CRIU
+restore, and none of the read-path tuning touches it — a patch that halved the
+read path would move total CRIU wall by well under a third. The number to
+compare across CF-3/4/5/6 is the log timestamp of the first
+`cuda_plugin: resuming devices` line, which is where CRIU's own work ends.
 
 **CF-5 and CF-6 need a cold page cache to mean anything.** The A100 nodes have
 226 GB of RAM and the 14B artifact is 52 GiB, so a second restore of the same
