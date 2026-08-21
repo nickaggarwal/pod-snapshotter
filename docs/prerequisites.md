@@ -163,6 +163,22 @@ problem is the fork's fault.
 - Optional but recommended: the fuse-client agent socket
   (`/var/run/fuse-client/agent.sock`, flag `-enable-agent-server`) for
   artifact pinning. Without it restores still work — just unpinned.
+- Optional and worth it: point `agent.nvmeCacheRoot` at the client's
+  node-local cache tier (default `/mnt/fuse-nvme0n1/fuse-cache`) so restores
+  read the CRIU images straight off the device instead of back through the
+  FUSE mount. The client already promotes everything it serves onto that tier
+  as a 1:1 mirror of the artifact prefix, and reading it back through
+  userspace costs about 7× — 500-690 MB/s through the mount against 2.6 GB/s
+  single-stream and 4.5 GB/s at four streams on the raw device. Measured
+  end-to-end on the 14B artifact: 253 s → **40 s**.
+
+  Two things to get right. It is a **host** path, not a path inside the agent
+  container: the agent execs runc through `nsenter -t 1 -m`, so runc resolves
+  `--image-path` against the host's mount namespace. And the bypass only
+  engages when the tier holds every file the artifact's MANIFEST lists at the
+  size it lists — a partial mirror declines and falls back to the mount, and a
+  size that disagrees is an error rather than a silently wrong restore. Leave
+  it unset to disable.
 
 ## Workload requirements
 

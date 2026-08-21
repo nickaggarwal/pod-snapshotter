@@ -412,24 +412,35 @@ The upstream check came back the wrong way. The AIO work **is** merged
 the newest tag is still v4.2.1, which is exactly what the node images run. So
 the choice was not fork-vs-upstream, it was fork-vs-wait. We forked.
 
-The fork is not a fork of the tree. It is four patch files against the
-v4.2.1 tarball, applied at image build time:
+The fork is a real fork, published at
+[github.com/nickaggarwal/criu](https://github.com/nickaggarwal/criu), branch
+`pod-snapshotter/v4.2.1-restore-parallelism`. It branches off the upstream
+`v4.2.1` tag (commit `9539417`) and carries four commits, each a reviewable,
+rebasable change on its own:
 
-| File | What it changes |
-|---|---|
-| `0001-make-shared-restore-state-thread-safe.patch` | `criu/bfd.c`, `criu/log.c` — locks the two shared statics the pools reach |
-| `0002-pagemap-native-aio-async-page-reads.patch` | `criu/pagemap.c` — the async read path gets an `io_submit`/`io_getevents` sliding window |
-| `0003-shmem-parallel-restore.patch` | `criu/shmem.c`, `criu/mem.c` — a thread pool that creates, sizes and fills shmem objects concurrently |
-| `0004-memfd-parallel-inode-restore.patch` | `criu/memfd.c` — the same pool shape for memfd inodes |
+| Commit | Mirrored patch | What it changes |
+|---|---|---|
+| `be64855` | `0001-make-shared-restore-state-thread-safe.patch` | `criu/bfd.c`, `criu/log.c` — locks the two shared statics the pools reach |
+| `1398bff` | `0002-pagemap-native-aio-async-page-reads.patch` | `criu/pagemap.c` — the async read path gets an `io_submit`/`io_getevents` sliding window |
+| `53e7e72` | `0003-shmem-parallel-restore.patch` | `criu/shmem.c`, `criu/mem.c` — a thread pool that creates, sizes and fills shmem objects concurrently |
+| `2090e7f` | `0004-memfd-parallel-inode-restore.patch` | `criu/memfd.c` — the same pool shape for memfd inodes |
 
-They are generated as git diffs against a checked-out v4.2.1, not written by
-hand, so the context lines cannot drift from what they claim to patch.
+`add24ee` on top is `POD-SNAPSHOTTER.md`, which describes the branch to anyone
+who finds the fork without this repo, and is the commit `Dockerfile.criu`
+pins.
 
-Keeping them as patches rather than a checked-out fork is the point:
-`patch --forward` fails loudly if a hunk stops applying, so rebasing onto a
-newer CRIU can't silently drop one, and the diff a reviewer has to read is 1
-000 lines instead of a whole source tree. [Dockerfile.criu](../Dockerfile.criu)
-applies them in sorted order and builds `criu` and `cuda_plugin`.
+The same four changes are mirrored into `hack/criu/patches/*.patch` so the
+series stays readable from this repo without cloning anything, and so it can
+be re-cut against a newer upstream base. The mirror is kept identical to the
+published commits — same files, same hunk counts.
+
+[Dockerfile.criu](../Dockerfile.criu) builds from the fork, pinned to a
+**commit** rather than the branch tip: what shipped to a node has to be
+reconstructible later, and a moving branch would make the image tag ambiguous.
+It then asserts that `Makefile.versions` still reads exactly `4.2.1` before
+building, so a future rebase onto a different upstream base fails at build
+time rather than shipping a binary whose CRIU image format silently disagrees
+with the node's CUDA plugin.
 
 **The CUDA plugin is deliberately not replaced.** The fork is based on the
 exact CRIU version the node already runs, so the plugin ABI is unchanged and
@@ -534,16 +545,16 @@ memfds — so the pools are the half that matters and the AIO window is nearly
 idle. On a workload whose memory is mostly private anonymous VMAs it would be
 the other way round.
 
-### 6c. The transport ceiling, which is now the whole problem
+### 6c. The transport ceiling, and how it came down
 
 Halving CRIU restore exposed what was underneath it. 452 s end-to-end for a
 52 GiB artifact is ~0.25 GB/s sustained, on *both* phases. PCIe on this node
-would move that in about three seconds. So the patched CRIU is no longer the
-constraint — getting the bytes to it is — and three separate things are
-paying for that:
+would move that in about three seconds. So the patched CRIU was no longer the
+constraint — getting the bytes to it was — and three things were paying for
+that:
 
-1. **The bytes move twice.** Pre-warm copies the artifact from the fuse mount
-   onto node-local storage, then CRIU reads that copy. Directory artifacts
+1. **The bytes moved twice.** Pre-warm copied the artifact from the fuse mount
+   onto node-local storage, then CRIU read that copy. Directory artifacts
    exist precisely so this copy is unnecessary (`PrefetchOpts.StageDir`
    empty = restore in place); the copy was a hand-applied
    `--stage-image-local=true` on the live DaemonSet, not the chart default.
@@ -560,14 +571,65 @@ paying for that:
    because a burst has ~1 GiB to land in. Raising parallelism without fixing
    that just moves the failure.
 
+**What `/proc/diskstats` said.** Sampling sectors-read per device across a
+restore is what actually located the problem, and it was not where any of the
+three guesses pointed. During a staging restore the node read **266 MB/s from
+`sda`** — the 256 GB OS disk — and **0 B/s from `nvme0n1`**, the 894 GB local
+NVMe. The staging copy was writing to and reading back from the wrong device
+entirely. Dropping it moved the reads onto `nvme0n1` and cut end-to-end from
+452 s to 253 s.
+
+**The mount itself is the remaining ~7×.** With staging gone, measuring the
+same bytes two ways: through the FUSE mount, 500-690 MB/s; straight off
+`nvme0n1`, 2.6 GB/s single-stream `O_DIRECT` and 4519 MiB/s at four streams.
+fuse-client already promotes everything it serves onto a node-local cache tier
+laid out as a faithful 1:1 mirror of the artifact prefix (verified: 632 files
+on both sides, matching sizes, no `.nvme-stream` temp files). So the bytes are
+*already on the device* — reading them back through the userspace filesystem
+that put them there is pure tax.
+
+`NVMeCache` (`internal/artifact/nvmecache.go`) skips it. When the tier holds
+every file the manifest lists at the size the manifest says, `runc restore`
+gets `--image-path` pointed at the cache directory and the mount is out of the
+read path. Pre-warm gets the same check: if the bytes are resident there is
+nothing to warm.
+
+| | pre-warm | CRIU restore | total to Ready |
+|---|---|---|---|
+| staging on, P=2 | 225 s | 225 s | 452 s |
+| staging on, P=4 | 220 s | 224 s | 446 s |
+| staging off, P=4 | 104 s | 147 s | 253 s |
+| **NVMe bypass** | **2 s** | **35 s** | **40 s** |
+
+Every row was verified by generation, not by readiness probe:
+`"The capital of France is"` → `" Paris. The capital of Spain is Madrid."`
+
+Two things about that table are worth stating plainly. The 11× end-to-end is
+almost entirely transport, not CRIU: the patched binary is identical across
+the last three rows. And the manifest check is what makes the bypass safe — a
+partial mirror declines and falls back to the mount, a size that disagrees
+with the manifest is an error rather than a silently wrong restore.
+
+**What is still unmeasured: AIO.** The `criu-aio-depth` A/B is not resolved.
+Two runs back to back gave 22 s with AIO at 128 and 23 s with it off — but
+`/proc/diskstats` showed **zero bytes read from either device** across the
+second pair, because the node has 226 GB of RAM and the 52 GiB artifact was
+entirely in page cache from the run before. A read path cannot be benchmarked
+against reads that never reach a device, so that pair is a null result and not
+evidence about AIO either way. Isolating it needs the artifact evicted from
+page cache between runs (`POSIX_FADV_DONTNEED` over the cache directory, or a
+node that has not served this artifact yet) — the 35 s figure in the table is
+the one taken with the device actually in the loop.
+
 Note also that the artifact is roughly 2× the model weights: vLLM's
 `sleep(level=1)` offloads weights to host RAM rather than dropping them, so
 they are captured in the image instead of being re-read from the weight
 store. §7 is the structural answer to that half.
 
-The order these are worth attacking in is (2), then (1), then (3) — the first
-two are attributable one-line changes, and (3) is a shared component whose
-memory behavior needs an actual heap audit rather than a bigger limit.
+Item (3) above is untouched and still real: fuse-client's per-file range
+budgets mean N concurrent readers reserve N × (1 GiB chunk cache + 512 MiB
+prefetch), which is why P=8 OOMKilled it. The bypass routes around that rather
+than fixing it, and the fix belongs in that repo.
 
 ---
 
@@ -603,7 +665,7 @@ distributed cache is good at.
 | 2 | Quiesce/resume + reference shim (§4) | **done** |
 | 3 | `SnapshotBuild` + build-time artifacts (§5) | **done** |
 | 4 | `--stream` restore, measured (§6a) | not started — `criu-image-streamer` is not on the node images, and the restore is not currently CRIU-read-bound (see below) |
-| 5 | Fork CRIU only if §4 measured short (§6b) | not started |
+| 5 | Fork CRIU only if §4 measured short (§6b) | **done** — [nickaggarwal/criu](https://github.com/nickaggarwal/criu), branch `pod-snapshotter/v4.2.1-restore-parallelism` |
 
 ### Benchmark table to fill in
 
@@ -617,7 +679,9 @@ created → placeholder pod Ready), not CRIU-restore-only:
 | +§4 quiesce | | | — | | | |
 | +§6a stream | | | — | | | |
 | +§6b fork, patches inert | 52 GiB | 231 s | *gone* | 445 s | — | 677 s |
-| +§6b fork, shmem pool ×8 | 52 GiB | 225 s | *gone* | **225 s** | — | **452 s** |
+| +§6b fork, shmem pool ×8 | 52 GiB | 225 s | *gone* | 225 s | — | 452 s |
+| +no staging copy | 52 GiB | 104 s | *gone* | 147 s | — | 253 s |
+| +NVMe bypass | 52 GiB | **2 s** | *gone* | **35 s** | — | **40 s** |
 
 The "patches inert" row is the control, not a separate build: it is the same
 `v4.2.1-ps4` binary run with `criu-aio-depth: 0` and `criu-shmem-threads: 1`,
@@ -626,9 +690,9 @@ same binary again with `criu-shmem-threads: 8` and AIO still off — CRIU
 restore halves (−49%), end-to-end drops a third (−33%), and the restored
 engine answers correctly (`"The capital of France is"` → `" Paris."`).
 
-Both rows read the artifact through a fuse-client that was, at the time,
-pinned to `--prefetch-parallelism=2` and staging a node-local copy — see
-§6c, which is where the remaining minutes are.
+The first two rows read the artifact through a fuse-client that was, at the
+time, pinned to `--prefetch-parallelism=2` and staging a node-local copy. The
+last two are where those minutes went — see §6c.
 
 `docs/testplan-gpu.md` gains the matching cases: directory-artifact restore,
 quiesce-point checkpoint of a vLLM pod, resume-side wake_up correctness (KV

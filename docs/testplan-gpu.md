@@ -26,6 +26,10 @@ AKS `Standard_NC24ads_A100_v4` node with the prerequisites installed).
 | GR-6 | Restore with `podsnapshot.io/tcp-close: "true"` | restore succeeds with established sockets closed |
 | GR-7 | GPU device missing in restore spec vs node | fails fast with "GPU device nodes missing" |
 | GR-8 | Agent restart mid-Running | checkAlive resumes against existing runc state; no duplicate restore |
+| GR-9 | NVMe bypass, tier complete | agent logs `restoring from the node NVMe cache tier` **and** `skipping pre-warm`; `--image-path` points under `--nvme-cache-root`, not the mount; restore succeeds and generation matches |
+| GR-10 | NVMe bypass, tier partial (delete one image file) | declines silently and pre-warms through the mount; restore still succeeds |
+| GR-11 | NVMe bypass, file size disagrees with the manifest | declines with a logged error naming the file; restore falls back to the mount rather than restoring wrong bytes |
+| GR-12 | `--nvme-cache-root` unset | no bypass attempted; behavior identical to GR-1 |
 
 ## QB — quiesce & build artifacts (v2)
 
@@ -61,6 +65,15 @@ be attributed to the patches rather than to the rebuild.
 | CF-5 | AIO on (`criu-aio-depth: 128`) | restore succeeds; no `AIO read returned 0` and no `BUG at criu/pagemap.c` |
 | CF-6 | Pools + AIO together | restore succeeds and serves; generation matches QB-5 |
 | CF-7 | Stock CRIU given the annotations | ignored, restore unaffected — the agent sets them unconditionally and must not require the fork |
+
+**CF-5 and CF-6 need a cold page cache to mean anything.** The A100 nodes have
+226 GB of RAM and the 14B artifact is 52 GiB, so a second restore of the same
+artifact reads entirely from page cache — measured: zero sectors read from
+either `sda` or `nvme0n1` across a whole restore. An AIO A/B run that way is a
+null result, not a measurement. Before each of these, either evict the
+artifact (`POSIX_FADV_DONTNEED` over the cache directory) or use a node that
+has not served it yet, and confirm with `/proc/diskstats` that the device
+actually saw the reads.
 
 CF-3 exists because of a real regression: the first pool build failed every
 restore with `Bad file descriptor` from `cr_fchpermat`, and having the inert
