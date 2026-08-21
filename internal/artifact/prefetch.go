@@ -18,7 +18,23 @@ import (
 // than one: the v1 tar forces a single sequential stream through
 // fuse-client, leaving most of the NVMe/network bandwidth on the floor
 // (docs/design-v2.md §3).
-const DefaultPrefetchParallelism = 8
+//
+// Four, not eight, and not "as many as we can". Measured against a warm
+// fuse-client on an A100 node, reading the 14B artifact's page images:
+//
+//	P=1   335-782 MiB/s
+//	P=2   542 MiB/s
+//	P=4   931-1322 MiB/s   <- peak
+//	P=6   705 MiB/s
+//	P=8   642 MiB/s        <- past the knee, and where the client OOMKilled
+//
+// Throughput peaks at 4 and then *falls*, so raising this is not a free
+// knob to turn up under pressure — 8 was both slower than 4 and the setting
+// that killed fuse-client (exit 137) mid-restore. The collapse and the OOM
+// are the same event: the client runs close to its memory limit, and enough
+// concurrent readers push it over, at which point everything queues behind a
+// restart. See docs/design-v2.md §6c.
+const DefaultPrefetchParallelism = 4
 
 // PrefetchOpts configures a directory-artifact prefetch.
 type PrefetchOpts struct {

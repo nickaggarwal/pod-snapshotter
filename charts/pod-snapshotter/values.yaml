@@ -72,7 +72,12 @@ agent:
   # measuring if the mount's per-read overhead beats the copy.
   stageImageLocal: false
   # Files fetched concurrently from a directory artifact (0 = built-in
-  # default of 8). Tar artifacts are always a single stream.
+  # default of 4). Tar artifacts are always a single stream.
+  #
+  # Measured throughput peaks at 4 and falls off after it, so this is not a
+  # knob to turn up when restores are slow: 8 was both slower than 4 and the
+  # setting under which fuse-client OOMKilled. See
+  # internal/artifact/prefetch.go for the curve.
   prefetchParallelism: 0
   resources:
     requests: {cpu: 100m, memory: 256Mi}
