@@ -612,14 +612,47 @@ with the manifest is an error rather than a silently wrong restore.
 
 **What is still unmeasured: AIO.** The `criu-aio-depth` A/B is not resolved.
 Two runs back to back gave 22 s with AIO at 128 and 23 s with it off — but
-`/proc/diskstats` showed **zero bytes read from either device** across the
-second pair, because the node has 226 GB of RAM and the 52 GiB artifact was
-entirely in page cache from the run before. A read path cannot be benchmarked
-against reads that never reach a device, so that pair is a null result and not
-evidence about AIO either way. Isolating it needs the artifact evicted from
-page cache between runs (`POSIX_FADV_DONTNEED` over the cache directory, or a
-node that has not served this artifact yet) — the 35 s figure in the table is
-the one taken with the device actually in the loop.
+`/proc/diskstats` showed **zero sectors read from either device** across the
+one of those pairs that was instrumented, because the node has 226 GB of RAM
+and the 52 GiB artifact was entirely in page cache from the run before. A read
+path cannot be benchmarked against reads that never reach a device, so that
+pair is a null result and not evidence about AIO either way. Isolating it
+needs the artifact evicted from page cache between runs
+(`POSIX_FADV_DONTNEED` over the cache directory, or a node that has not served
+this artifact yet). The 35 s row in the table is the first restore after the
+bypass landed and is the conservative number of the three; how much of it
+reached the device was not instrumented, so treat 35 s as the honest figure
+and 22 s as a cache-warm best case rather than a second data point.
+
+**And `restore.log` says the read path is no longer the majority of it.**
+CRIU's own clock on that run, with the memfd pool confirmed active
+(`Restoring 205 memfd inodes on 8 threads`):
+
+| Phase | Wall | Share |
+|---|---|---|
+| CRIU proper — images read, memory mapped, tasks built | 8.9 s | 42% |
+| `cuda_plugin` resuming devices on the GPU worker | 12.4 s | 58% |
+| **total** | **21.3 s** | |
+
+That 12.4 s is a single gap in the log between `cuda_plugin: resuming devices`
+and the next line: one `cuda-checkpoint` call, no I/O of ours in it at all. It
+reproduces — a second run gave 8.7 s / 12.4 s / 21.4 s against the first run's
+8.9 s / 12.4 s / 21.3 s. It is the largest single item left in a restore, it
+is inside NVIDIA's plugin rather than in CRIU or in us, and neither the CRIU
+fork nor any transport work touches it.
+
+So the read path is now 8.9 s of a 40 s end-to-end — and the ordering of what
+to attack next changes accordingly. More AIO depth, `--stream`, faster
+devices: all of them divide into the 42%, and the resume half sets a floor
+they cannot cross. §7's weight decoupling is the one item on the list that
+plausibly moves the GPU side too, by shrinking what has to be resumed rather
+than by reading it faster.
+
+(One caveat on that split: it comes from the cache-warm run, the only one with
+a `restore.log` still on the node. On the 35 s run the CRIU-proper half would
+be larger and the GPU-resume half about the same, since the latter is not
+I/O-bound — so the read path's share is somewhere between 42% and roughly
+65%, not lower.)
 
 Note also that the artifact is roughly 2× the model weights: vLLM's
 `sleep(level=1)` offloads weights to host RAM rather than dropping them, so
