@@ -654,6 +654,32 @@ be larger and the GPU-resume half about the same, since the latter is not
 I/O-bound — so the read path's share is somewhere between 42% and roughly
 65%, not lower.)
 
+### Against the blog
+
+The blog's table is *CRIU restore only*, so the honest comparison is against
+our CRIU-proper number, not against end-to-end:
+
+| | image | CRIU restore | GB/s |
+|---|---|---|---|
+| Dynamo, Qwen3-0.6B | 6.2 GiB | 2.4 s | 2.77 |
+| Dynamo, Qwen3-8B | 26 GiB | 4.7 s | 5.94 |
+| Dynamo, gpt-oss-120b | 129 GiB | 15 s | 9.23 |
+| **ours, Qwen2.5-14B** | **52.5 GiB** | **8.8 s** | **6.41** |
+
+6.41 GB/s lands between their 8B and 120b rows, on a different model, a
+different GPU (A100 vs B200) and an artifact that is roughly 2× the weights
+because `sleep(level=1)` offloads to host RAM instead of dropping. On the
+metric the blog actually publishes, the read path is there.
+
+Two honest asterisks. That 8.8 s is the cache-warm run, so it is a
+memory-bandwidth figure rather than a storage one — the blog does not say
+which theirs is either. And their end-to-end story includes GMS, which we have
+not built: their "under 5 s ready" for gpt-oss-120b is weights restored over a
+separate channel in parallel, not a faster CRIU. Our end-to-end is 40 s, and
+the gap between 8.8 s and 40 s is the 12.4 s of `cuda_plugin` plus pod
+scheduling and container setup around it — which is where the remaining work
+is, and none of it is CRIU's read path.
+
 Note also that the artifact is roughly 2× the model weights: vLLM's
 `sleep(level=1)` offloads weights to host RAM rather than dropping them, so
 they are captured in the image instead of being re-read from the weight
@@ -715,6 +741,14 @@ created → placeholder pod Ready), not CRIU-restore-only:
 | +§6b fork, shmem pool ×8 | 52 GiB | 225 s | *gone* | 225 s | — | 452 s |
 | +no staging copy | 52 GiB | 104 s | *gone* | 147 s | — | 253 s |
 | +NVMe bypass | 52 GiB | **2 s** | *gone* | **35 s** | — | **40 s** |
+
+**677 s → 40 s, 17×**, on the same 52 GiB artifact and the same node, with the
+restored engine verified by generation at every step. Of the 637 s removed,
+the CRIU fork accounts for 225 s (35%) and transport for 412 s (65%) —
+199 s from deleting the staging copy and 213 s from bypassing the mount. The
+fork was the thing we set out to build; the larger half turned out to be two
+configuration mistakes underneath it, which is worth remembering the next time
+a slow restore looks like it needs a patch.
 
 The "patches inert" row is the control, not a separate build: it is the same
 `v4.2.1-ps4` binary run with `criu-aio-depth: 0` and `criu-shmem-threads: 1`,
