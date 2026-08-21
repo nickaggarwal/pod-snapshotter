@@ -412,14 +412,18 @@ The upstream check came back the wrong way. The AIO work **is** merged
 the newest tag is still v4.2.1, which is exactly what the node images run. So
 the choice was not fork-vs-upstream, it was fork-vs-wait. We forked.
 
-The fork is not a fork of the tree. It is three patch files against the
+The fork is not a fork of the tree. It is four patch files against the
 v4.2.1 tarball, applied at image build time:
 
 | File | What it changes |
 |---|---|
-| `hack/criu/patches/0001-pagemap-native-aio-async-page-reads.patch` | `criu/pagemap.c` — the async read path gets an `io_submit`/`io_getevents` sliding window |
-| `hack/criu/patches/0002-shmem-parallel-restore.patch` | `criu/shmem.c` — a thread pool that creates, sizes and fills shmem objects concurrently |
-| `hack/criu/patches/0003-memfd-parallel-inode-restore.patch` | `criu/memfd.c` — the same pool shape for memfd inodes |
+| `0001-make-shared-restore-state-thread-safe.patch` | `criu/bfd.c`, `criu/log.c` — locks the two shared statics the pools reach |
+| `0002-pagemap-native-aio-async-page-reads.patch` | `criu/pagemap.c` — the async read path gets an `io_submit`/`io_getevents` sliding window |
+| `0003-shmem-parallel-restore.patch` | `criu/shmem.c`, `criu/mem.c` — a thread pool that creates, sizes and fills shmem objects concurrently |
+| `0004-memfd-parallel-inode-restore.patch` | `criu/memfd.c` — the same pool shape for memfd inodes |
+
+They are generated as git diffs against a checked-out v4.2.1, not written by
+hand, so the context lines cannot drift from what they claim to patch.
 
 Keeping them as patches rather than a checked-out fork is the point:
 `patch --forward` fails loudly if a hunk stops applying, so rebasing onto a
@@ -462,6 +466,55 @@ attributed to the patches rather than to the rebuild, without reinstalling
 anything on the node. It also means a stock CRIU can be handed the same
 annotations and will simply ignore them, which is why the agent sets them
 unconditionally rather than probing for the fork first.
+
+### What the pools got wrong the first time
+
+The first build of the pools (`v4.2.1-ps3`) failed **every** restore it was
+enabled for, and the failure is worth recording because the fix is not local
+to the patch — it is a property of where CRIU's restore runs.
+
+```
+148: Error (criu/util.c:1014): Unable to change [10]/ ownership to (0, 0): Bad file descriptor
+148: Error (criu/memfd.c:471): Can't set permissions ... of memfd:/dev/zero: Bad file descriptor
+148: Error (criu/mem.c:1475): `- Can't open vma
+```
+
+`[10]` is the tell: `cr_fchpermat()` prints its `dirfd`, and 10 was a
+descriptor the pool had opened in CRIU's **main process** during
+`prepare_memfd_inodes()`. But `memfd_open_inode_nocache()` runs inside the
+**forked tasks**, which have already rebuilt their fd tables
+(`setup_newborn_fds` → `close_old_fds`). By the time the fd number was read it
+named nothing, or some unrelated file. Passing an fd *number* through shared
+memory only works while everyone still shares an fd *table*.
+
+The memfd pass now publishes through `fdstore_add()` — the mechanism CRIU
+already uses for exactly this boundary, a datagram socket every forked task
+inherits. `memfd_open_inode()` already prefers `fdstore_id` when set, so a
+prepared inode needs no new lookup path; it simply arrives already cached.
+
+**The shmem pass keeps a plain descriptor, and that is correct, not an
+oversight.** `shmem_restore_parallel()` is called from `open_vmas()` — already
+inside the task that will consume the fd — so it never crosses a fork. The
+asymmetry between the two passes *is* the bug, so each side now states which
+one it is and why.
+
+Reading the rest of the shared state for the same class of mistake turned up
+two races that had not fired yet, either of which would have corrupted a
+restore in a much harder-to-attribute way than a bad fd:
+
+- `criu/bfd.c` keeps a free list of read buffers that every worker reaches via
+  `open_page_read → open_image_at → bfdopenr → buf_get`. Two workers could
+  take the same buffer, or race the refill.
+- `criu/log.c` formats every `pr_*` call into one shared static buffer.
+
+Both are now locked (patch 0001). The early-outs in `vprint_on_level()` stay
+*outside* the lock, so a filtered-out debug line still costs nothing — the
+pools make `pr_debug` a hot path in a way it was not before.
+
+The general lesson for anything else added to this fork: CRIU's restore
+crosses a fork boundary partway through, and a patch that adds concurrency
+before that point cannot hand anything fd-shaped to the far side except
+through the fdstore.
 
 ### What the async patch may not do
 
@@ -528,6 +581,12 @@ created → placeholder pod Ready), not CRIU-restore-only:
 | +§3 dirs | | | *gone* | | n/a | |
 | +§4 quiesce | | | — | | | |
 | +§6a stream | | | — | | | |
+| +§6b fork, patches inert | 52 GiB | 231 s | *gone* | 445 s | — | 677 s |
+| +§6b fork, pools + AIO on | 52 GiB | | *gone* | | | |
+
+The "patches inert" row is the control, not a separate build: it is the same
+`v4.2.1-ps4` binary run with `criu-aio-depth: 0` and `criu-shmem-threads: 1`,
+which is what makes the last two rows comparable at all.
 
 `docs/testplan-gpu.md` gains the matching cases: directory-artifact restore,
 quiesce-point checkpoint of a vLLM pod, resume-side wake_up correctness (KV
