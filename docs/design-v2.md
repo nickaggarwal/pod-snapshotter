@@ -534,6 +534,41 @@ memfds — so the pools are the half that matters and the AIO window is nearly
 idle. On a workload whose memory is mostly private anonymous VMAs it would be
 the other way round.
 
+### 6c. The transport ceiling, which is now the whole problem
+
+Halving CRIU restore exposed what was underneath it. 452 s end-to-end for a
+52 GiB artifact is ~0.25 GB/s sustained, on *both* phases. PCIe on this node
+would move that in about three seconds. So the patched CRIU is no longer the
+constraint — getting the bytes to it is — and three separate things are
+paying for that:
+
+1. **The bytes move twice.** Pre-warm copies the artifact from the fuse mount
+   onto node-local storage, then CRIU reads that copy. Directory artifacts
+   exist precisely so this copy is unnecessary (`PrefetchOpts.StageDir`
+   empty = restore in place); the copy was a hand-applied
+   `--stage-image-local=true` on the live DaemonSet, not the chart default.
+
+2. **Prefetch ran at the wrong concurrency.** Measured on a warm client, read
+   throughput peaks at 4 concurrent files (~1.3 GB/s) and *falls* on either
+   side: 542 MB/s at 2, 642 MB/s at 8. The live setting was 2 — chosen not
+   because it was fast but because 8 had OOMKilled the fuse client, so the
+   workaround for a memory bug became a throughput ceiling.
+
+3. **The client idles near its limit.** `client-fmjpg` sat at 14.98 GiB of a
+   16 GiB limit (`memory.peak` 16.03 GiB — already over), of which 6.5 GiB is
+   unreclaimable anon. It does not OOM because readers allocate much; it OOMs
+   because a burst has ~1 GiB to land in. Raising parallelism without fixing
+   that just moves the failure.
+
+Note also that the artifact is roughly 2× the model weights: vLLM's
+`sleep(level=1)` offloads weights to host RAM rather than dropping them, so
+they are captured in the image instead of being re-read from the weight
+store. §7 is the structural answer to that half.
+
+The order these are worth attacking in is (2), then (1), then (3) — the first
+two are attributable one-line changes, and (3) is a shared component whose
+memory behavior needs an actual heap audit rather than a bigger limit.
+
 ---
 
 ## 7. Later — weight decoupling
@@ -582,11 +617,18 @@ created → placeholder pod Ready), not CRIU-restore-only:
 | +§4 quiesce | | | — | | | |
 | +§6a stream | | | — | | | |
 | +§6b fork, patches inert | 52 GiB | 231 s | *gone* | 445 s | — | 677 s |
-| +§6b fork, pools + AIO on | 52 GiB | | *gone* | | | |
+| +§6b fork, shmem pool ×8 | 52 GiB | 225 s | *gone* | **225 s** | — | **452 s** |
 
 The "patches inert" row is the control, not a separate build: it is the same
 `v4.2.1-ps4` binary run with `criu-aio-depth: 0` and `criu-shmem-threads: 1`,
-which is what makes the last two rows comparable at all.
+which is what makes the last two rows comparable at all. The pool row is the
+same binary again with `criu-shmem-threads: 8` and AIO still off — CRIU
+restore halves (−49%), end-to-end drops a third (−33%), and the restored
+engine answers correctly (`"The capital of France is"` → `" Paris."`).
+
+Both rows read the artifact through a fuse-client that was, at the time,
+pinned to `--prefetch-parallelism=2` and staging a node-local copy — see
+§6c, which is where the remaining minutes are.
 
 `docs/testplan-gpu.md` gains the matching cases: directory-artifact restore,
 quiesce-point checkpoint of a vLLM pod, resume-side wake_up correctness (KV
