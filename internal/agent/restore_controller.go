@@ -55,8 +55,9 @@ type RestoreReconciler struct {
 	PrefetchParallelism int
 	// HostRoot is where the host's / is mounted (read-only) here.
 	HostRoot string
-	// NVMeCacheRoot is fuse-client's node-local cache tier as visible here,
-	// e.g. /host/mnt/fuse-nvme0n1/fuse-cache. When set, and when the tier
+	// NVMeCacheRoot is fuse-client's node-local cache tier as the *host*
+	// sees it, e.g. /mnt/fuse-nvme0n1/fuse-cache — runc resolves it in the
+	// host mount namespace. When set, and when the tier
 	// holds every file the manifest lists at the right size, the restore
 	// reads the CRIU images straight off the device instead of back through
 	// the FUSE mount — measured ~7x faster for bytes that are already local
@@ -136,6 +137,27 @@ func (r *RestoreReconciler) prewarm(ctx context.Context, pr *snapv1.PodRestore) 
 			}
 			return r.fail(ctx, pr, fmt.Sprintf("reading artifact %s: %v", artifact.ManifestName, err))
 		}
+		// Pre-warm exists to pull the artifact onto the node's NVMe tier. If
+		// the tier already holds all of it — a second restore of the same
+		// build, or a node that ran the build — then reading 50+ GiB back
+		// through the mount discovers only that fact, at FUSE speed.
+		//
+		// Skipping is safe because it is not load-bearing: the restore
+		// re-checks the tier itself and falls back to the mount if anything
+		// is missing. The bad case is a tier evicted between here and there,
+		// which costs a cold read — the same read this would have done.
+		resident := false
+		if !r.StageImageLocal {
+			if cached, cerr := (artifact.NVMeCache{Root: r.NVMeCacheRoot, HostRoot: r.HostRoot}).Resolve(uri.FusePath(), m); cached.Host != "" {
+				logger.Info("artifact already resident on the node NVMe tier; skipping pre-warm", "dir", cached.Host)
+				resident = true
+				n = m.TotalBytes
+				msg = fmt.Sprintf("%d bytes already resident on the node NVMe tier across %d files", n, len(m.Files))
+			} else if cerr != nil {
+				logger.Info("NVMe cache tier does not match the manifest; pre-warming through the mount", "err", cerr)
+			}
+		}
+
 		opts := artifact.PrefetchOpts{
 			SrcDir:      hostPath,
 			Manifest:    m,
@@ -147,8 +169,11 @@ func (r *RestoreReconciler) prewarm(ctx context.Context, pr *snapv1.PodRestore) 
 				return ctrl.Result{}, err
 			}
 		}
-		if n, err = artifact.Prefetch(ctx, opts); err != nil {
-			return r.fail(ctx, pr, fmt.Sprintf("pre-warm fetch failed: %v", err))
+		if !resident {
+			if n, err = artifact.Prefetch(ctx, opts); err != nil {
+				return r.fail(ctx, pr, fmt.Sprintf("pre-warm fetch failed: %v", err))
+			}
+			msg = fmt.Sprintf("%d bytes across %d files", n, len(m.Files))
 		}
 		if opts.StageDir != "" {
 			// Re-publish the manifest locally so restore() can tell a
@@ -157,7 +182,6 @@ func (r *RestoreReconciler) prewarm(ctx context.Context, pr *snapv1.PodRestore) 
 				return r.fail(ctx, pr, fmt.Sprintf("writing staged %s: %v", artifact.ManifestName, err))
 			}
 		}
-		msg = fmt.Sprintf("%d bytes across %d files", n, len(m.Files))
 	} else {
 		f, err := os.Open(hostPath)
 		if err != nil {
@@ -238,6 +262,10 @@ func (r *RestoreReconciler) restore(ctx context.Context, pr *snapv1.PodRestore) 
 	var (
 		bundle   *restore.Bundle
 		manifest *artifact.Manifest
+		// hostImageDir is set only when the images live somewhere the agent
+		// and the host name differently — i.e. the NVMe bypass. Empty means
+		// bundle.CheckpointDir is already a path runc can open.
+		hostImageDir string
 	)
 	if uri.Dir {
 		imageDir := artifactPath
@@ -247,11 +275,16 @@ func (r *RestoreReconciler) restore(ctx context.Context, pr *snapv1.PodRestore) 
 			imageDir, manifest = stage, staged
 		} else if manifest, err = artifact.ReadManifestDir(artifactPath); err != nil {
 			return r.fail(ctx, pr, fmt.Sprintf("reading artifact %s: %v", artifact.ManifestName, err))
-		} else if cached, cerr := (artifact.NVMeCache{Root: r.NVMeCacheRoot}).Resolve(uri.FusePath(), manifest); cached != "" {
+		} else if cached, cerr := (artifact.NVMeCache{Root: r.NVMeCacheRoot, HostRoot: r.HostRoot}).Resolve(uri.FusePath(), manifest); cached.Host != "" {
 			// Pre-warm just pulled all of this onto the node's NVMe; read it
 			// from there rather than paying the FUSE round trip again.
-			logger.Info("restoring from the node NVMe cache tier", "dir", cached)
-			imageDir = cached
+			//
+			// Two paths for one directory: we parse the checkpoint metadata
+			// ourselves, so Open() gets the path this process can reach,
+			// while runc resolves --image-path in the host mount namespace
+			// and gets that one.
+			logger.Info("restoring from the node NVMe cache tier", "dir", cached.Host)
+			imageDir, hostImageDir = cached.Local, cached.Host
 		} else if cerr != nil {
 			// Only a size disagreement gets here, and it means the cache is
 			// not the mirror we assume. Not fatal — the mount still has the
@@ -334,7 +367,7 @@ func (r *RestoreReconciler) restore(ctx context.Context, pr *snapv1.PodRestore) 
 	pid, err := r.Runc.Restore(ctx, restore.RestoreOpts{
 		ContainerID: cid,
 		BundleDir:   filepath.Dir(bundle.SpecPath),
-		ImagePath:   bundle.CheckpointDir,
+		ImagePath:   criuImagePath(bundle.CheckpointDir, hostImageDir),
 		WorkPath:    filepath.Join(workDir, "criu-work"),
 		TCPClose:    tcpClose,
 		Env:         criuTuning(pr),
@@ -516,4 +549,18 @@ func (r *RestoreReconciler) relevant(obj client.Object) bool {
 		return false
 	}
 	return pr.Status.TargetNode == r.NodeName
+}
+
+// criuImagePath is the checkpoint directory as runc will see it.
+//
+// The agent execs runc through nsenter into the host mount namespace, so when
+// the images are read somewhere the two namespaces name differently — the
+// NVMe bypass — runc must be handed the host spelling, not the one the agent
+// used to parse the bundle. hostImageDir is empty in every other case, and
+// then the bundle's own path is already right.
+func criuImagePath(checkpointDir, hostImageDir string) string {
+	if hostImageDir == "" {
+		return checkpointDir
+	}
+	return filepath.Join(hostImageDir, filepath.Base(checkpointDir))
 }

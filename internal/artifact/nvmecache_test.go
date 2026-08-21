@@ -33,8 +33,8 @@ func TestNVMeCacheResolveComplete(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if got != dir {
-		t.Fatalf("got %q, want %q", got, dir)
+	if got.Host != dir || got.Local != dir {
+		t.Fatalf("got %+v, want both paths %q", got, dir)
 	}
 }
 
@@ -48,8 +48,8 @@ func TestNVMeCacheResolveDeclinesWhenIncomplete(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if got != "" {
-		t.Fatalf("expected decline, got %q", got)
+	if got.Host != "" {
+		t.Fatalf("expected decline, got %+v", got)
 	}
 }
 
@@ -66,8 +66,8 @@ func TestNVMeCacheResolveReportsSizeMismatch(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected an error for a size mismatch")
 	}
-	if got != "" {
-		t.Fatalf("expected no path alongside the error, got %q", got)
+	if got.Host != "" {
+		t.Fatalf("expected no path alongside the error, got %+v", got)
 	}
 }
 
@@ -83,9 +83,52 @@ func TestNVMeCacheDisabled(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			got, err := NVMeCache{Root: tc.root}.Resolve("snapshots/builds/x", tc.m)
-			if err != nil || got != "" {
-				t.Fatalf("got (%q, %v), want (\"\", nil)", got, err)
+			if err != nil || got.Host != "" {
+				t.Fatalf("got (%+v, %v), want a zero CacheDir and no error", got, err)
 			}
 		})
+	}
+}
+
+// The path handed back must be the host's, not this process's, even though
+// the checks are done through HostRoot. runc resolves it in the host mount
+// namespace, so returning the /host-prefixed path fails at restore time as a
+// missing file — which looks like an incomplete artifact rather than the
+// path-translation bug it is.
+func TestNVMeCacheResolveReturnsHostPathNotLocalPath(t *testing.T) {
+	hostRoot := t.TempDir()
+	hostView := "/mnt/fuse-nvme0n1/fuse-cache"
+	dir := filepath.Join(hostRoot, hostView, "snapshots/builds/x")
+	writeCacheFile(t, filepath.Join(dir, "checkpoint/pages-1.img"), 100)
+	writeCacheFile(t, filepath.Join(dir, "checkpoint/core-1.img"), 20)
+
+	got, err := NVMeCache{Root: hostView, HostRoot: hostRoot}.Resolve("snapshots/builds/x", testManifest())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	wantHost := filepath.Join(hostView, "snapshots/builds/x")
+	if got.Host != wantHost {
+		t.Fatalf("Host = %q, want the host path %q", got.Host, wantHost)
+	}
+	// And Local must be the one this process can actually open.
+	wantLocal := filepath.Join(hostRoot, wantHost)
+	if got.Local != wantLocal {
+		t.Fatalf("Local = %q, want %q", got.Local, wantLocal)
+	}
+	if _, err := os.Stat(got.Local); err != nil {
+		t.Fatalf("Local is not openable: %v", err)
+	}
+}
+
+// With HostRoot set, a tier that exists only at the unprefixed path is not
+// visible to this process and must not be claimed.
+func TestNVMeCacheResolveChecksThroughHostRoot(t *testing.T) {
+	root := t.TempDir()
+	writeCacheFile(t, filepath.Join(root, "snapshots/builds/x/checkpoint/pages-1.img"), 100)
+	writeCacheFile(t, filepath.Join(root, "snapshots/builds/x/checkpoint/core-1.img"), 20)
+
+	got, err := NVMeCache{Root: root, HostRoot: t.TempDir()}.Resolve("snapshots/builds/x", testManifest())
+	if err != nil || got.Host != "" {
+		t.Fatalf("got (%+v, %v), want a decline", got, err)
 	}
 }
