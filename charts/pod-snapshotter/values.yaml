@@ -71,6 +71,14 @@ agent:
   # Turn this on to copy them onto node-local storage instead, which is worth
   # measuring if the mount's per-read overhead beats the copy.
   stageImageLocal: false
+  # fuse-client's node-local NVMe cache tier, as seen through the agent's
+  # read-only /host mount. After pre-warm the artifact is already on this
+  # device, and reading it back through the FUSE mount costs ~7x (500-690
+  # MB/s vs 2.6-4.5 GB/s measured on A100 nodes), so the restore reads the
+  # CRIU images straight off it instead. Guarded: the bypass is used only
+  # when the tier holds every manifest file at the right size, otherwise the
+  # restore falls back to the mount. Empty disables it entirely.
+  nvmeCacheRoot: /host/mnt/fuse-nvme0n1/fuse-cache
   # Files fetched concurrently from a directory artifact (0 = built-in
   # default of 4). Tar artifacts are always a single stream.
   #

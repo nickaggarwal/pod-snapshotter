@@ -50,6 +50,7 @@ func main() {
 		skipHostChecks  bool
 		stageImageLocal bool
 		prefetchWorkers int
+		nvmeCacheRoot   string
 	)
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8083", "Metrics endpoint address (0 to disable).")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8084", "Health probe endpoint address.")
@@ -64,6 +65,7 @@ func main() {
 	flag.BoolVar(&skipHostChecks, "skip-host-checks", false, "Skip nsenter-based prereq checks (dev only).")
 	flag.BoolVar(&stageImageLocal, "stage-image-local", false, "Copy directory artifacts to node-local storage during pre-warm instead of restoring in place through the fuse mount.")
 	flag.IntVar(&prefetchWorkers, "prefetch-parallelism", 0, "Files fetched concurrently from a directory artifact (0 = default).")
+	flag.StringVar(&nvmeCacheRoot, "nvme-cache-root", "", "fuse-client's node-local NVMe cache tier (e.g. /host/mnt/fuse-nvme0n1/fuse-cache). When set, restores read pre-warmed CRIU images straight off the device instead of back through the fuse mount. Empty disables.")
 
 	opts := zap.Options{Development: false}
 	opts.BindFlags(flag.CommandLine)
@@ -118,6 +120,7 @@ func main() {
 		HostRoot:            hostRoot,
 		StageImageLocal:     stageImageLocal,
 		PrefetchParallelism: prefetchWorkers,
+		NVMeCacheRoot:       nvmeCacheRoot,
 		Resolver:            resolver,
 		Runc:                restore.NewHostRunc(),
 	}

@@ -41,6 +41,7 @@ spec:
             - --host-root=/host
             - --stage-image-local={{ .Values.agent.stageImageLocal }}
             - --prefetch-parallelism={{ .Values.agent.prefetchParallelism }}
+            - --nvme-cache-root={{ .Values.agent.nvmeCacheRoot }}
           env:
             - name: NODE_NAME
               valueFrom:

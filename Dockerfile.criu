@@ -1,5 +1,12 @@
 # Builds pod-snapshotter's CRIU fork: upstream v4.2.1 plus the restore-path
-# patches in hack/criu/patches (docs/design-v2.md §6b).
+# patches, as published at
+#
+#   https://github.com/nickaggarwal/criu
+#   branch pod-snapshotter/v4.2.1-restore-parallelism
+#
+# (docs/design-v2.md §6b). The fork is the source of truth; the copies in
+# hack/criu/patches are kept in sync with it so the series stays reviewable
+# from this repo and can be re-cut against a newer upstream base.
 #
 # v4.2.1 is the base on purpose — it is what the AKS Ubuntu 24.04 GPU nodes
 # already run, so the CUDA plugin, the NVIDIA driver and the CRIU image format
@@ -26,20 +33,32 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libgnutls28-dev libdrm-dev uuid-dev iproute2 \
     && rm -rf /var/lib/apt/lists/*
 
-WORKDIR /src
-RUN curl -fsSL "https://github.com/checkpoint-restore/criu/archive/refs/tags/v${CRIU_VERSION}.tar.gz" \
-      -o criu.tar.gz \
- && tar xzf criu.tar.gz --strip-components=1 \
- && rm criu.tar.gz
+# Pinned to a commit, not to the branch tip: what shipped to a node has to be
+# reconstructible later, and a moving branch would make the tag ambiguous.
+# Bump CRIU_FORK_COMMIT deliberately when the branch advances.
+ARG CRIU_FORK_REPO=https://github.com/nickaggarwal/criu.git
+ARG CRIU_FORK_COMMIT=add24ee4312da3163e41d7248abe1c773bbe5ada
 
-# Applied in order; the build fails loudly if any hunk does not apply, so a
-# rebase onto a new upstream base cannot silently drop a patch.
-COPY hack/criu/patches/ /patches/
+WORKDIR /src
 RUN set -eux; \
-    for p in $(ls /patches/*.patch 2>/dev/null | sort); do \
-        echo "== applying $(basename "$p")"; \
-        patch -p1 --batch --forward < "$p"; \
-    done
+    git init -q .; \
+    git remote add origin "${CRIU_FORK_REPO}"; \
+    git fetch -q --depth 1 origin "${CRIU_FORK_COMMIT}"; \
+    git checkout -q FETCH_HEAD
+
+# The base must be the version we claim. The fork branches off the v4.2.1 tag,
+# so Makefile.versions has to still read exactly that — if a rebase ever lands
+# this branch on a different upstream base, fail here rather than shipping a
+# binary whose CRIU image format silently disagrees with the node's CUDA
+# plugin. (Makefile.versions is the source; criu/include/version.h is
+# generated from it during the build and does not exist yet at this point.)
+RUN set -eux; \
+    v() { sed -n "s/^CRIU_VERSION_$1[[:space:]]*:=[[:space:]]*\\([0-9]*\\).*/\\1/p" Makefile.versions; }; \
+    maj="$(v MAJOR)"; min="$(v MINOR)"; sub="$(v SUBLEVEL)"; \
+    got="${maj}${min:+.${min}}${sub:+.${sub}}"; \
+    echo "fork base version: ${got} (expected ${CRIU_VERSION})"; \
+    test "${got}" = "${CRIU_VERSION}"; \
+    git log --oneline -6
 
 RUN make -j"$(nproc)" criu cuda_plugin
 

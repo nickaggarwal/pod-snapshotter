@@ -55,6 +55,13 @@ type RestoreReconciler struct {
 	PrefetchParallelism int
 	// HostRoot is where the host's / is mounted (read-only) here.
 	HostRoot string
+	// NVMeCacheRoot is fuse-client's node-local cache tier as visible here,
+	// e.g. /host/mnt/fuse-nvme0n1/fuse-cache. When set, and when the tier
+	// holds every file the manifest lists at the right size, the restore
+	// reads the CRIU images straight off the device instead of back through
+	// the FUSE mount — measured ~7x faster for bytes that are already local
+	// (internal/artifact.NVMeCache). Empty disables the bypass.
+	NVMeCacheRoot string
 
 	Resolver SandboxResolver
 	Runc     restore.RuncRunner
@@ -240,6 +247,16 @@ func (r *RestoreReconciler) restore(ctx context.Context, pr *snapv1.PodRestore) 
 			imageDir, manifest = stage, staged
 		} else if manifest, err = artifact.ReadManifestDir(artifactPath); err != nil {
 			return r.fail(ctx, pr, fmt.Sprintf("reading artifact %s: %v", artifact.ManifestName, err))
+		} else if cached, cerr := (artifact.NVMeCache{Root: r.NVMeCacheRoot}).Resolve(uri.FusePath(), manifest); cached != "" {
+			// Pre-warm just pulled all of this onto the node's NVMe; read it
+			// from there rather than paying the FUSE round trip again.
+			logger.Info("restoring from the node NVMe cache tier", "dir", cached)
+			imageDir = cached
+		} else if cerr != nil {
+			// Only a size disagreement gets here, and it means the cache is
+			// not the mirror we assume. Not fatal — the mount still has the
+			// real bytes — but it should be visible, not silently slow.
+			logger.Info("NVMe cache tier does not match the manifest; reading through the mount", "err", cerr)
 		}
 		// Clear scratch from a prior attempt without touching a staged image.
 		for _, sub := range []string{"bundle", "criu-work"} {
