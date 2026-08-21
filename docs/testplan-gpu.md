@@ -46,6 +46,27 @@ pod: `kubectl create configmap snapshot-shim
 | QB-9 | Parallel pre-warm | `status.prewarmBytes` equals the manifest total; wall time below the single-stream tar path for the same bytes |
 | QB-10 | Build pod name collision with a terminating pod | new build waits for the stale pod instead of adopting it (dumping an already-checkpointed container fails inside containerd) |
 
+## CF — patched CRIU (v2 §6b)
+
+Only meaningful with `criu.enabled=true`. Every case runs against the same
+installed binary — the tuning annotations are what varies — so a failure can
+be attributed to the patches rather than to the rebuild.
+
+| ID | Scenario | Pass criteria |
+|----|----------|---------------|
+| CF-1 | Installer on a node that cannot run the binary | DaemonSet fails, `/usr/local/sbin/criu` is removed, `criu --version` on the host still answers from the distro package |
+| CF-2 | `criu.uninstall=true` | marker and binary gone; the next restore succeeds on the packaged CRIU |
+| CF-3 | Patches inert (`criu-aio-depth: 0`, `criu-shmem-threads: 1`) | restore succeeds and the workload serves — this is the control for CF-4 and the first thing to run after any rebase |
+| CF-4 | Pools on (`criu-shmem-threads: 8`) | restore succeeds; `restore.log` shows `Restoring N memfd inodes on M threads`; CRIU-restore wall time below CF-3 |
+| CF-5 | AIO on (`criu-aio-depth: 128`) | restore succeeds; no `AIO read returned 0` and no `BUG at criu/pagemap.c` |
+| CF-6 | Pools + AIO together | restore succeeds and serves; generation matches QB-5 |
+| CF-7 | Stock CRIU given the annotations | ignored, restore unaffected — the agent sets them unconditionally and must not require the fork |
+
+CF-3 exists because of a real regression: the first pool build failed every
+restore with `Bad file descriptor` from `cr_fchpermat`, and having the inert
+control on the same binary is what proved the rebuild innocent and pointed at
+the patches. See [design-v2.md §6b](design-v2.md).
+
 ## IR — integration & resilience
 
 | ID | Scenario | Pass criteria |
