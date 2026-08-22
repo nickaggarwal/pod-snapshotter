@@ -65,7 +65,7 @@ be attributed to the patches rather than to the rebuild.
 | CF-5 | AIO on (`criu-aio-depth: 128`) | restore succeeds; no `AIO read returned 0` and no `BUG at criu/pagemap.c`. Not a throughput case — see below |
 | CF-6 | Pools + AIO together | restore succeeds and serves; generation matches QB-5 |
 | CF-8 | Pool raised to `criu-shmem-threads: 24` | restore succeeds and serves; `Restoring N memfd inodes on 24 threads`; CRIU-proper phase below CF-4 and `nvme0n1` read rate above CF-4's |
-| CF-9 | `criu-image-io-mode: direct` on `v4.2.1-ps5` | restore succeeds and serves; `restore.log` shows `AIO: N of M submissions used O_DIRECT` with N/M near 1; `nvme0n1` reads roughly equal artifact size even on a warm node |
+| CF-9 | `criu-image-io-mode: direct` on `v4.2.1-ps5` | restore succeeds and serves; `restore.log` shows `AIO: N of M submissions used O_DIRECT` with N/M near 1; `nvme0n1` reads roughly equal artifact size even on a warm node. **Measured 2026-08-22: 12575/12575 = 1.000 across 206 calls — every submission took O_DIRECT, so the alignment argument holds in practice** |
 | CF-10 | AIO depth sweep on `v4.2.1-ps5` with `direct` | `criu-aio-depth` 1 / 16 / 128 at fixed `criu-shmem-threads: 8`: CRIU-proper phase must *fall* with depth. Flat here means the §6d submission-depth model is wrong |
 | CF-7 | Stock CRIU given the annotations | ignored, restore unaffected — the agent sets them unconditionally and must not require the fork |
 
@@ -100,13 +100,30 @@ connected to anything.
 A100 nodes have 226 GB of RAM and the 14B artifact is 52 GiB, so a second
 restore of the same artifact reads entirely from page cache — measured: zero
 sectors read from either `sda` or `nvme0n1` across a whole restore. That
-applies to CF-4, CF-6 and CF-8. Before each, either evict the artifact
-(`POSIX_FADV_DONTNEED` over the cache directory) or use a node that has not
-served it yet, and confirm with `/proc/diskstats`, or with
-`node_disk_read_bytes_total` in Prometheus, that the device actually saw the
-reads. The Prometheus route is worth knowing about: it is scraped at 15 s
-resolution on every node continuously, so it can answer this question
-*retroactively* about a run you forgot to instrument.
+applies to CF-4, CF-6 and CF-8. On this dev cluster the reliable way to get a
+cold run is `sync; echo 3 > /proc/sys/vm/drop_caches` on every GPU node from
+the privileged `pod-snapshotter-criu` pod, before each run and on every node
+rather than just the intended one — the restore is scheduled after the drop.
+Confirm it took by reading `MemAvailable` back (it returns to ~202 of 216 GB),
+and confirm the run was genuinely cold from `/proc/diskstats`: a cold 14B
+restore reads **56.4 GB** off `nvme0n1`, a warm one reads zero. Do not rely on
+`criu-image-io-mode: direct` alone for this — it bypasses the cache for CRIU's
+own reads but not for pre-warm, and it is a per-process measure, not eviction.
+`node_disk_read_bytes_total` in Prometheus is the retroactive fallback: it is
+scraped at 15 s resolution on every node continuously, so it can answer this
+about a run you forgot to instrument.
+
+**Read the log from `criu-work/`, and read it before tearing the run down.**
+The CRIU log is at
+`/var/lib/pod-snapshotter/restores/<uid>/criu-work/restore.log`; the agent
+deletes that whole directory when the PodRestore goes away. A sweep that
+deletes run N before parsing it gets nothing back but wall clock, which on
+this workload is dominated by scheduling and pre-warm and cannot resolve the
+read path at all.
+
+**Check `Restoring N memfd inodes on M threads` before believing a config
+applied.** It echoes the effective thread count, so a tuning annotation that
+never reached CRIU shows up as the default 8 rather than as a null result.
 
 CF-3 exists because of a real regression: the first pool build failed every
 restore with `Bad file descriptor` from `cr_fchpermat`, and having the inert
