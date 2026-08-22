@@ -37,7 +37,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # reconstructible later, and a moving branch would make the tag ambiguous.
 # Bump CRIU_FORK_COMMIT deliberately when the branch advances.
 ARG CRIU_FORK_REPO=https://github.com/nickaggarwal/criu.git
-ARG CRIU_FORK_COMMIT=add24ee4312da3163e41d7248abe1c773bbe5ada
+ARG CRIU_FORK_COMMIT=6c683e43ab6edd9907588797f27a413af4d7cf35
 
 WORKDIR /src
 RUN set -eux; \

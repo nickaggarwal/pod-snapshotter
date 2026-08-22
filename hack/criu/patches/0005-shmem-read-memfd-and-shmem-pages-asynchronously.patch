@@ -1,0 +1,43 @@
+diff --git a/criu/shmem.c b/criu/shmem.c
+index 5cf5d85..e44e050 100644
+--- a/criu/shmem.c
++++ b/criu/shmem.c
+@@ -509,9 +509,37 @@ static int do_restore_shmem_content(void *addr, unsigned long size, unsigned lon
+ 		if (vaddr + nr_pages * PAGE_SIZE > size)
+ 			break;
+ 
+-		pr.read_pages(&pr, vaddr, nr_pages, addr + vaddr, 0);
++		/*
++		 * PR_ASYNC, not 0. With 0 this lands in read_local_page() and
++		 * every segment is a blocking pread that must return before
++		 * the next one is issued -- one read in flight for the whole
++		 * object, however fast the device is. Queueing instead lets
++		 * pagemap_enqueue_iovec() coalesce the run of ascending
++		 * offsets into a few large iovecs, and process_async_reads()
++		 * submit them together.
++		 *
++		 * This is the path essentially all of a GPU checkpoint takes:
++		 * cuda-checkpoint parks device memory in host buffers that
++		 * CRIU records as memfds, and restore_memfd_shmem_content()
++		 * comes through here. Before this, the AIO submission path
++		 * was only ever reachable from the task-anonymous memory in
++		 * criu/mem.c -- 3 of 208 page images on a 14B vLLM engine.
++		 *
++		 * The destination is a private mmap of this object alone, so
++		 * nothing reads these pages until the drain below returns.
++		 */
++		pr.read_pages(&pr, vaddr, nr_pages, addr + vaddr, PR_ASYNC);
+ 	}
+ 
++	/*
++	 * Drain before unmapping. pr.close() asserts the queue is empty
++	 * (BUG_ON(!list_empty(&pr->async))), so a missed sync here is a loud
++	 * failure rather than a silently short read -- but do it explicitly,
++	 * and keep a real error from being masked by a successful drain.
++	 */
++	if (pr.sync(&pr) && ret >= 0)
++		ret = -1;
++
+ 	pr.close(&pr);
+ 	return ret;
+ }

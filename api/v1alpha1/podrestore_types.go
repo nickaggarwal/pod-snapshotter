@@ -45,7 +45,22 @@ const (
 	CRIUShmemThreadsAnnotation = "podsnapshot.io/criu-shmem-threads"
 	// CRIUImageIOModeAnnotation is "writeback" (buffered, default) or
 	// "direct" (O_DIRECT for the block-aligned reads).
+	//
+	// "direct" is also the only way to measure the storage path without a
+	// node-wide side effect: it bypasses the page cache for CRIU's reads
+	// alone, where drop_caches and a POSIX_FADV_DONTNEED sweep would
+	// affect every workload on the node.
 	CRIUImageIOModeAnnotation = "podsnapshot.io/criu-image-io-mode"
+	// CRIUAIOChunkAnnotation caps how many bytes one queued async read may
+	// grow to before the next page starts a fresh one, in bytes and a
+	// multiple of the page size. "0" restores unbounded coalescing.
+	//
+	// It exists because coalescing and queue depth pull against each
+	// other. A memfd is a contiguous run of offsets into one mmap, so
+	// without a cap the whole object becomes a single submission and the
+	// device sees a queue of one however deep CRIUAIODepthAnnotation is.
+	// Ignored by CRIU builds before v4.2.1-ps5.
+	CRIUAIOChunkAnnotation = "podsnapshot.io/criu-aio-chunk"
 )
 
 // PodRestoreSpec defines the desired state of PodRestore.

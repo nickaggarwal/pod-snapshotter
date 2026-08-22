@@ -419,7 +419,7 @@ the choice was not fork-vs-upstream, it was fork-vs-wait. We forked.
 The fork is a real fork, published at
 [github.com/nickaggarwal/criu](https://github.com/nickaggarwal/criu), branch
 `pod-snapshotter/v4.2.1-restore-parallelism`. It branches off the upstream
-`v4.2.1` tag (commit `9539417`) and carries four commits, each a reviewable,
+`v4.2.1` tag (commit `9539417`) and carries six commits, each a reviewable,
 rebasable change on its own:
 
 | Commit | Mirrored patch | What it changes |
@@ -428,12 +428,18 @@ rebasable change on its own:
 | `1398bff` | `0002-pagemap-native-aio-async-page-reads.patch` | `criu/pagemap.c` — the async read path gets an `io_submit`/`io_getevents` sliding window |
 | `53e7e72` | `0003-shmem-parallel-restore.patch` | `criu/shmem.c`, `criu/mem.c` — a thread pool that creates, sizes and fills shmem objects concurrently |
 | `2090e7f` | `0004-memfd-parallel-inode-restore.patch` | `criu/memfd.c` — the same pool shape for memfd inodes |
+| `4377264` | `0005-shmem-read-memfd-and-shmem-pages-asynchronously.patch` | `criu/shmem.c` — passes `PR_ASYNC`, which is what finally puts memfd and shmem bytes on the AIO path at all (§6d) |
+| `6c683e4` | `0006-pagemap-bound-how-far-one-async-read-coalesces.patch` | `criu/pagemap.c` — caps one queued read at 1 MiB so an object does not collapse into a single submission |
 
-`add24ee` on top is `POD-SNAPSHOTTER.md`, which describes the branch to anyone
-who finds the fork without this repo, and is the commit `Dockerfile.criu`
-pins.
+`add24ee` between them is `POD-SNAPSHOTTER.md`, which describes the branch to
+anyone who finds the fork without this repo.
 
-The same four changes are mirrored into `hack/criu/patches/*.patch` so the
+Note the ordering of the discovery, because it is the useful part: `1398bff`
+was written first and was dead code on this workload for its entire life.
+`4377264` is three lines of real change and is what makes it run. A patch
+that is merged and shipped is not a patch that executes.
+
+The same six changes are mirrored into `hack/criu/patches/*.patch` so the
 series stays readable from this repo without cloning anything, and so it can
 be re-cut against a newer upstream base. The mirror is kept identical to the
 published commits — same files, same hunk counts.
@@ -472,8 +478,9 @@ All three patches read their settings from the environment, and
 | Annotation | Env | Meaning |
 |---|---|---|
 | `podsnapshot.io/criu-aio-depth` | `CRIU_AIO_DEPTH` | reads in flight; `0`/`1` = stock serial `preadv` loop |
-| `podsnapshot.io/criu-shmem-threads` | `CRIU_SHMEM_RESTORE_THREADS` | shmem/memfd objects restored concurrently; `1` = stock serial loop |
-| `podsnapshot.io/criu-image-io-mode` | `CRIU_IMAGE_IO_MODE` | `writeback` (default) or `direct` for `O_DIRECT` |
+| `podsnapshot.io/criu-shmem-threads` | `CRIU_SHMEM_RESTORE_THREADS` | shmem/memfd objects restored concurrently; `1` = stock serial loop. Unset = `min(nproc, 8)`, hard cap 32. Since each worker's reads are serial, this *is* the effective queue depth — see §6d |
+| `podsnapshot.io/criu-image-io-mode` | `CRIU_IMAGE_IO_MODE` | `writeback` (default) or `direct` for `O_DIRECT`. Also the only per-process way to get a cold-cache measurement |
+| `podsnapshot.io/criu-aio-chunk` | `CRIU_AIO_CHUNK` | bytes one queued async read may grow to before splitting; `0` = unbounded. Default 1 MiB. Ignored before `v4.2.1-ps5` |
 
 That shape was chosen for one reason: **A/B on the same binary.** Setting
 depth `0` and threads `1` makes both patches inert, so a regression can be
@@ -614,19 +621,35 @@ the last three rows. And the manifest check is what makes the bypass safe — a
 partial mirror declines and falls back to the mount, a size that disagrees
 with the manifest is an error rather than a silently wrong restore.
 
-**What is still unmeasured: AIO.** The `criu-aio-depth` A/B is not resolved.
-Two runs back to back gave 22 s with AIO at 128 and 23 s with it off — but
-`/proc/diskstats` showed **zero sectors read from either device** across the
-one of those pairs that was instrumented, because the node has 226 GB of RAM
-and the 52 GiB artifact was entirely in page cache from the run before. A read
-path cannot be benchmarked against reads that never reach a device, so that
-pair is a null result and not evidence about AIO either way. Isolating it
-needs the artifact evicted from page cache between runs
-(`POSIX_FADV_DONTNEED` over the cache directory, or a node that has not served
-this artifact yet). The 35 s row in the table is the first restore after the
-bypass landed and is the conservative number of the three; how much of it
-reached the device was not instrumented, so treat 35 s as the honest figure
-and 22 s as a cache-warm best case rather than a second data point.
+**The AIO A/B, and why it measured nothing.** The `criu-aio-depth` A/B came
+back flat. The first reason is page cache. The node has 226 GB of RAM and the artifact is
+52 GiB, so once one restore has read it, every later restore is served from
+memory. `node_disk_read_bytes_total` on the restore node, at 15 s resolution
+across all four runs:
+
+| run | `criu-aio-depth` | wall | read from `nvme0n1` |
+|---|---|---|---|
+| 1 | 128 (default) | 35 s | **44.0 GB** |
+| 2 | 0 | 23 s | 0.0 GB |
+| 3 | 128 | 22 s | 0.0 GB |
+| 4 | 128 | 23 s | 0.0 GB |
+
+Runs 2-4 touched the device zero times. A read-path patch cannot be
+benchmarked against reads that never reach a device, so the 22 s-vs-23 s
+comparison is a null result on those grounds alone.
+
+It turns out there is a second and more decisive reason, found by reading the
+source rather than the numbers: the AIO patch is not on the path these bytes
+take at all. §6d has it. Evicting the cache between runs would have produced
+the same null result, for the better reason.
+
+**Run 1 is the one honest storage measurement**, and it is only three-quarters
+honest: 44.0 GB of the 56.4 GB came off `nvme0n1` and the remaining 12.4 GB
+was already cached from the pre-warm probe. It sustained 1.26 GB/s averaged
+over the whole 35 s with a 1.465 GB/s peak — which is well under the 2.6 GB/s
+single-stream and 4.5 GB/s four-stream figures the raw device benchmark gave,
+so even the storage-bound run was not storage-limited. That is consistent with
+what the phase breakdown below shows: the read path is not where the time is.
 
 **And `restore.log` says the read path is no longer the majority of it.**
 CRIU's own clock on that run, with the memfd pool confirmed active
@@ -652,11 +675,117 @@ they cannot cross. §7's weight decoupling is the one item on the list that
 plausibly moves the GPU side too, by shrinking what has to be resumed rather
 than by reading it faster.
 
-(One caveat on that split: it comes from the cache-warm run, the only one with
-a `restore.log` still on the node. On the 35 s run the CRIU-proper half would
-be larger and the GPU-resume half about the same, since the latter is not
-I/O-bound — so the read path's share is somewhere between 42% and roughly
-65%, not lower.)
+(One caveat on that split: it comes from a cache-warm run, the only kind with
+a `restore.log` still on the node when the timings were pulled. The 12.4 s is
+not I/O-bound, so on the storage-bound 35 s run it stays put and the CRIU
+half grows to ~22.6 s — 65% read path, 35% GPU resume. The read path's share
+across the two regimes is therefore 42-65%, and the GPU resume is 35-58%. The
+cheaper the storage gets, the more the GPU half dominates.)
+
+### 6d. Why AIO measured nothing, and the two commits that fix it
+
+Re-reading the CRIU source rather than the benchmark numbers settled the AIO
+question, and it settles it against the patch. The A/B was never going to
+show anything, and page cache is only the second reason.
+
+**The AIO patch is unreachable on 98% of the bytes.** `do_restore_shmem_content()`
+— the function behind both `restore_shmem_content()` and
+`restore_memfd_shmem_content()`, i.e. every shmem and every memfd — issues its
+reads as:
+
+```c
+pr.read_pages(&pr, vaddr, nr_pages, addr + vaddr, 0);   /* flags = 0 */
+```
+
+Flags `0`. `maybe_read_page_local()` gates its async branch on
+`(flags & (PR_ASYNC | PR_ASAP)) == PR_ASYNC`, so a zero-flag read falls
+straight through to `read_local_page()` — a blocking `pread` loop. Nothing is
+ever appended to `pr->async`, and `process_async_reads_aio()` returns at its
+first check, `if (!nr_jobs)`.
+
+The only caller in the tree that passes `PR_ASYNC` is `criu/mem.c:1250`, the
+private-anonymous task-memory path. On this checkpoint that is **3 of 208 page
+images**; the other 205 are memfds holding cuda-checkpoint's parked device
+memory — essentially the whole 52 GiB.
+
+So `criu-aio-depth: 128` vs `0` measured 22 s vs 23 s because on the bytes
+that matter the code under test does not execute. That is a stronger
+statement than the page-cache one: a cold-cache re-run would have produced the
+same null result, for this reason instead.
+
+**What the pools actually bought.** Patch 0004's 8 workers each run their own
+`do_restore_shmem_content()`, each doing serial blocking `pread`s. Effective
+queue depth is therefore 8, not 8×128. The measurement agrees precisely: run
+1 read 44.0 GB in 35 s = 1.26 GB/s, about 157 MB/s per thread, against a
+device that does 2.6 GB/s on one `O_DIRECT` stream and 4.5 GB/s on four. Eight
+threads at 157 MB/s each is what a queue depth of 8 against ~130 us NVMe
+service time looks like.
+
+**The restore is submission-limited, not storage-limited.** Both the peak
+(1.465 GB/s) and the average sit far below what the device gave a synthetic
+reader, and the gap is entirely accounted for by how few reads are in flight.
+
+**What was done about it.** Two more commits on the fork, and one knob that
+needed no code at all:
+
+1. **`4377264` — pass `PR_ASYNC`.** Three lines of real change in
+   `do_restore_shmem_content()`, plus an explicit drain before the mapping
+   goes away. This is what puts memfd and shmem bytes on the async path for
+   the first time; `1398bff`, the AIO patch itself, needed no modification —
+   it had simply never been reachable. Two paths stay unaffected by design:
+   `opts.auto_dedup` still routes to `process_async_reads_serial()` and
+   punches its holes exactly as before, and `pr->io_complete` is set only by
+   `uffd.c`, which does not reach this function.
+
+2. **`6c683e4` — bound the coalescing.** Necessary, and not obvious until the
+   first fix was written. `pagemap_enqueue_iovec()` extends the job in
+   progress for every read that continues it, with no upper bound. A memfd is
+   a contiguous ascending run of offsets into a single mmap, so *every* page
+   extends the same iovec and the entire multi-gigabyte object becomes exactly
+   one job — one submission, queue depth one. `PR_ASYNC` on its own would have
+   changed nothing measurable. The cap is 1 MiB, applied to `pr->async` only:
+   `criu/mem.c`'s list is rendered into `task_restore_args` and replayed by
+   the restorer blob, where each job costs memory and no batching happens, so
+   splitting there would be all cost. `CRIU_AIO_CHUNK` overrides it; `0`
+   restores unbounded coalescing.
+
+3. **Raise the pool.** `CRIU_SHMEM_RESTORE_THREADS` defaults to
+   `min(nproc, 8)` and is capped at 32. The node has 24 cores. Independent of
+   the two commits, and worth measuring on its own — it is the control that
+   separates "more threads" from "deeper queues per thread".
+
+`O_DIRECT` also becomes correct on this path, which it was not before.
+`CRIU_IMAGE_IO_MODE=direct` is off by default because most reads cannot be
+aligned — but `pages-%u.img` is declared `RAW_IMAGE_MAGIC`
+(`criu/include/magic.h:40`), so `do_open_image()` skips `img_check_magic()`
+and the file carries **no header**: every page offset is an exact multiple of
+`PAGE_SIZE`, and the destination is an mmap'd memfd. `piov_is_aligned()`
+should now pass for essentially every memfd job. That matters for a second
+reason beyond throughput — it is a per-process way to get a cold-cache
+measurement, where `drop_caches` and a `POSIX_FADV_DONTNEED` sweep are
+node-wide side effects on a shared GPU node and were correctly refused.
+
+**Not yet measured on hardware.** The fork is built and pushed as
+`v4.2.1-ps5`, and the analysis above is from the source, not from a stopwatch.
+Rolling a rebuilt CRIU onto the DaemonSet that serves every node of a shared
+GPU cluster is a deliberate act, so it is left for a human to trigger. The
+A/B that settles it is CF-5/CF-6/CF-8 in `docs/testplan-gpu.md`, run with
+`criu-image-io-mode: direct` so the reads actually reach the device.
+
+Expected shape, stated in advance so the measurement can contradict it: eight
+threads at 157 MB/s each is a queue depth of 8 against ~130 us NVMe service
+time. Making each thread submit 128 reads instead of 1 should saturate before
+thread count does, putting the CRIU-proper phase somewhere near the 4.5 GB/s
+four-stream figure — 8.9 s toward ~3 s. If throughput instead tracks thread
+count and ignores AIO depth, the submission-depth model is wrong and the
+bottleneck is somewhere neither of these commits touches.
+
+Note what this cannot change: the end-to-end 40 s. The 35 s CRIU restore is
+12.4 s of `cuda_plugin` plus ~22.6 s of reading, and only the second number
+moves. Best case takes 40 s to roughly 22 s. At that point the read path is a
+fifth of a restore whose GPU half is fixed, and §7 is the only lever left that
+touches the other four fifths — which is the same conclusion §6c reached, from
+the other direction.
 
 ### Against the blog
 
@@ -729,6 +858,7 @@ distributed cache is good at.
 | 3 | `SnapshotBuild` + build-time artifacts (§5) | **done** |
 | 4 | `--stream` restore, measured (§6a) | not started — `criu-image-streamer` is not on the node images, and the restore is not currently CRIU-read-bound (see below) |
 | 5 | Fork CRIU only if §4 measured short (§6b) | **done** — [nickaggarwal/criu](https://github.com/nickaggarwal/criu), branch `pod-snapshotter/v4.2.1-restore-parallelism` |
+| 6 | Put the memfd bytes on the AIO path (§6d) | **built, not measured** — fork commits `4377264`+`6c683e4`, image `v4.2.1-ps5`; needs CF-5/6/8 on hardware |
 
 ### Benchmark table to fill in
 

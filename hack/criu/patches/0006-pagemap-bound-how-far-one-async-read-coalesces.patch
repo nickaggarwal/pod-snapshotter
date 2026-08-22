@@ -1,0 +1,82 @@
+diff --git a/criu/pagemap.c b/criu/pagemap.c
+index a518549..fd0d06e 100644
+--- a/criu/pagemap.c
++++ b/criu/pagemap.c
+@@ -333,9 +333,55 @@ int pagemap_render_iovec(struct list_head *from, struct task_restore_args *ta)
+ 	return 0;
+ }
+ 
++/*
++ * How large one queued read is allowed to grow before the next page starts a
++ * fresh one, in bytes. 0 disables the split entirely (unbounded coalescing,
++ * the original behavior).
++ *
++ * This exists because coalescing and queue depth pull in opposite directions.
++ * A shmem or memfd object is a contiguous ascending run of offsets into a
++ * single mmap, so without a bound every page of it extends one iovec and the
++ * whole object -- gigabytes, on a GPU checkpoint -- becomes exactly one job.
++ * One job is one submission, and one submission is a queue depth of one,
++ * which is the thing process_async_reads_aio() was written to avoid.
++ *
++ * Splitting costs nothing that matters: the pieces are still sequential and
++ * still page-aligned, and the destination pages are the mmap itself, so more
++ * jobs in flight is not more memory. It buys the device a queue.
++ */
++#define PR_AIO_CHUNK_DEFAULT (1UL << 20)
++
++static unsigned long pr_aio_chunk(void)
++{
++	static unsigned long cached;
++	static bool have;
++	const char *env;
++	char *end;
++	long v;
++
++	if (have)
++		return cached;
++
++	cached = PR_AIO_CHUNK_DEFAULT;
++	env = getenv("CRIU_AIO_CHUNK");
++	if (env && *env) {
++		v = strtol(env, &end, 10);
++		if (*end || v < 0)
++			pr_warn("Ignoring bad CRIU_AIO_CHUNK=%s\n", env);
++		else if (v % PAGE_SIZE)
++			pr_warn("Ignoring unaligned CRIU_AIO_CHUNK=%s\n", env);
++		else
++			cached = (unsigned long)v;
++	}
++
++	have = true;
++	return cached;
++}
++
+ int pagemap_enqueue_iovec(struct page_read *pr, void *buf, unsigned long len, struct list_head *to)
+ {
+ 	struct page_read_iov *cur_async = NULL;
++	unsigned long chunk;
+ 	struct iovec *iov;
+ 
+ 	if (!list_empty(to))
+@@ -350,6 +396,21 @@ int pagemap_enqueue_iovec(struct page_read *pr, void *buf, unsigned long len, st
+ 	if (!cur_async || pr->pi_off != cur_async->end)
+ 		return enqueue_async_iov(pr, buf, len, to);
+ 
++	/*
++	 * Contiguous, but the job in progress is already big enough. Cap it
++	 * and start another, so the reads can be submitted as a batch rather
++	 * than as one enormous request.
++	 *
++	 * Only for pr->async, the list process_async_reads() drains. The
++	 * other caller (criu/mem.c) renders its list into task_restore_args
++	 * for the restorer blob to replay, where each job costs a
++	 * restore_vma_io entry in the restorer's memory and no submission
++	 * batching happens -- splitting there would be all cost.
++	 */
++	chunk = pr_aio_chunk();
++	if (chunk && to == &pr->async && cur_async->end - cur_async->from >= chunk)
++		return enqueue_async_iov(pr, buf, len, to);
++
+ 	/*
+ 	 * This read is pure continuation of the previous one. Let's
+ 	 * just add another IOV (or extend one of the existing).

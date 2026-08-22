@@ -62,8 +62,11 @@ be attributed to the patches rather than to the rebuild.
 | CF-2 | `criu.uninstall=true` | marker and binary gone; the next restore succeeds on the packaged CRIU |
 | CF-3 | Patches inert (`criu-aio-depth: 0`, `criu-shmem-threads: 1`) | restore succeeds and the workload serves — this is the control for CF-4 and the first thing to run after any rebase |
 | CF-4 | Pools on (`criu-shmem-threads: 8`) | restore succeeds; `restore.log` shows `Restoring N memfd inodes on M threads`; time to the first `cuda_plugin: resuming devices` line below CF-3 |
-| CF-5 | AIO on (`criu-aio-depth: 128`) | restore succeeds; no `AIO read returned 0` and no `BUG at criu/pagemap.c` |
+| CF-5 | AIO on (`criu-aio-depth: 128`) | restore succeeds; no `AIO read returned 0` and no `BUG at criu/pagemap.c`. Not a throughput case — see below |
 | CF-6 | Pools + AIO together | restore succeeds and serves; generation matches QB-5 |
+| CF-8 | Pool raised to `criu-shmem-threads: 24` | restore succeeds and serves; `Restoring N memfd inodes on 24 threads`; CRIU-proper phase below CF-4 and `nvme0n1` read rate above CF-4's |
+| CF-9 | `criu-image-io-mode: direct` on `v4.2.1-ps5` | restore succeeds and serves; `restore.log` shows `AIO: N of M submissions used O_DIRECT` with N/M near 1; `nvme0n1` reads roughly equal artifact size even on a warm node |
+| CF-10 | AIO depth sweep on `v4.2.1-ps5` with `direct` | `criu-aio-depth` 1 / 16 / 128 at fixed `criu-shmem-threads: 8`: CRIU-proper phase must *fall* with depth. Flat here means the §6d submission-depth model is wrong |
 | CF-7 | Stock CRIU given the annotations | ignored, restore unaffected — the agent sets them unconditionally and must not require the fork |
 
 **Compare the CRIU-proper phase, not the CRIU wall.** On the 14B artifact,
@@ -73,14 +76,37 @@ read path would move total CRIU wall by well under a third. The number to
 compare across CF-3/4/5/6 is the log timestamp of the first
 `cuda_plugin: resuming devices` line, which is where CRIU's own work ends.
 
-**CF-5 and CF-6 need a cold page cache to mean anything.** The A100 nodes have
-226 GB of RAM and the 14B artifact is 52 GiB, so a second restore of the same
-artifact reads entirely from page cache — measured: zero sectors read from
-either `sda` or `nvme0n1` across a whole restore. An AIO A/B run that way is a
-null result, not a measurement. Before each of these, either evict the
-artifact (`POSIX_FADV_DONTNEED` over the cache directory) or use a node that
-has not served it yet, and confirm with `/proc/diskstats` that the device
-actually saw the reads.
+**CF-9 is how to get a cold-cache number without a node-wide side effect.**
+`CRIU_IMAGE_IO_MODE=direct` bypasses the page cache for CRIU's own reads only,
+so it isolates the storage path without `drop_caches` or a
+`POSIX_FADV_DONTNEED` sweep touching every other workload on a shared GPU
+node. It only became viable once the memfd bytes moved onto the async path:
+`pages-%u.img` has no header, so those reads are page-aligned and
+`piov_is_aligned()` accepts them. Check the `AIO: N of M submissions used
+O_DIRECT` line before trusting the timing — a low N means most jobs fell back
+to buffered reads and the run is warm again.
+
+**On `v4.2.1-ps4` and earlier, CF-5 is a safety case, not a performance one.** `criu-aio-depth` cannot
+currently change the wall clock on a GPU checkpoint, because the memfd and
+shmem restore paths call `read_pages()` with flags `0` and never reach the
+async code — see [design-v2.md §6d](design-v2.md). Run CF-5 to prove the AIO
+path stays harmless when enabled (it is still live for task-anonymous memory,
+3 of 208 images here), and do not read a timing conclusion out of it. On
+`v4.2.1-ps5` and later the memfd path does pass `PR_ASYNC`, so CF-5 becomes a
+performance case — and CF-10 is the sweep that proves the depth knob is
+connected to anything.
+
+**Any case that does claim a throughput number needs a cold page cache.** The
+A100 nodes have 226 GB of RAM and the 14B artifact is 52 GiB, so a second
+restore of the same artifact reads entirely from page cache — measured: zero
+sectors read from either `sda` or `nvme0n1` across a whole restore. That
+applies to CF-4, CF-6 and CF-8. Before each, either evict the artifact
+(`POSIX_FADV_DONTNEED` over the cache directory) or use a node that has not
+served it yet, and confirm with `/proc/diskstats`, or with
+`node_disk_read_bytes_total` in Prometheus, that the device actually saw the
+reads. The Prometheus route is worth knowing about: it is scraped at 15 s
+resolution on every node continuously, so it can answer this question
+*retroactively* about a run you forgot to instrument.
 
 CF-3 exists because of a real regression: the first pool build failed every
 restore with `Bad file descriptor` from `cr_fchpermat`, and having the inert

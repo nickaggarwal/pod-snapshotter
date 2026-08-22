@@ -455,6 +455,7 @@ func criuTuning(pr *snapv1.PodRestore) map[string]string {
 		snapv1.CRIUAIODepthAnnotation:     "CRIU_AIO_DEPTH",
 		snapv1.CRIUShmemThreadsAnnotation: "CRIU_SHMEM_RESTORE_THREADS",
 		snapv1.CRIUImageIOModeAnnotation:  "CRIU_IMAGE_IO_MODE",
+		snapv1.CRIUAIOChunkAnnotation:     "CRIU_AIO_CHUNK",
 	} {
 		if v := pr.Annotations[annotation]; v != "" {
 			env[name] = v

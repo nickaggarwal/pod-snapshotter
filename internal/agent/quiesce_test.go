@@ -135,6 +135,7 @@ func TestCRIUTuning(t *testing.T) {
 		snapv1.CRIUAIODepthAnnotation:     "256",
 		snapv1.CRIUShmemThreadsAnnotation: "1",
 		snapv1.CRIUImageIOModeAnnotation:  "direct",
+		snapv1.CRIUAIOChunkAnnotation:     "1048576",
 		"unrelated":                       "ignored",
 	}}}
 	got := criuTuning(pr)
@@ -142,6 +143,7 @@ func TestCRIUTuning(t *testing.T) {
 		"CRIU_AIO_DEPTH":             "256",
 		"CRIU_SHMEM_RESTORE_THREADS": "1",
 		"CRIU_IMAGE_IO_MODE":         "direct",
+		"CRIU_AIO_CHUNK":             "1048576",
 	}
 	if len(got) != len(want) {
 		t.Fatalf("criuTuning = %v, want %v", got, want)
