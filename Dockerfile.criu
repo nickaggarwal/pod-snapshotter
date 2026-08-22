@@ -76,13 +76,17 @@ RUN set -eux; \
     mkdir -p /out/usr/local/sbin; \
     cp criu/criu /out/usr/local/sbin/criu; \
     tar -C /out -czf /criu-dist.tar.gz usr; \
-    cp plugins/cuda/cuda_plugin.so /cuda_plugin.so
+    cp plugins/cuda/cuda_plugin.so /cuda_plugin.so; \
+    ./criu/criu --version > /criu-gitid
 
 # The runtime image is the installer payload: the DaemonSet copies the tarball
 # onto the host and unpacks it there.
 FROM ubuntu:${UBUNTU_VERSION}
 COPY --from=build /criu-dist.tar.gz /criu-dist.tar.gz
 COPY --from=build /cuda_plugin.so /cuda_plugin.so
+# The binary's own gitid, so install.sh can tell two images apart even when
+# CRIU_BUILD_VERSION was not updated alongside the image (see install.sh).
+COPY --from=build /criu-gitid /criu-gitid
 COPY hack/criu/install.sh /install.sh
 RUN chmod +x /install.sh
 ENTRYPOINT ["/install.sh"]

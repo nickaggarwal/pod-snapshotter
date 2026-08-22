@@ -25,12 +25,21 @@ if [ "${UNINSTALL:-false}" = "true" ]; then
     exec sleep infinity
 fi
 
-if [ -f "$MARKER" ] && [ "$(cat "$MARKER")" = "$VERSION" ]; then
-    echo "patched CRIU $VERSION already installed"
+# The marker records what is installed. It is compared against the version
+# *and* against the binary's own gitid, because those can disagree: a
+# `kubectl set image` that does not also update CRIU_BUILD_VERSION leaves the
+# marker matching while the image underneath has changed, and the installer
+# would skip the very rollout it was asked to do. Trusting the built binary
+# rather than the env var alone makes that fail safe.
+BUILT_ID="$(sed -n 's/^GitID: //p' /criu-gitid 2>/dev/null || true)"
+WANT="${VERSION}${BUILT_ID:+ ${BUILT_ID}}"
+
+if [ -f "$MARKER" ] && [ "$(cat "$MARKER")" = "$WANT" ]; then
+    echo "patched CRIU $WANT already installed"
     exec sleep infinity
 fi
 
-echo "installing patched CRIU $VERSION"
+echo "installing patched CRIU $WANT"
 tar -C "$HOST_ROOT" -xzf /criu-dist.tar.gz
 
 if [ ! -f "${HOST_ROOT}/usr/lib/criu/cuda_plugin.so" ]; then
@@ -47,7 +56,7 @@ if ! hostrun '/usr/local/sbin/criu --version'; then
     exit 1
 fi
 
-printf '%s' "$VERSION" > "$MARKER"
+printf '%s' "$WANT" > "$MARKER"
 
 echo "--- what the host resolves now ---"
 hostrun 'command -v criu; criu --version'
