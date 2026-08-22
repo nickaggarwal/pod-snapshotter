@@ -546,15 +546,19 @@ sliding window would have several reads outstanding against a file that is
 being punched underneath them.
 
 Making shmem and memfd page reads `PR_ASYNC` — so the pool and the AIO window
-compose — was tried and reverted. CRIU merges adjacent async read jobs, and
-merging across objects produced a single read spanning past the end of an
-object's pages image: `AIO read returned 0 at 268435456, 1 iovs left`, then
-`BUG at criu/pagemap.c:963`. The two patches now cover disjoint ground: AIO
-accelerates the private-VMA read path, the pools accelerate shmem/memfd. For
-the 14B artifact that split is lopsided — 205 of the 208 page images belong to
-memfds — so the pools are the half that matters and the AIO window is nearly
-idle. On a workload whose memory is mostly private anonymous VMAs it would be
-the other way round.
+compose — was tried once before and reverted: merging adjacent async read jobs
+produced a single read spanning past the end of an object's pages image,
+`AIO read returned 0 at 268435456, 1 iovs left`, then `BUG at
+criu/pagemap.c:963`. That failure was the unbounded coalescing in
+`pagemap_enqueue_iovec()`, which `6c683e4` now caps, and the two commits in
+§6d land the same idea successfully — 205 of 208 page images are memfds, so
+this is where nearly all the bytes are. The revert stands as the reason the
+cap exists, not as a claim that the paths must stay disjoint.
+
+For a workload whose memory is mostly private anonymous VMAs the split would
+be the other way round, and `criu/mem.c`'s list is deliberately left
+uncapped: it is rendered into `task_restore_args` and replayed by the restorer
+blob, where each job costs memory and no batching happens.
 
 ### 6c. The transport ceiling, and how it came down
 
@@ -765,24 +769,56 @@ reason beyond throughput — it is a per-process way to get a cold-cache
 measurement, where `drop_caches` and a `POSIX_FADV_DONTNEED` sweep are
 node-wide side effects on a shared GPU node and were correctly refused.
 
-**Not yet measured on hardware.** The fork is built and pushed as
-`v4.2.1-ps5`, and the analysis above is from the source, not from a stopwatch.
-Rolling a rebuilt CRIU onto the DaemonSet that serves every node of a shared
-GPU cluster is a deliberate act, so it is left for a human to trigger. The
-A/B that settles it is CF-5/CF-6/CF-8 in `docs/testplan-gpu.md`, run with
-`criu-image-io-mode: direct` so the reads actually reach the device.
+**Measured, 2026-08-22.** `v4.2.1-ps5` on both A100 nodes, Qwen2.5-14B, five
+cold runs — `drop_caches` on every GPU node before each, and every run
+confirmed cold by reading 56.4 GB off `nvme0n1` (a warm run reads zero). The
+number compared is the CRIU-proper phase: start to the first
+`cuda_plugin: resuming devices`.
 
-Expected shape, stated in advance so the measurement can contradict it: eight
-threads at 157 MB/s each is a queue depth of 8 against ~130 us NVMe service
-time. Making each thread submit 128 reads instead of 1 should saturate before
-thread count does, putting the CRIU-proper phase somewhere near the 4.5 GB/s
-four-stream figure — 8.9 s toward ~3 s. If throughput instead tracks thread
-count and ignores AIO depth, the submission-depth model is wrong and the
-bottleneck is somewhere neither of these commits touches.
+| depth | threads | CRIU-proper | GPU resume | O_DIRECT | nvme read |
+|-------|---------|-------------|-----------|----------|-----------|
+| 1 | 24 | 23.9 s | 12.5 s | — (serial) | 56.4 GB |
+| 1 | 8 | 21.4 s | 12.5 s | — (serial) | 56.4 GB |
+| 16 | 8 | **19.4 s** | 12.5 s | 1.00 | 56.4 GB |
+| 128 | 8 | **19.4 s** | 12.5 s | 1.00 | 56.4 GB |
+| 128 | 24 | **19.1 s** | 12.5 s | 1.00 | 56.4 GB |
+
+The depth knob is connected, which is the one thing CF-10 existed to decide.
+At a fixed 8 threads, depth 1 → 16 moves the read path 21.4 s → 19.4 s; at a
+fixed 24 threads, depth 1 → 128 moves it 23.9 s → 19.1 s. Before these two
+commits that comparison was flat by construction, because the code under test
+never ran. `O_DIRECT` took **12575 of 12575 submissions** — the alignment
+argument above holds exactly, not approximately.
+
+**But the model was wrong about the size of the win.** The prediction was
+8.9 s toward ~3 s. The read path went 21.4 s → 19.4 s: about 2 s, not 18.
+Three things the arithmetic missed, in the order they matter:
+
+- **Depth saturates at 16.** 16 and 128 are indistinguishable (19.4 s both).
+  Whatever the constraint is, four extra doublings of queue depth do not
+  touch it, so it is not submission depth past that point.
+- **Threads stop helping, then start hurting.** At depth 1, going 8 → 24
+  threads made it *slower* (21.4 s → 23.9 s) — 24 serial streams contending
+  where 8 already sufficed. At depth 128 the same change is worth 0.3 s,
+  inside run-to-run noise. Neither knob has anything left to give.
+- **The read path is not 21.4 s of reading.** 56.4 GB in 19.4 s is 2.9 GB/s,
+  already above the 2.6 GB/s single-stream figure and past half the 4.5 GB/s
+  four-stream one. The remainder is CRIU's own per-object work — 205 memfds
+  created, mapped, filled, unmapped — which no amount of queue depth
+  addresses. The device is no longer the limit; the arrival rate of work to
+  give it is.
+
+So the submission-depth model was right about the mechanism and wrong about
+the headroom. It was worth doing — a 2 s read-path win is real and the
+`O_DIRECT` result retires a standing question — but the honest summary is that
+the read path is now close to done, and §7 owns everything that is left.
 
 Note what this cannot change: the end-to-end 40 s. The 35 s CRIU restore is
 12.4 s of `cuda_plugin` plus ~22.6 s of reading, and only the second number
-moves. Best case takes 40 s to roughly 22 s. At that point the read path is a
+moves. Best case takes 40 s to roughly 22 s. Measured: 39 s wall, of which
+19.4 s is CRIU-proper and 12.5 s is GPU resume — and the 12.5 s did not vary
+by a tenth of a second across five configurations, which is the cleanest
+confirmation available that read-path tuning cannot reach it. At that point the read path is a
 fifth of a restore whose GPU half is fixed, and §7 is the only lever left that
 touches the other four fifths — which is the same conclusion §6c reached, from
 the other direction.
@@ -858,7 +894,7 @@ distributed cache is good at.
 | 3 | `SnapshotBuild` + build-time artifacts (§5) | **done** |
 | 4 | `--stream` restore, measured (§6a) | not started — `criu-image-streamer` is not on the node images, and the restore is not currently CRIU-read-bound (see below) |
 | 5 | Fork CRIU only if §4 measured short (§6b) | **done** — [nickaggarwal/criu](https://github.com/nickaggarwal/criu), branch `pod-snapshotter/v4.2.1-restore-parallelism` |
-| 6 | Put the memfd bytes on the AIO path (§6d) | **built, not measured** — fork commits `4377264`+`6c683e4`, image `v4.2.1-ps5`; needs CF-5/6/8 on hardware |
+| 6 | Put the memfd bytes on the AIO path (§6d) | **done** — fork commits `4377264`+`6c683e4`, image `v4.2.1-ps5`, live on both GPU nodes. CF-8/9/10 measured 2026-08-22: read path 21.4 s → 19.4 s cold, `O_DIRECT` 12575/12575. Smaller than predicted; §6d says why |
 
 ### Benchmark table to fill in
 
@@ -874,10 +910,19 @@ created → placeholder pod Ready), not CRIU-restore-only:
 | +§6b fork, patches inert | 52 GiB | 231 s | *gone* | 445 s | — | 677 s |
 | +§6b fork, shmem pool ×8 | 52 GiB | 225 s | *gone* | 225 s | — | 452 s |
 | +no staging copy | 52 GiB | 104 s | *gone* | 147 s | — | 253 s |
-| +NVMe bypass | 52 GiB | **2 s** | *gone* | **35 s** | — | **40 s** |
+| +NVMe bypass | 52 GiB | **2 s** | *gone* | 35 s | — | 40 s |
+| +§6d memfd on AIO, cold | 52 GiB | **2 s** | *gone* | **31.9 s** | — | **39 s** |
 
-**677 s → 40 s, 17×**, on the same 52 GiB artifact and the same node, with the
-restored engine verified by generation at every step. Of the 637 s removed,
+**677 s → 39 s, 17×**, on the same 52 GiB artifact and the same node, with the
+restored engine verified by generation at every step.
+
+The last row is the only one measured on a cold page cache — `drop_caches` on
+every GPU node first, 56.4 GB confirmed read off `nvme0n1`. It is therefore
+*not* strictly comparable to the 35 s above it, which was warm and
+uninstrumented; the ps5 read path beats it while also paying for real device
+reads. Within that row the split is 19.4 s CRIU-proper and 12.5 s GPU resume,
+and the 12.5 s held to a tenth of a second across all five tuning
+configurations in §6d. Of the 637 s removed,
 the CRIU fork accounts for 225 s (35%) and transport for 412 s (65%) —
 199 s from deleting the staging copy and 213 s from bypassing the mount. The
 fork was the thing we set out to build; the larger half turned out to be two

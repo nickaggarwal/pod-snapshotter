@@ -42,12 +42,11 @@ criu:
   uninstall: false
   image:
     repository: pod-snapshotter/criu
-    # Still ps4, deliberately. ps5 adds the two commits that finally put memfd
-    # and shmem bytes on the AIO path (design-v2.md §6d) and is expected to be
-    # the faster build -- but it has not been measured on hardware yet, and
-    # this tag is what an existing install picks up on upgrade. Bump it after
-    # CF-5/CF-6/CF-8/CF-9/CF-10 pass, not before.
-    tag: v4.2.1-ps4
+    # ps5 adds the two commits that put memfd and shmem bytes on the AIO path
+    # (design-v2.md §6d). Measured 2026-08-22 on the A100 pool over five cold
+    # runs: read path 21.4 s -> 19.4 s, O_DIRECT 12575/12575, generation
+    # correct. CF-8/CF-9/CF-10 pass, which is what this tag was waiting on.
+    tag: v4.2.1-ps5
     pullPolicy: IfNotPresent
 
 agent:
