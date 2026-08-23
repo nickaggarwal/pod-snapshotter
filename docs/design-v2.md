@@ -796,7 +796,8 @@ Three things the arithmetic missed, in the order they matter:
 
 - **Depth saturates at 16.** 16 and 128 are indistinguishable (19.4 s both).
   Whatever the constraint is, four extra doublings of queue depth do not
-  touch it, so it is not submission depth past that point.
+  touch it, so it is not submission depth past that point. CF-11 below rules
+  out the obvious suspect: it is not the chunk cap starving the queue either.
 - **Threads stop helping, then start hurting.** At depth 1, going 8 → 24
   threads made it *slower* (21.4 s → 23.9 s) — 24 serial streams contending
   where 8 already sufficed. At depth 128 the same change is worth 0.3 s,
@@ -807,6 +808,31 @@ Three things the arithmetic missed, in the order they matter:
   created, mapped, filled, unmapped — which no amount of queue depth
   addresses. The device is no longer the limit; the arrival rate of work to
   give it is.
+
+**The chunk cap is what makes depth mean anything.** CF-11, same protocol,
+same five-run discipline, fixed at depth 128 / 8 threads, sweeping
+`CRIU_AIO_CHUNK`:
+
+| chunk | CRIU-proper | GPU resume | O_DIRECT | nvme read |
+|-------|-------------|-----------|----------|-----------|
+| `0` (unbounded) | 22.0 s | 12.6 s | 1.00 | 56.4 GB |
+| 4 MiB | 21.7 s | 12.5 s | 1.00 | 56.4 GB |
+| 1 MiB (default) | **19.3 s** | 12.5 s | 1.00 | 56.4 GB |
+| 256 KiB | **19.1 s** | 12.5 s | 1.00 | 56.4 GB |
+
+`0` is the control, and it lands where `6c683e4` predicted: with coalescing
+unbounded, `pagemap_enqueue_iovec()` merges each memfd into essentially one
+giant iovec, the queue never holds more than a couple of jobs, and a depth of
+128 buys nothing — 22.0 s, back within noise of the depth-1 run's 21.4 s. The
+depth knob and the chunk cap are one mechanism, not two: without the cap there
+is nothing for the depth to be deep *with*.
+
+It also closes the open question about CF-10's saturation. 256 KiB and 1 MiB
+tie within run-to-run noise (19.1 vs 19.3 s), so chunk size is not the thing
+holding depth back past 16 — smaller chunks mean more jobs in flight and it
+did not help. That leaves the third bullet above as the explanation: CRIU's
+own per-object work, not the I/O queue. 4 MiB regressing to 21.7 s is the same
+effect from the other side, one doubling short of unbounded.
 
 So the submission-depth model was right about the mechanism and wrong about
 the headroom. It was worth doing — a 2 s read-path win is real and the
@@ -894,7 +920,7 @@ distributed cache is good at.
 | 3 | `SnapshotBuild` + build-time artifacts (§5) | **done** |
 | 4 | `--stream` restore, measured (§6a) | not started — `criu-image-streamer` is not on the node images, and the restore is not currently CRIU-read-bound (see below) |
 | 5 | Fork CRIU only if §4 measured short (§6b) | **done** — [nickaggarwal/criu](https://github.com/nickaggarwal/criu), branch `pod-snapshotter/v4.2.1-restore-parallelism` |
-| 6 | Put the memfd bytes on the AIO path (§6d) | **done** — fork commits `4377264`+`6c683e4`, image `v4.2.1-ps5`, live on both GPU nodes. CF-8/9/10 measured 2026-08-22: read path 21.4 s → 19.4 s cold, `O_DIRECT` 12575/12575. Smaller than predicted; §6d says why |
+| 6 | Put the memfd bytes on the AIO path (§6d) | **done** — fork commits `4377264`+`6c683e4`, image `v4.2.1-ps5`, live on both GPU nodes. CF-8/9/10/11 measured 2026-08-22: read path 21.4 s → 19.4 s cold, `O_DIRECT` 12575/12575, and the unbounded-chunk control gives the win back (22.0 s). Smaller than predicted; §6d says why |
 
 ### Benchmark table to fill in
 

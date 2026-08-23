@@ -67,7 +67,7 @@ be attributed to the patches rather than to the rebuild.
 | CF-8 | Pool raised to `criu-shmem-threads: 24` | restore succeeds and serves; `Restoring N memfd inodes on 24 threads`. **Do not expect it to be faster** — measured 2026-08-22, 24 threads is worth 0.3 s at depth 128 (noise) and *costs* 2.5 s at depth 1, where 24 serial streams contend where 8 sufficed. The pass criterion is that it still restores correctly, and that the thread count in the log matches what was asked for |
 | CF-9 | `criu-image-io-mode: direct` on `v4.2.1-ps5` | restore succeeds and serves; `restore.log` shows `AIO: N of M submissions used O_DIRECT` with N/M near 1; `nvme0n1` reads roughly equal artifact size even on a warm node. **Measured 2026-08-22: 12575/12575 = 1.000 across 206 calls — every submission took O_DIRECT, so the alignment argument holds in practice** |
 | CF-10 | AIO depth sweep on `v4.2.1-ps5` with `direct` | `criu-aio-depth` 1 / 16 / 128 at fixed `criu-shmem-threads: 8`: CRIU-proper phase must *fall* with depth. Flat here means the §6d submission-depth model is wrong. **Passed 2026-08-22: 21.4 s → 19.4 s → 19.4 s.** Depth saturates by 16 — do not read the 16-vs-128 tie as a failure |
-| CF-11 | `criu-aio-chunk` sweep at fixed depth 128 / threads 8 | 256 KiB / 1 MiB / 4 MiB / `0`. `0` is the real control: unbounded coalescing is the pre-`6c683e4` behavior and should collapse each memfd to a single submission, undoing the CF-10 win regardless of depth. Needs agent `v0.4.3-aiochunk` or later — earlier agents drop the annotation silently, which looks identical to the knob doing nothing |
+| CF-11 | `criu-aio-chunk` sweep at fixed depth 128 / threads 8 | 256 KiB / 1 MiB / 4 MiB / `0`. `0` is the real control: unbounded coalescing is the pre-`6c683e4` behavior and should collapse each memfd to a single submission, undoing the CF-10 win regardless of depth. Needs agent `v0.4.3-aiochunk` or later — earlier agents drop the annotation silently, which looks identical to the knob doing nothing. **Passed 2026-08-22: `0` → 22.0 s, 4 MiB → 21.7 s, 1 MiB → 19.3 s, 256 KiB → 19.1 s.** The control lands where predicted: unbounded gives back the whole CF-10 win, so chunking is what makes depth mean anything. 256 KiB and 1 MiB tie within noise, which rules out chunk size as the explanation for CF-10's saturation at depth 16 |
 | CF-7 | Stock CRIU given the annotations | ignored, restore unaffected — the agent sets them unconditionally and must not require the fork |
 
 **Compare the CRIU-proper phase, not the CRIU wall.** On the 14B artifact,
@@ -121,6 +121,12 @@ deletes that whole directory when the PodRestore goes away. A sweep that
 deletes run N before parsing it gets nothing back but wall clock, which on
 this workload is dominated by scheduling and pre-warm and cannot resolve the
 read path at all.
+
+**`drop_caches` evicts the container image too.** The first restore after a
+drop re-pulls `vllm/vllm-openai` and spends a minute or two in
+`ContainerCreating` before CRIU is even invoked. That lands in wall clock and
+not in the CRIU-proper phase, which is one more reason to compare the latter;
+budget for it when a sweep looks stalled on its first run.
 
 **Check `Restoring N memfd inodes on M threads` before believing a config
 applied.** It echoes the effective thread count, so a tuning annotation that
