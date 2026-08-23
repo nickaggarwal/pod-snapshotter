@@ -27,7 +27,10 @@ INTERVAL="${INTERVAL:-5}"
 mkdir -p "$OUT"
 
 agent_pod() {
-  kubectl -n "$AGENT_NS" get pods -l app.kubernetes.io/name=pod-snapshotter-agent \
+  # The chart labels these app=pod-snapshotter-agent, not with the
+  # app.kubernetes.io/name form -- selecting on the wrong one returns an empty
+  # list and the jsonpath below fails on an index into nothing.
+  kubectl -n "$AGENT_NS" get pods -l app=pod-snapshotter-agent \
     --field-selector "spec.nodeName=$NODE" -o jsonpath='{.items[0].metadata.name}'
 }
 AGENT="$(agent_pod)"

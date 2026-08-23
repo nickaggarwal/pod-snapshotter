@@ -239,6 +239,40 @@ Two smaller decisions fell out of this:
   old to claim it or when the artifact is a tar. A cluster mid-upgrade keeps
   working, and a snapshot never waits on an agent that will not act.
 
+Two things about the dump only became visible once the agent owned it, and
+both are properties of the operation rather than bugs in a particular
+implementation.
+
+**A dump is not idempotent, and the state machine has to know it.**
+`runc checkpoint` takes the container with it: after a successful dump there
+is no process left to dump again. That makes the ordinary controller reflex —
+fail, requeue, retry — actively wrong at exactly one point, between CRIU
+finishing and the status write landing. The manager writes the same object's
+status while the dump runs, so losing that write to a conflict is the normal
+case, not the exceptional one; and the retry that follows re-enters a dump
+whose container is already gone. The first real run showed it precisely: a
+47-second dump, a complete artifact on disk, and a snapshot that then spun in
+`Checkpointing` forever reporting a missing sandbox. The completion now
+re-reads on conflict, and a reconcile that finds a committed MANIFEST
+finishes the bookkeeping rather than dumping again. The kubelet path never
+had to think about this, because the tar it returns is a value — it can be
+re-requested, and the retry is harmless.
+
+**A mutable tag is not a version.** That bug took much longer to find than to
+fix, because every check said the cluster was current while the manager
+running in it was three commits old. The images are pinned to tags, the pull
+policy is `IfNotPresent`, and re-pushing a tag a node already has changes
+nothing: the rendered pod spec is byte-identical, no rollout happens, and the
+node goes on serving its cached layers. The stale manager did not know about
+`spec.checkpointer`, so its finalizer `Update` silently pruned the field, and
+the build ran the kubelet path while reporting itself as the agent one — a
+measurement attributed to the wrong code, which is the one failure this
+project can least afford. `hack/deploy.sh` now compares registry digests
+against what the kubelet actually pulled, and restarts the workloads after a
+build. This is the same class of failure as the CRIU marker drift in §6: the
+artifact that says what is installed is not the thing that is running, and
+only the running thing counts.
+
 ---
 
 ## 4. Workstream 2 — quiesce/resume hooks
