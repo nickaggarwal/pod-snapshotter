@@ -42,17 +42,27 @@ criu:
   uninstall: false
   image:
     repository: pod-snapshotter/criu
-    # ps5 adds the two commits that put memfd and shmem bytes on the AIO path
+      # ps5 adds the two commits that put memfd and shmem bytes on the AIO path
     # (design-v2.md §6d). Measured 2026-08-22 on the A100 pool over five cold
     # runs: read path 21.4 s -> 19.4 s, O_DIRECT 12575/12575, generation
     # correct. CF-8/CF-9/CF-10 pass, which is what this tag was waiting on.
-    tag: v4.2.1-ps5
+    #
+    # ps5.1 is the same CRIU binary (fork commit 6c683e4) rebuilt to carry
+    # /criu-gitid, so install.sh can tell two images apart when only the tag
+    # moved. Before it, `kubectl set image` alone left the marker matching and
+    # the installer skipped the rollout it had just been asked to do.
+    tag: v4.2.1-ps5.1
     pullPolicy: IfNotPresent
 
 agent:
   image:
     repository: pod-snapshotter/agent
-    tag: latest
+    # Pinned, not "latest". The agent is what translates the CRIU tuning
+    # annotations into environment for `runc restore`, so which build is
+    # running decides which knobs exist at all -- v0.4.2 and earlier silently
+    # drop podsnapshot.io/criu-aio-chunk, and a restore tuned with it looks
+    # like the knob does nothing rather than like the agent is too old.
+    tag: v0.4.3-aiochunk
     pullPolicy: IfNotPresent
   # Restrict the agent to GPU nodes by default. Set to {} to run everywhere
   # (e.g. CPU-only checkpoint trials on kind).
@@ -95,7 +105,13 @@ agent:
   # knob to turn up when restores are slow: 8 was both slower than 4 and the
   # setting under which fuse-client OOMKilled. See
   # internal/artifact/prefetch.go for the curve.
-  prefetchParallelism: 0
+  #
+  # Stated explicitly rather than left at the 0 sentinel. Both mean 4 today,
+  # but the live DaemonSet was hand-patched to an explicit 4 during the §6c
+  # work, and a helm upgrade replacing that with 0 is a silent change to the
+  # rendered args of the thing being benchmarked -- true even while the
+  # effective value is identical.
+  prefetchParallelism: 4
   resources:
     requests: {cpu: 100m, memory: 256Mi}
     limits: {memory: 2Gi}
