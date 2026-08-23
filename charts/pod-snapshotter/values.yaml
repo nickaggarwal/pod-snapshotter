@@ -1,10 +1,20 @@
 nameOverride: ""
 namespace: pod-snapshotter
 
+# Registry every component image is pulled from, prepended to the per-component
+# image.repository paths below. Empty means "the repository field is already
+# fully qualified" -- which is only true for a local kind cluster. Set it for
+# any real deployment; hack/deploy.sh does.
+imageRegistry: ""
+
 manager:
   image:
     repository: pod-snapshotter/manager
-    tag: latest
+    # Pinned, like the agent and CRIU tags. "latest" was what let the chart and
+    # the cluster drift apart in the first place: a tag that means a different
+    # image on every push cannot be compared against what is running, so
+    # hack/deploy.sh --check had nothing to check.
+    tag: v0.2.2
     pullPolicy: IfNotPresent
   replicas: 1
   leaderElect: false
@@ -42,7 +52,7 @@ criu:
   uninstall: false
   image:
     repository: pod-snapshotter/criu
-      # ps5 adds the two commits that put memfd and shmem bytes on the AIO path
+    # ps5 adds the two commits that put memfd and shmem bytes on the AIO path
     # (design-v2.md §6d). Measured 2026-08-22 on the A100 pool over five cold
     # runs: read path 21.4 s -> 19.4 s, O_DIRECT 12575/12575, generation
     # correct. CF-8/CF-9/CF-10 pass, which is what this tag was waiting on.
@@ -51,7 +61,13 @@ criu:
     # /criu-gitid, so install.sh can tell two images apart when only the tag
     # moved. Before it, `kubectl set image` alone left the marker matching and
     # the installer skipped the rollout it had just been asked to do.
-    tag: v4.2.1-ps5.1
+    #
+    # ps5.2 is the same binary again (fork commit 6c683e4) with an installer
+    # that waits for the host's own package provisioning instead of racing it.
+    # A node scaled up fresh can run this DaemonSet minutes before the distro
+    # criu and its shared libraries land, and the run-check then failed on a
+    # missing libnet.so.1 and rolled back -- a healthy build reported as broken.
+    tag: v4.2.1-ps5.2
     pullPolicy: IfNotPresent
 
 agent:
@@ -64,10 +80,14 @@ agent:
     # like the knob does nothing rather than like the agent is too old.
     tag: v0.4.3-aiochunk
     pullPolicy: IfNotPresent
-  # Restrict the agent to GPU nodes by default. Set to {} to run everywhere
-  # (e.g. CPU-only checkpoint trials on kind).
+  # Where the agent runs. Every linux node by default, not GPU nodes only: the
+  # agent also publishes prereq status and serves pre-warm, and a node with no
+  # agent looks to the manager like a node that failed its checks. Narrow it if
+  # you want checkpointing confined to a pool -- but note that the GPU label to
+  # narrow on is cluster-specific (this one uses accelerator=nvidia, not the
+  # gpu-operator's nvidia.com/gpu.present).
   nodeSelector:
-    nvidia.com/gpu.present: "true"
+    kubernetes.io/os: linux
   tolerations:
     - key: nvidia.com/gpu
       operator: Exists
@@ -78,7 +98,12 @@ agent:
   workRoot: /var/lib/pod-snapshotter/restores
   criSocket: /run/containerd/containerd.sock
   # fuse-client integration on each node.
-  fuseAPIEndpoint: "http://127.0.0.1:8081"
+  # Empty on purpose. The agent uses this to verify an artifact exists before a
+  # restore, and it is hostNetwork, so 127.0.0.1:8081 reaches fuse-client only
+  # on nodes that run one. On a node without it, every verification fails and
+  # the restore fails with it -- the check is strictly less reliable than the
+  # restore it guards. Set it only where fuse-client is on every agent node.
+  fuseAPIEndpoint: ""
   fuseAgentSocket: /var/run/fuse-client/agent.sock
   # Directory artifacts are restored in place through the fuse mount, so
   # pre-warm only has to pull their bytes into the node's NVMe tier — no copy.

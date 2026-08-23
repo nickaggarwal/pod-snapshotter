@@ -39,13 +39,33 @@ if [ -f "$MARKER" ] && [ "$(cat "$MARKER")" = "$WANT" ]; then
     exec sleep infinity
 fi
 
+# Wait for the host to finish its own provisioning before touching it. On a
+# freshly scaled-up node this DaemonSet can land minutes before the distro
+# criu package and its dependencies do, and the patched binary links against
+# the same shared libraries that package pulls in (libnet, libnl, libbsd...).
+# Installing into that window and failing the run-check reads as "this build
+# is broken on this host" when the truth is "ask again in a minute" -- so wait
+# for the host to look provisioned, and only then lay anything down.
+i=0
+while [ $i -lt 60 ]; do
+    hostrun 'command -v criu >/dev/null 2>&1' && break
+    [ $i -eq 0 ] && echo "waiting for the host's distro criu to arrive before installing over it"
+    i=$((i + 1))
+    sleep 10
+done
+if [ $i -ge 60 ]; then
+    echo "host still has no distro criu after 10 minutes; installing anyway" >&2
+fi
+
 echo "installing patched CRIU $WANT"
 tar -C "$HOST_ROOT" -xzf /criu-dist.tar.gz
 
+PLUGIN_ADDED=false
 if [ ! -f "${HOST_ROOT}/usr/lib/criu/cuda_plugin.so" ]; then
     echo "node has no CUDA plugin; installing the one built with this CRIU"
     mkdir -p "${HOST_ROOT}/usr/lib/criu"
     cp /cuda_plugin.so "${HOST_ROOT}/usr/lib/criu/cuda_plugin.so"
+    PLUGIN_ADDED=true
 fi
 
 # Refuse to leave a binary behind that the host cannot actually run: a missing
@@ -53,6 +73,10 @@ fi
 if ! hostrun '/usr/local/sbin/criu --version'; then
     echo "ERROR: the patched CRIU does not run on this host; rolling back" >&2
     rm -f "${HOST_ROOT}/usr/local/sbin/criu"
+    # Undo the plugin too. A rollback that leaves it behind hands the distro
+    # binary a plugin it was not validated with, which is a worse state than
+    # the one we found -- and it makes the next attempt skip the copy.
+    [ "$PLUGIN_ADDED" = true ] && rm -f "${HOST_ROOT}/usr/lib/criu/cuda_plugin.so"
     exit 1
 fi
 
