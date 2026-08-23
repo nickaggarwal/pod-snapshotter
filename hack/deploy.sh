@@ -93,7 +93,12 @@ if ! $DO_CHECK; then
   # CRDs first and separately: helm does not upgrade anything in crds/, and a
   # new status field that the manager writes but the API server does not know
   # about is dropped silently, which looks like a controller bug.
-  kubectl apply -f "$CHART/crds/" >/dev/null
+  #
+  # Server-side, because these CRDs no longer fit in the client-side
+  # last-applied-configuration annotation (262144 bytes) once the podTemplate
+  # schemas are inlined -- a plain `kubectl apply` fails with "Too long" on
+  # the annotation rather than on anything wrong with the CRD.
+  kubectl apply --server-side --force-conflicts -f "$CHART/crds/" >/dev/null
   ok "CRDs applied"
 
   if ! helm -n "$NAMESPACE" status "$RELEASE" >/dev/null 2>&1; then

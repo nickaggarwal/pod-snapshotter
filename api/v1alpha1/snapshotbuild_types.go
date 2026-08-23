@@ -116,6 +116,14 @@ type SnapshotBuildSpec struct {
 	// +optional
 	TimeoutSeconds int32 `json:"timeoutSeconds,omitempty"`
 
+	// Checkpointer selects who runs the dump, passed through to the
+	// PodSnapshot this build drives. See PodSnapshotSpec.Checkpointer:
+	// "agent" skips the kubelet's tar and has the node agent write CRIU's
+	// images straight into the artifact directory.
+	// +kubebuilder:validation:Enum=kubelet;agent
+	// +optional
+	Checkpointer string `json:"checkpointer,omitempty"`
+
 	// KeepBuildPod leaves the build pod running after a successful build,
 	// for debugging. It still counts against the GPU.
 	// +optional

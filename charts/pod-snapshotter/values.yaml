@@ -14,7 +14,12 @@ manager:
     # the cluster drift apart in the first place: a tag that means a different
     # image on every push cannot be compared against what is running, so
     # hack/deploy.sh --check had nothing to check.
-    tag: v0.2.2
+    # v0.3.0 routes the dump: it reads podsnapshot.io/capabilities off the
+    # node and hands phase Checkpointing to the agent when the snapshot asked
+    # for checkpointer: agent and the node can honor it, instead of calling
+    # the kubelet checkpoint API. Everything else falls back, with the reason
+    # in the snapshot's status.
+    tag: v0.3.0-agentckpt
     pullPolicy: IfNotPresent
   replicas: 1
   leaderElect: false
@@ -67,7 +72,13 @@ criu:
     # A node scaled up fresh can run this DaemonSet minutes before the distro
     # criu and its shared libraries land, and the run-check then failed on a
     # missing libnet.so.1 and rolled back -- a healthy build reported as broken.
-    tag: v4.2.1-ps5.2
+    # ps5.3 is the same binary again (fork commit 6c683e4). What changed is
+    # what happens on a node the binary cannot run on: a glibc older than the
+    # one it was built against is a permanent fact about that node, so the
+    # installer now rolls back and parks instead of crashlooping. The 22.04
+    # agentpool node had been restarting forever, which made a clean deploy
+    # indistinguishable from a broken one.
+    tag: v4.2.1-ps5.3
     pullPolicy: IfNotPresent
 
 agent:
@@ -78,7 +89,12 @@ agent:
     # running decides which knobs exist at all -- v0.4.2 and earlier silently
     # drop podsnapshot.io/criu-aio-chunk, and a restore tuned with it looks
     # like the knob does nothing rather than like the agent is too old.
-    tag: v0.4.3-aiochunk
+    # v0.5.0 can take the dump itself: `runc checkpoint` with CRIU's
+    # --image-path on the artifact directory, so the images are written once
+    # rather than written, tarred, and untarred (design-v2.md §3). It
+    # advertises agent-checkpoint in podsnapshot.io/capabilities, which is how
+    # the manager knows the node is new enough to route work to.
+    tag: v0.5.0-agentckpt
     pullPolicy: IfNotPresent
   # Where the agent runs. Every linux node by default, not GPU nodes only: the
   # agent also publishes prereq status and serves pre-warm, and a node with no

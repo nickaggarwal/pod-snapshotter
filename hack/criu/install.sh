@@ -70,13 +70,31 @@ fi
 
 # Refuse to leave a binary behind that the host cannot actually run: a missing
 # shared library here would otherwise surface as a failed restore much later.
-if ! hostrun '/usr/local/sbin/criu --version'; then
+if ! RUNCHECK=$(hostrun '/usr/local/sbin/criu --version' 2>&1); then
+    echo "$RUNCHECK" >&2
     echo "ERROR: the patched CRIU does not run on this host; rolling back" >&2
     rm -f "${HOST_ROOT}/usr/local/sbin/criu"
     # Undo the plugin too. A rollback that leaves it behind hands the distro
     # binary a plugin it was not validated with, which is a worse state than
     # the one we found -- and it makes the next attempt skip the copy.
     [ "$PLUGIN_ADDED" = true ] && rm -f "${HOST_ROOT}/usr/lib/criu/cuda_plugin.so"
+
+    # A libc too old for the build is permanent: this node's distro will not
+    # grow a newer glibc because the DaemonSet restarted. Park instead of
+    # crashlooping, so the pool this image was never built for shows as one
+    # node deliberately skipped rather than as an install that keeps failing.
+    #
+    # The node keeps its distro CRIU and stays usable; it just does not get
+    # the patched read path. Anything else -- a missing file, a bad build --
+    # still exits nonzero, because those are worth a restart and worth an
+    # alert.
+    case "$RUNCHECK" in
+        *GLIBC_*not\ found*|*version\ \`GLIBC*)
+            echo "SKIPPED: this host's glibc is older than the one $WANT was built against." >&2
+            echo "SKIPPED: leaving the distro CRIU in place on this node." >&2
+            exec sleep infinity
+            ;;
+    esac
     exit 1
 fi
 

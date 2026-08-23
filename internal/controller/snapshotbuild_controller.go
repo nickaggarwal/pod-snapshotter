@@ -189,6 +189,10 @@ func (r *SnapshotBuildReconciler) reconcileBuilding(ctx context.Context, build *
 				DeletionPolicy: snapv1.DeletionPolicyRetain,
 				// The dump itself, once the workload has already quiesced.
 				TimeoutSeconds: build.Spec.TimeoutSeconds,
+				// Empty passes through as empty, which the PodSnapshot CRD
+				// then defaults to kubelet -- so an old build spec keeps its
+				// old behaviour rather than inheriting a new default here.
+				Checkpointer: build.Spec.Checkpointer,
 			},
 		}
 		if err := controllerutil.SetControllerReference(build, newSnap, r.Scheme()); err != nil {
