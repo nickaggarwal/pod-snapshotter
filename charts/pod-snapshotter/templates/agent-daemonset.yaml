@@ -29,7 +29,7 @@ spec:
       {{- end }}
       containers:
         - name: agent
-          image: "{{ .Values.agent.image.repository }}:{{ .Values.agent.image.tag }}"
+          image: "{{ include "pod-snapshotter.image" (dict "img" .Values.agent.image "root" $) }}"
           imagePullPolicy: {{ .Values.agent.image.pullPolicy }}
           args:
             - --fuse-mount={{ .Values.agent.fuseMount }}

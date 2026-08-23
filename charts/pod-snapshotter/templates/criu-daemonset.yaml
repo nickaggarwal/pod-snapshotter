@@ -30,7 +30,7 @@ spec:
       tolerations: {{- toYaml .Values.agent.tolerations | nindent 8 }}
       containers:
         - name: install
-          image: "{{ .Values.criu.image.repository }}:{{ .Values.criu.image.tag }}"
+          image: "{{ include "pod-snapshotter.image" (dict "img" .Values.criu.image "root" $) }}"
           imagePullPolicy: {{ .Values.criu.image.pullPolicy }}
           env:
             - name: HOST_ROOT

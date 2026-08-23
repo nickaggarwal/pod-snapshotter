@@ -3,7 +3,8 @@ CONTROLLER_GEN ?= $(GOBIN)/controller-gen
 IMG_MANAGER ?= pod-snapshotter/manager:latest
 IMG_AGENT ?= pod-snapshotter/agent:latest
 
-.PHONY: all build test vet manifests generate proto docker-build helm-template clean
+.PHONY: all build test vet manifests generate proto docker-build helm-template clean \
+	deploy deploy-build deploy-check e2e
 
 all: build
 
@@ -46,6 +47,25 @@ docker-build:
 
 helm-template:
 	helm template pod-snapshotter charts/pod-snapshotter
+
+# Deploy and prove the cluster matches the chart. See hack/deploy.sh -- the
+# verify step is the point of it: three separate measurements on this project
+# were taken against a binary that was not the one the chart named.
+deploy:
+	./hack/deploy.sh
+
+# Same, but build and push the images the chart pins first.
+deploy-build:
+	./hack/deploy.sh --build
+
+# Report drift without changing anything.
+deploy-check:
+	./hack/deploy.sh --check
+
+# Snapshot a real vLLM engine, restore it, and check it still answers
+# correctly. Needs a GPU node with a free GPU.
+e2e:
+	./hack/e2e.sh
 
 install-tools:
 	go install sigs.k8s.io/controller-tools/cmd/controller-gen@v0.16.5
