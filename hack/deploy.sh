@@ -157,12 +157,35 @@ want_manager="$REGISTRY/pod-snapshotter/manager:$TAG_MANAGER"
 want_agent="$REGISTRY/pod-snapshotter/agent:$TAG_AGENT"
 want_criu="$REGISTRY/pod-snapshotter/criu:$TAG_CRIU"
 
-got=$(kubectl -n "$NAMESPACE" get deploy pod-snapshotter-manager -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null || true)
-[ "$got" = "$want_manager" ] && ok "manager image $got" || bad "manager image is ${got:-<missing>}, chart says $want_manager"
-got=$(kubectl -n "$NAMESPACE" get ds pod-snapshotter-agent -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null || true)
-[ "$got" = "$want_agent" ] && ok "agent image $got" || bad "agent image is ${got:-<missing>}, chart says $want_agent"
-got=$(kubectl -n "$NAMESPACE" get ds pod-snapshotter-criu -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null || true)
-[ "$got" = "$want_criu" ] && ok "criu image $got" || bad "criu image is ${got:-<missing>}, chart says $want_criu"
+# A pod spec may reference the image by tag or by digest. Pinning by digest is
+# strictly stronger -- it is the only reference that cannot drift -- so accept
+# it when it resolves to the tag the chart pins, and report the tag it stands
+# for rather than flagging the safer form as a mismatch.
+image_check() {
+  local what="$1" workload="$2" repo="$3" tag="$4"
+  local want="$REGISTRY/$repo:$tag" got
+  got=$(kubectl -n "$NAMESPACE" get "$workload" -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null || true)
+  if [ "$got" = "$want" ]; then
+    ok "$what image $got"
+    return
+  fi
+  case "$got" in
+    "$REGISTRY/$repo@sha256:"*)
+      local pinned tagged
+      pinned="${got#*@}"
+      tagged=$(az acr repository show -n "${REGISTRY%%.*}" --image "$repo:$tag" --query digest -o tsv 2>/dev/null || true)
+      if [ -n "$tagged" ] && [ "$pinned" = "$tagged" ]; then
+        ok "$what image pinned by digest to $tag"
+      else
+        bad "$what image is pinned to ${pinned:0:19}, which is not $tag"
+      fi
+      ;;
+    *) bad "$what image is ${got:-<missing>}, chart says $want" ;;
+  esac
+}
+image_check manager deploy/pod-snapshotter-manager pod-snapshotter/manager "$TAG_MANAGER"
+image_check agent   ds/pod-snapshotter-agent       pod-snapshotter/agent   "$TAG_AGENT"
+image_check criu    ds/pod-snapshotter-criu        pod-snapshotter/criu    "$TAG_CRIU"
 
 # The tag matching is not evidence the running binary is the one just built.
 # These tags are mutable and the pull policy is IfNotPresent, so re-pushing a
