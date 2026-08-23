@@ -1,6 +1,7 @@
 package v1alpha1
 
 import (
+	"strings"
 	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -61,6 +62,37 @@ const (
 	RestoreCompleteFile = "restore-complete"
 )
 
+// Checkpointer values for PodSnapshotSpec.Checkpointer.
+const (
+	// CheckpointerKubelet POSTs to the kubelet checkpoint API (v1 default).
+	CheckpointerKubelet = "kubelet"
+	// CheckpointerAgent runs `runc checkpoint` on the node agent, with CRIU
+	// writing directly into the artifact directory.
+	CheckpointerAgent = "agent"
+)
+
+// CapabilitiesAnnotation is set on Nodes by the agent: a comma-separated list
+// of optional behaviours this node's agent implements. It is separate from
+// PrereqsAnnotation because the two answer different questions -- prereqs is
+// "is this node healthy", capabilities is "how new is the code on it".
+const CapabilitiesAnnotation = "podsnapshot.io/capabilities"
+
+// AgentCheckpointCapability is advertised in CapabilitiesAnnotation by agents
+// that implement CheckpointerAgent. The manager checks for it before honoring
+// checkpointer: agent, so a partially upgraded cluster degrades to the kubelet
+// path instead of stalling on a node whose agent would never pick the work up.
+const AgentCheckpointCapability = "agent-checkpoint"
+
+// NodeHasCapability reports whether the node advertises the named capability.
+func NodeHasCapability(annotations map[string]string, want string) bool {
+	for _, c := range strings.Split(annotations[CapabilitiesAnnotation], ",") {
+		if strings.TrimSpace(c) == want {
+			return true
+		}
+	}
+	return false
+}
+
 // Deletion policies for the snapshot artifact.
 const (
 	DeletionPolicyRetain = "Retain"
@@ -114,12 +146,35 @@ type PodSnapshotSpec struct {
 	// +optional
 	DeletionPolicy string `json:"deletionPolicy,omitempty"`
 
-	// TimeoutSeconds for the kubelet checkpoint call. Large VRAM dumps take
-	// minutes; default 120.
+	// TimeoutSeconds for the checkpoint. Large VRAM dumps take minutes;
+	// default 120.
 	// +kubebuilder:default=120
 	// +kubebuilder:validation:Minimum=1
 	// +optional
 	TimeoutSeconds int32 `json:"timeoutSeconds,omitempty"`
+
+	// Checkpointer selects who runs the dump:
+	//
+	//   kubelet — POST to the kubelet checkpoint API, which drives CRIU and
+	//             hands back a tar. The agent then expands that tar into the
+	//             artifact directory.
+	//   agent   — the node agent runs `runc checkpoint` itself, with CRIU
+	//             writing its images straight into the artifact directory.
+	//
+	// The two produce the same artifact. What differs is how many times the
+	// bytes are written to get there: the kubelet path writes them into a
+	// tar and reads them back out, so a 56 GB checkpoint moves roughly three
+	// times that much I/O, most of it on whichever disk holds
+	// /var/lib/kubelet — the OS disk on a stock AKS GPU node, not the NVMe
+	// tier the artifact is bound for. See docs/design-v2.md §3.
+	//
+	// agent requires artifactFormat: dir (there is no tar to hand back), and
+	// falls back to kubelet if the node's agent is too old to advertise the
+	// capability.
+	// +kubebuilder:validation:Enum=kubelet;agent
+	// +kubebuilder:default=kubelet
+	// +optional
+	Checkpointer string `json:"checkpointer,omitempty"`
 }
 
 // ArtifactStatus describes the produced checkpoint artifact.

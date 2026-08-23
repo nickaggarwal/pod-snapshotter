@@ -137,6 +137,19 @@ agent:
   # rendered args of the thing being benchmarked -- true even while the
   # effective value is identical.
   prefetchParallelism: 4
+  # sha256 every image file when the agent publishes a checkpoint it dumped
+  # itself (spec.checkpointer: agent).
+  #
+  # Off, because it costs a full extra read of the checkpoint immediately
+  # after writing it -- 56 GB re-read to verify 56 GB just written, which is
+  # exactly the pass that path exists to remove. The manifest records every
+  # file's size either way, and both the prefetch verifier and the NVMe cache
+  # check fall back to size when no digest is present. Turn it on for
+  # artifacts meant to outlive the node that wrote them.
+  #
+  # The kubelet path always digests: it is streaming the bytes through the tar
+  # expander anyway, so there the hash is free.
+  digestArtifacts: false
   resources:
     requests: {cpu: 100m, memory: 256Mi}
     limits: {memory: 2Gi}

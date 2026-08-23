@@ -189,7 +189,7 @@ func Open(imageDir, workDir, rootfsDir string) (*Bundle, error) {
 
 	b.ExtraMounts, b.NvidiaHookMounts = scanDumpLog(filepath.Join(imageDir, "dump.log"))
 
-	if err := applyRootfsDiff(filepath.Join(imageDir, "rootfs-diff.tar"), rootfsDir); err != nil {
+	if err := applyRootfsDiff(filepath.Join(imageDir, RootfsDiffName), rootfsDir); err != nil {
 		return nil, err
 	}
 

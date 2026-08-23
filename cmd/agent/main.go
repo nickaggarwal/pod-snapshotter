@@ -51,6 +51,7 @@ func main() {
 		stageImageLocal bool
 		prefetchWorkers int
 		nvmeCacheRoot   string
+		digestArtifacts bool
 	)
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8083", "Metrics endpoint address (0 to disable).")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8084", "Health probe endpoint address.")
@@ -65,6 +66,7 @@ func main() {
 	flag.BoolVar(&skipHostChecks, "skip-host-checks", false, "Skip nsenter-based prereq checks (dev only).")
 	flag.BoolVar(&stageImageLocal, "stage-image-local", false, "Copy directory artifacts to node-local storage during pre-warm instead of restoring in place through the fuse mount.")
 	flag.IntVar(&prefetchWorkers, "prefetch-parallelism", 0, "Files fetched concurrently from a directory artifact (0 = default).")
+	flag.BoolVar(&digestArtifacts, "digest-artifacts", false, "sha256 every image file when publishing an agent-dumped artifact. Costs a full extra read of the checkpoint immediately after writing it; the manifest records sizes either way.")
 	flag.StringVar(&nvmeCacheRoot, "nvme-cache-root", "", "fuse-client's node-local NVMe cache tier (e.g. /host/mnt/fuse-nvme0n1/fuse-cache). When set, restores read pre-warmed CRIU images straight off the device instead of back through the fuse mount. Empty disables.")
 
 	opts := zap.Options{Development: false}
@@ -136,6 +138,25 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Checkpoint controller: runs `runc checkpoint` for snapshots that asked
+	// for checkpointer: agent, writing CRIU's images straight into the
+	// artifact directory instead of routing them through the kubelet's tar
+	// (docs/design-v2.md §3).
+	checkpointCtrl := &agent.CheckpointReconciler{
+		Client:    mgr.GetClient(),
+		NodeName:  nodeName,
+		FuseMount: fuseMount,
+		WorkRoot:  workRoot,
+		HostRoot:  hostRoot,
+		Digest:    digestArtifacts,
+		Resolver:  resolver,
+		Runc:      restore.NewHostRunc(),
+	}
+	if err := checkpointCtrl.SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "agent-checkpoint")
+		os.Exit(1)
+	}
+
 	// Quiesce controller: waits for the workload shim's presence file before
 	// the manager issues the checkpoint.
 	if err := (&agent.QuiesceReconciler{
@@ -154,6 +175,10 @@ func main() {
 		FuseMount:      fuseMount,
 		HostRoot:       hostRoot,
 		SkipHostChecks: skipHostChecks,
+		// Claimed only because the controller above was wired successfully.
+		// The manager routes work on the strength of this annotation, so it
+		// has to describe this process, not this binary.
+		Capabilities: []string{snapv1.AgentCheckpointCapability},
 	}
 	if err := mgr.Add(prereq); err != nil {
 		setupLog.Error(err, "unable to add prereq checker")

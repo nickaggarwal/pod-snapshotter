@@ -34,7 +34,8 @@ import (
 // GPU checks are skipped (not failed) on nodes without /dev/nvidiactl so the
 // system remains usable for CPU-only checkpoint trials.
 //
-// It also publishes the node's restore-compatibility tuple (GPU model, driver
+// It also publishes the agent's optional capabilities (podsnapshot.io/
+// capabilities) and the node's restore-compatibility tuple (GPU model, driver
 // version, CRIU version) as the podsnapshot.io/compat annotation plus a
 // podsnapshot.io/compat-hash label. A restore built against one tuple is
 // confined to nodes carrying the same hash, so an incompatible placement is
@@ -50,6 +51,12 @@ type PrereqChecker struct {
 	Interval time.Duration
 	// SkipHostChecks disables nsenter-based checks (tests / non-Linux dev).
 	SkipHostChecks bool
+	// Capabilities are the optional behaviours this agent implements,
+	// published as podsnapshot.io/capabilities. Set by cmd/agent from what it
+	// actually wired up, not hardcoded here: an agent built with the
+	// checkpoint reconciler but started without a CRI socket cannot honor
+	// checkpointer: agent, and must not claim it can.
+	Capabilities []string
 }
 
 var (
@@ -99,9 +106,11 @@ func (p *PrereqChecker) checkAndPublish(ctx context.Context) {
 	}
 	key := p.compatibility(ctx)
 	compat, hash := key.NodeCompatibility(), key.NodeHash()
+	caps := strings.Join(p.Capabilities, ",")
 
 	if node.Annotations[snapv1.PrereqsAnnotation] == value &&
 		node.Annotations[snapv1.CompatibilityAnnotation] == compat &&
+		node.Annotations[snapv1.CapabilitiesAnnotation] == caps &&
 		node.Labels[snapv1.CompatibilityHashLabel] == hash {
 		return
 	}
@@ -111,6 +120,15 @@ func (p *PrereqChecker) checkAndPublish(ctx context.Context) {
 	}
 	node.Annotations[snapv1.PrereqsAnnotation] = value
 	node.Annotations[snapv1.CompatibilityAnnotation] = compat
+	// Capabilities say what this build of the agent can be asked to do. The
+	// manager reads it to decide whether checkpointer: agent is honorable on
+	// this node, which is the only way a rolling upgrade can route work to
+	// the new agents without stranding snapshots on the old ones.
+	if caps == "" {
+		delete(node.Annotations, snapv1.CapabilitiesAnnotation)
+	} else {
+		node.Annotations[snapv1.CapabilitiesAnnotation] = caps
+	}
 	if hash != "" {
 		if node.Labels == nil {
 			node.Labels = map[string]string{}

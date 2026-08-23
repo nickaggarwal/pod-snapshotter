@@ -78,7 +78,7 @@ func (r *QuiesceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	now := metav1.Now()
 	snap.Status.Quiesce.ReadyAt = &now
 	snap.Status.Phase = snapv1.SnapshotPhaseCheckpointing
-	snap.Status.Message = "workload quiesced; calling kubelet checkpoint API"
+	snap.Status.Message = "workload quiesced; starting checkpoint"
 	setCond(&snap.Status.Conditions, snapv1.ConditionQuiesced, metav1.ConditionTrue, "Quiesced",
 		fmt.Sprintf("%s/%s present", q.Dir, snapv1.ReadyForCheckpointFile))
 	return ctrl.Result{}, r.Status().Update(ctx, &snap)

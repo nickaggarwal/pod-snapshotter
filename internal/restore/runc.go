@@ -25,10 +25,43 @@ type RuncRunner interface {
 	// Restore runs `runc restore` detached and returns the restored init's
 	// host PID.
 	Restore(ctx context.Context, opts RestoreOpts) (pid int, err error)
+	// Checkpoint runs `runc checkpoint`, writing CRIU images to
+	// opts.ImagePath.
+	Checkpoint(ctx context.Context, opts CheckpointOpts) error
 	// Kill sends SIGKILL to the container and deletes its runc state.
 	Kill(ctx context.Context, containerID string) error
 	// State returns whether the container exists and is running.
 	State(ctx context.Context, containerID string) (running bool, err error)
+}
+
+// CRIUDumpLogName is the log file runc tells CRIU to write during a dump.
+// As with restore, runc's own error is uninformative and this is where the
+// reason lives.
+const CRIUDumpLogName = "dump.log"
+
+// CheckpointOpts are the inputs to `runc checkpoint`.
+//
+// The container is one the CRI runtime created and owns, so this runs against
+// the runtime's own runc state root, not ours (see HostRunc.CRIRuncRoot).
+type CheckpointOpts struct {
+	ContainerID string
+	// ImagePath is where CRIU writes its images. Pointing this straight at
+	// the destination is the whole point of dumping from the agent: the
+	// kubelet checkpoint API writes a tar, which then has to be read back and
+	// expanded before any restore can use it (docs/design-v2.md §3).
+	ImagePath string
+	WorkPath  string
+	// LeaveRunning keeps the container alive after the dump. The quiesce
+	// protocol resumes the workload afterwards, so the default (false, i.e.
+	// leave it stopped) is only right when the pod is being discarded.
+	LeaveRunning bool
+	// PreDump runs a memory pre-dump pass instead of a full dump.
+	PreDump bool
+	// ParentPath is a previous dump to diff against (with PreDump).
+	ParentPath string
+	// Env is added to runc's environment, and through it CRIU's -- the dump
+	// side equivalent of RestoreOpts.Env.
+	Env map[string]string
 }
 
 // RestoreOpts are the inputs to `runc restore`.
@@ -63,6 +96,11 @@ type HostRunc struct {
 	// CRI runtime's (containerd uses /run/containerd/runc/k8s.io) so our
 	// containers never collide with kubelet-managed ones.
 	RuncRoot string
+	// CRIRuncRoot is the CRI runtime's OWN runc state root, used only for
+	// checkpointing containers the runtime created. Restores use RuncRoot;
+	// dumps must use this one, because a container is only visible in the
+	// state root of the runc that created it.
+	CRIRuncRoot string
 }
 
 // NewHostRunc builds the default host runner.
@@ -71,15 +109,23 @@ func NewHostRunc() *HostRunc {
 		NsenterTarget: 1,
 		RuncBinary:    "runc",
 		RuncRoot:      "/run/pod-snapshotter/runc",
+		CRIRuncRoot:   "/run/containerd/runc/k8s.io",
 	}
 }
 
 // command builds: nsenter -t 1 -m -p -- runc [globalArgs] <args>.
 // Global flags (--root, --log, --log-format) must precede the subcommand.
 func (h *HostRunc) command(ctx context.Context, globalArgs []string, args ...string) *exec.Cmd {
+	return h.commandIn(ctx, h.RuncRoot, globalArgs, args...)
+}
+
+// commandIn is command() against an explicit runc state root. Checkpointing
+// needs the CRI runtime's root, since that is the only place a container the
+// runtime created is visible.
+func (h *HostRunc) commandIn(ctx context.Context, root string, globalArgs []string, args ...string) *exec.Cmd {
 	full := append([]string{
 		"-t", strconv.Itoa(h.NsenterTarget), "-m", "-p", "--",
-		h.RuncBinary, "--root", h.RuncRoot,
+		h.RuncBinary, "--root", root,
 	}, globalArgs...)
 	full = append(full, args...)
 	return exec.CommandContext(ctx, "nsenter", full...)
@@ -158,6 +204,78 @@ func (h *HostRunc) Restore(ctx context.Context, opts RestoreOpts) (int, error) {
 		return 0, fmt.Errorf("parsing pid file: %w", err)
 	}
 	return pid, nil
+}
+
+// Checkpoint implements RuncRunner: `runc checkpoint` against the CRI
+// runtime's state root, writing CRIU images straight to opts.ImagePath.
+//
+// This is the dump-side counterpart to Restore, and it exists to get out from
+// under the kubelet checkpoint API. That API returns a tar, so the bytes are
+// written by CRIU, read back and written again by the kubelet's tar, then
+// read back and written a third time when the agent expands them into the
+// directory layout a restore can actually use. For a 56 GB artifact that is
+// 112 GB read and 168 GB written to publish 56 GB. Dumping here writes it
+// once, in the layout the restore already expects.
+//
+// Two things the kubelet does that this deliberately does not: it garbage
+// collects old checkpoint tars, and it enforces its own request timeout. The
+// first is moot -- there is no tar to collect. The second was a problem, not
+// a feature: a dump that takes longer than runtimeRequestTimeout fails at the
+// API layer while CRIU is still running.
+func (h *HostRunc) Checkpoint(ctx context.Context, opts CheckpointOpts) error {
+	if err := os.MkdirAll(opts.WorkPath, 0o755); err != nil {
+		return err
+	}
+	if err := os.MkdirAll(opts.ImagePath, 0o755); err != nil {
+		return err
+	}
+	logFile := filepath.Join(opts.WorkPath, "runc-checkpoint.log")
+
+	args := []string{
+		"checkpoint",
+		"--image-path", opts.ImagePath,
+		"--work-path", opts.WorkPath,
+	}
+	if opts.LeaveRunning {
+		args = append(args, "--leave-running")
+	}
+	if opts.PreDump {
+		args = append(args, "--pre-dump")
+	}
+	if opts.ParentPath != "" {
+		args = append(args, "--parent-path", opts.ParentPath)
+	}
+	args = append(args, opts.ContainerID)
+
+	cmd := h.commandIn(ctx, h.CRIRuncRoot, []string{"--log", logFile, "--log-format", "json"}, args...)
+	if len(opts.Env) > 0 {
+		cmd.Env = os.Environ()
+		for _, k := range slices.Sorted(maps.Keys(opts.Env)) {
+			cmd.Env = append(cmd.Env, k+"="+opts.Env[k])
+		}
+	}
+	// Unlike Restore, nothing detaches here: runc exits when the dump is
+	// done, so capturing output in-process cannot deadlock on a surviving
+	// writer.
+	out, runErr := cmd.CombinedOutput()
+	if runErr != nil {
+		return fmt.Errorf("runc checkpoint failed: %w\noutput: %s\nrunc log tail: %s\n%s",
+			runErr,
+			strings.TrimSpace(string(out)),
+			tailFile(logFile, 4096),
+			criuDumpLogTail(opts.WorkPath, 8192))
+	}
+	return nil
+}
+
+// criuDumpLogTail returns the tail of CRIU's own dump log, which is where the
+// real reason for a failed dump appears.
+func criuDumpLogTail(workPath string, n int64) string {
+	t := tailFile(filepath.Join(workPath, CRIUDumpLogName), n)
+	if t == "" {
+		return ""
+	}
+	return "criu dump.log tail: " + t
 }
 
 // Kill implements RuncRunner.

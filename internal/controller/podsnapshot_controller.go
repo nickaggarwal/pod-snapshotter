@@ -194,8 +194,42 @@ func (r *PodSnapshotReconciler) reconcilePending(ctx context.Context, snap *snap
 	}
 
 	snap.Status.Phase = snapv1.SnapshotPhaseCheckpointing
-	snap.Status.Message = "calling kubelet checkpoint API"
+	snap.Status.Message = "starting checkpoint"
 	return ctrl.Result{}, r.Status().Update(ctx, snap)
+}
+
+// agentCheckpoints decides whether this snapshot's dump is the node agent's
+// to run. Three things all have to hold, and each failure degrades to the
+// kubelet path rather than failing the snapshot:
+//
+//   - the spec asked for it,
+//   - the artifact is a directory (there is no tar for the agent to hand
+//     back, which is the entire point),
+//   - the node's agent advertises the capability, so a cluster mid-upgrade
+//     does not route work to an agent that will never pick it up.
+func (r *PodSnapshotReconciler) agentCheckpoints(ctx context.Context, snap *snapv1.PodSnapshot) (bool, string) {
+	if snap.Spec.Checkpointer != snapv1.CheckpointerAgent {
+		return false, ""
+	}
+	if snap.Status.Artifact == nil {
+		return false, ""
+	}
+	if uri, err := artifact.Parse(snap.Status.Artifact.URI); err != nil || !uri.Dir {
+		return false, fmt.Sprintf(
+			"checkpointer %q needs a directory artifact; falling back to the kubelet API for %s",
+			snapv1.CheckpointerAgent, snap.Status.Artifact.URI)
+	}
+	var node corev1.Node
+	if err := r.Get(ctx, types.NamespacedName{Name: snap.Status.NodeName}, &node); err != nil {
+		return false, fmt.Sprintf("could not read node %s to check agent capabilities; falling back to the kubelet API",
+			snap.Status.NodeName)
+	}
+	if !snapv1.NodeHasCapability(node.Annotations, snapv1.AgentCheckpointCapability) {
+		return false, fmt.Sprintf(
+			"node %s does not advertise %s (agent too old); falling back to the kubelet API",
+			node.Name, snapv1.AgentCheckpointCapability)
+	}
+	return true, ""
 }
 
 // resolveQuiesce reads the quiesce contract off the pod being snapshotted.
@@ -246,6 +280,26 @@ func (r *PodSnapshotReconciler) reconcileQuiescing(ctx context.Context, snap *sn
 func (r *PodSnapshotReconciler) reconcileCheckpointing(ctx context.Context, snap *snapv1.PodSnapshot) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 	key := types.NamespacedName{Namespace: snap.Namespace, Name: snap.Name}
+
+	// The agent may own this phase entirely (docs/design-v2.md §3): it runs
+	// `runc checkpoint` itself and CRIU writes into the artifact directory,
+	// with no tar in between. Nothing for the manager to do but stay out of
+	// the way -- and, once, say in the status which path this took, because
+	// the two are indistinguishable from the finished artifact.
+	if agentOwns, why := r.agentCheckpoints(ctx, snap); agentOwns {
+		want := fmt.Sprintf("node agent %s is running runc checkpoint", snap.Status.NodeName)
+		if snap.Status.Message == want {
+			return ctrl.Result{}, nil
+		}
+		snap.Status.Message = want
+		return ctrl.Result{}, r.Status().Update(ctx, snap)
+	} else if why != "" && snap.Status.Message != why {
+		logger.Info("agent checkpoint not available", "reason", why)
+		snap.Status.Message = why
+		if err := r.Status().Update(ctx, snap); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
 
 	// A previous reconcile may already have a checkpoint call running.
 	if _, running := r.inflight.LoadOrStore(key, struct{}{}); running {
