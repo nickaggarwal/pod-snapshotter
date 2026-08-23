@@ -178,6 +178,67 @@ and existing `PodRestore`s keep working unchanged.
   already promoted the artifact and points `--image-path` at the cache tier
   on the device.
 
+### 3a. The write side, and why it took a second pass
+
+The checkpoint side above shipped as a *description* of the artifact, not as
+a separate write path. The kubelet still ran the dump, and the agent still
+turned its tar into the directory the restore wanted. Everything in §3 was
+true of the restore; the write side was tar all the way down.
+
+That gap is expensive, and the cost is structural rather than incidental. The
+kubelet checkpoint API returns a tar — there is no directory mode to ask for
+— so publishing one artifact means writing its bytes three times:
+
+1. CRIU writes the images.
+2. The kubelet reads them back and writes them again, into the archive.
+3. The agent reads the archive back and writes them a third time, expanding
+   it into the layout a restore can use.
+
+Measured on the A100 pool with a 56.4 GB Qwen2.5-14B checkpoint, sampling
+`/proc/diskstats` every 5 s across the whole build:
+
+| device | read | written |
+|---|---|---|
+| `nvme0n1` (artifact tier, 880 G) | 24.2 GB | 59.1 GB |
+| `sda` (OS disk, 247 G) | 9.0 GB | **257.9 GB** |
+
+The ratio is bad enough on its own. The device split is worse: `sda` is
+`/dev/root`, and on a stock AKS GPU node it is also where `/var/lib/kubelet`
+lives — so the kubelet's tar is staged on the OS disk, not on the NVMe tier
+the artifact is bound for. The build spends most of its I/O writing a
+temporary file to the slowest device on the node, to produce an artifact that
+was always going to live somewhere else. The dump itself (`nvme0n1`, ~200–900
+MB/s for about 140 s) is a small part of the run; the tar phases held `sda` at
+a sustained ~265 MB/s for roughly 550 s.
+
+**What shipped:** `spec.checkpointer: agent`. The node agent runs
+`runc checkpoint` against the CRI runtime's own container with `--image-path`
+on the artifact directory, so CRIU writes each image once, where it will be
+read from. `artifact.PublishDir` then adds four small files and the MANIFEST.
+Nothing is copied.
+
+The artifact has to be indistinguishable from a kubelet-produced one, because
+`restore.Open` parses both and cannot tell them apart. So the agent
+reconstructs what containerd used to put in the tar: `config.dump` in the CRI
+metadata shape (its encoded pod UID is how images are found), `spec.dump` and
+the overlay upperdir path read from the *live* container before the dump takes
+the process with it, `dump.log` (a restore input — `scanDumpLog` reads the
+mount table out of it, not a diagnostic), `rootfs-diff.tar`, and `shm-diff.tar`.
+
+Two smaller decisions fell out of this:
+
+- **Digesting is opt-in and off.** The manifest walk originally hashed every
+  file, which would have re-read all 56 GB immediately after writing it — the
+  exact pass this path exists to remove. Sizes are recorded either way, and
+  both the prefetch verifier and the NVMe cache check fall back to size when
+  no digest is present. The kubelet path still digests, because it is
+  streaming the bytes through the expander anyway and the hash is free there.
+- **Routing degrades, never stalls.** The agent advertises `agent-checkpoint`
+  in `podsnapshot.io/capabilities`; the manager falls back to the kubelet
+  path, with the reason in the snapshot's status, when the node's agent is too
+  old to claim it or when the artifact is a tar. A cluster mid-upgrade keeps
+  working, and a snapshot never waits on an agent that will not act.
+
 ---
 
 ## 4. Workstream 2 — quiesce/resume hooks
