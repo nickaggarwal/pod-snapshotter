@@ -20,6 +20,11 @@ REV="${E2E_REV:-e2e-$(date +%s)}"
 TIMEOUT_BUILD="${E2E_TIMEOUT_BUILD:-3600}"
 TIMEOUT_RESTORE="${E2E_TIMEOUT_RESTORE:-900}"
 KEEP="${E2E_KEEP:-false}"
+# Which side runs the dump. Empty leaves it to the CRD's default (kubelet);
+# "agent" takes the direct path. Settable so the same correctness gate can be
+# run against both, which is the only way to know the two produce artifacts
+# that restore identically.
+CHECKPOINTER="${E2E_CHECKPOINTER:-}"
 
 say() { printf '\n\033[1m-- %s\033[0m\n' "$*"; }
 ok()  { printf '   \033[32mok\033[0m   %s\n' "$*"; }
@@ -49,6 +54,7 @@ metadata:
 spec:
   revision: $REV
   artifactFormat: dir
+${CHECKPOINTER:+  checkpointer: $CHECKPOINTER}
   timeoutSeconds: $TIMEOUT_BUILD
   podTemplate:
     metadata:

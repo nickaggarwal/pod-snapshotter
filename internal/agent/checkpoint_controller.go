@@ -11,6 +11,7 @@ import (
 	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/event"
@@ -101,6 +102,25 @@ func (r *CheckpointReconciler) checkpoint(ctx context.Context, snap *snapv1.PodS
 			"checkpointer %q needs a directory artifact; %s is a tar", snapv1.CheckpointerAgent, uri.String()))
 	}
 
+	dstDir := uri.HostPath(r.FuseMount)
+
+	// A dump is not repeatable: `runc checkpoint` takes the container with it,
+	// so once it has succeeded there is no process left to dump a second time.
+	// If this reconcile is a re-entry after the artifact was already committed
+	// -- a conflict on the final status write, an agent restart between the
+	// publish and the update -- finish the bookkeeping instead of trying to
+	// dump a container that no longer exists.
+	//
+	// The MANIFEST is the commit marker, so its presence is the whole test.
+	if m, err := artifact.ReadManifestDir(dstDir); err == nil {
+		logger.Info("artifact is already committed; completing without a second dump",
+			"dir", dstDir, "files", len(m.Files))
+		if err := r.complete(ctx, snap, uri, filepath.Join(dstDir, "checkpoint"), m); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{}, nil
+	}
+
 	sandbox, err := r.Resolver.Resolve(ctx, snap.Status.PodUID, snap.Status.Container)
 	if err != nil {
 		// The pod is running — the manager checked — so this is the CRI being
@@ -131,7 +151,6 @@ func (r *CheckpointReconciler) checkpoint(ctx context.Context, snap *snapv1.PodS
 			"pid", sandbox.KeeperPID, "err", err)
 	}
 
-	dstDir := uri.HostPath(r.FuseMount)
 	imageDir := filepath.Join(dstDir, "checkpoint")
 	workDir := filepath.Join(r.WorkRoot, "checkpoints", string(snap.UID))
 
@@ -198,18 +217,47 @@ func (r *CheckpointReconciler) checkpoint(ctx context.Context, snap *snapv1.PodS
 		logger.Info("could not remove CRIU work dir", "path", workDir, "err", err)
 	}
 
-	now := metav1.Now()
-	snap.Status.Artifact.Format = uri.Format()
-	snap.Status.Artifact.SizeBytes = m.TotalBytes
-	snap.Status.Artifact.FileCount = int32(len(m.Files)) // #nosec G115 -- CRIU image counts are small
-	snap.Status.Artifact.CreatedAt = now
-	snap.Status.Phase = snapv1.SnapshotPhaseCompleted
-	snap.Status.Message = ""
-	snap.Status.CompletedAt = &now
-	setCond(&snap.Status.Conditions, snapv1.ConditionCheckpointCreated, metav1.ConditionTrue, "CheckpointCreated", imageDir)
-	setCond(&snap.Status.Conditions, snapv1.ConditionArtifactUploaded, metav1.ConditionTrue, "Published", uri.String())
-	setCond(&snap.Status.Conditions, snapv1.ConditionReady, metav1.ConditionTrue, "Completed", "")
-	return ctrl.Result{}, r.Status().Update(ctx, snap)
+	// From here the artifact is committed on disk, and the only thing left is
+	// to say so. That has to survive a conflict: the manager writes this same
+	// object's status while the dump runs, so a stale resourceVersion is the
+	// normal case, not the exceptional one. Losing the race here used to mean
+	// re-entering checkpoint() for a container runc has already taken -- the
+	// dump succeeds, the artifact is complete, and the snapshot spins in
+	// Checkpointing forever reporting that the sandbox is gone.
+	if err := r.complete(ctx, snap, uri, imageDir, m); err != nil {
+		return ctrl.Result{}, err
+	}
+	return ctrl.Result{}, nil
+}
+
+// complete marks the snapshot done, re-reading the object on conflict. Only
+// the status fields this reconciler owns are reapplied to the fresh copy.
+func (r *CheckpointReconciler) complete(
+	ctx context.Context, snap *snapv1.PodSnapshot,
+	uri artifact.URI, imageDir string, m *artifact.Manifest,
+) error {
+	name := client.ObjectKeyFromObject(snap)
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		var cur snapv1.PodSnapshot
+		if err := r.Get(ctx, name, &cur); err != nil {
+			return client.IgnoreNotFound(err)
+		}
+		now := metav1.Now()
+		if cur.Status.Artifact == nil {
+			cur.Status.Artifact = &snapv1.ArtifactStatus{URI: uri.String()}
+		}
+		cur.Status.Artifact.Format = uri.Format()
+		cur.Status.Artifact.SizeBytes = m.TotalBytes
+		cur.Status.Artifact.FileCount = int32(len(m.Files)) // #nosec G115 -- CRIU image counts are small
+		cur.Status.Artifact.CreatedAt = now
+		cur.Status.Phase = snapv1.SnapshotPhaseCompleted
+		cur.Status.Message = ""
+		cur.Status.CompletedAt = &now
+		setCond(&cur.Status.Conditions, snapv1.ConditionCheckpointCreated, metav1.ConditionTrue, "CheckpointCreated", imageDir)
+		setCond(&cur.Status.Conditions, snapv1.ConditionArtifactUploaded, metav1.ConditionTrue, "Published", uri.String())
+		setCond(&cur.Status.Conditions, snapv1.ConditionReady, metav1.ConditionTrue, "Completed", "")
+		return r.Status().Update(ctx, &cur)
+	})
 }
 
 // contribute adds the two members that are pod-scoped rather than

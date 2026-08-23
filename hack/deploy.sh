@@ -127,6 +127,22 @@ if ! $DO_CHECK; then
   render | kubectl apply -n "$NAMESPACE" -f - >/dev/null
   ok "manifests applied"
 
+  # A rebuild reuses the tag, so the rendered pod spec is byte-identical to
+  # what is already live and `kubectl apply` is a no-op -- the nodes go on
+  # running the layers they cached under that tag. Nothing above catches it:
+  # the tag matches, the rollout is complete, and the binary is old.
+  #
+  # So when this run pushed images, restart explicitly. On a plain deploy of
+  # already-published tags there is nothing new to pull, and skipping the
+  # restart keeps it non-disruptive.
+  if $DO_BUILD; then
+    say "restarting workloads onto the images just pushed"
+    for w in deploy/pod-snapshotter-manager ds/pod-snapshotter-agent ds/pod-snapshotter-criu; do
+      kubectl -n "$NAMESPACE" rollout restart "$w" >/dev/null
+    done
+    ok "restart requested"
+  fi
+
   say "waiting for rollout"
   kubectl -n "$NAMESPACE" rollout status deploy/pod-snapshotter-manager --timeout=300s
   for ds in pod-snapshotter-agent pod-snapshotter-criu; do
@@ -147,6 +163,36 @@ got=$(kubectl -n "$NAMESPACE" get ds pod-snapshotter-agent -o jsonpath='{.spec.t
 [ "$got" = "$want_agent" ] && ok "agent image $got" || bad "agent image is ${got:-<missing>}, chart says $want_agent"
 got=$(kubectl -n "$NAMESPACE" get ds pod-snapshotter-criu -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null || true)
 [ "$got" = "$want_criu" ] && ok "criu image $got" || bad "criu image is ${got:-<missing>}, chart says $want_criu"
+
+# The tag matching is not evidence the running binary is the one just built.
+# These tags are mutable and the pull policy is IfNotPresent, so re-pushing a
+# tag a node already has changes nothing: the pod spec is byte-identical, no
+# rollout happens, and the node keeps serving the layers it cached. That is
+# how a manager three commits old passed every check above while silently
+# pruning a spec field it did not know about.
+#
+# Digests are the invariant. Ask the registry what the tag points at now, and
+# the kubelet what it actually pulled.
+digest_check() {
+  local what="$1" repo="$2" tag="$3" selector="$4"
+  local want got pod
+  want=$(az acr repository show -n "${REGISTRY%%.*}" --image "$repo:$tag" --query digest -o tsv 2>/dev/null || true)
+  if [ -z "$want" ]; then
+    info "$what digest not checked (registry unreachable)"
+    return
+  fi
+  pod=$(kubectl -n "$NAMESPACE" get pods --no-headers -o custom-columns=:metadata.name 2>/dev/null | grep "^$selector" | head -1)
+  [ -n "$pod" ] || { bad "$what has no running pod to check"; return; }
+  got=$(kubectl -n "$NAMESPACE" get pod "$pod" -o jsonpath='{.status.containerStatuses[0].imageID}' 2>/dev/null | sed 's/.*@//')
+  if [ "$got" = "$want" ]; then
+    ok "$what runs ${want:0:19}"
+  else
+    bad "$what runs ${got:0:19} but $tag now points at ${want:0:19} -- stale image, force a rollout"
+  fi
+}
+digest_check manager pod-snapshotter/manager "$TAG_MANAGER" pod-snapshotter-manager-
+digest_check agent   pod-snapshotter/agent   "$TAG_AGENT"   pod-snapshotter-agent-
+digest_check criu    pod-snapshotter/criu    "$TAG_CRIU"    pod-snapshotter-criu-
 
 # Every DaemonSet fully rolled. A partially-rolled criu DaemonSet is the exact
 # state that produced a measurement attributed to the wrong binary.

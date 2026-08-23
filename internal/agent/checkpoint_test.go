@@ -1,11 +1,20 @@
 package agent
 
 import (
+	"context"
+	"encoding/json"
+	"os"
+	"path/filepath"
 	"testing"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	snapv1 "pod-snapshotter/api/v1alpha1"
+	"pod-snapshotter/internal/artifact"
 )
 
 func snapFor(node, checkpointer, uri string) *snapv1.PodSnapshot {
@@ -123,5 +132,62 @@ func TestCRIUDumpTuning(t *testing.T) {
 
 	if criuDumpTuning(&snapv1.PodSnapshot{}) != nil {
 		t.Fatal("no annotations should mean no env, not an empty map runc has to be handed")
+	}
+}
+
+// A dump is one-way: runc checkpoint takes the container with it. So a
+// reconcile that arrives after the artifact is already committed -- the final
+// status write lost a conflict, or the agent restarted between publishing and
+// updating -- must finish the bookkeeping rather than try to dump a container
+// that no longer exists.
+//
+// This was a real failure: the dump succeeded in 47s, the artifact was
+// complete on disk, and the snapshot then spun in Checkpointing forever
+// reporting "no ready sandbox found" because every retry re-entered the dump.
+func TestCheckpointCompletesFromACommittedArtifactWithoutDumping(t *testing.T) {
+	dir := t.TempDir()
+	ckpt := filepath.Join(dir, "checkpoint")
+	if err := os.MkdirAll(ckpt, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, n := range []string{"pages-1.img", "inventory.img"} {
+		if err := os.WriteFile(filepath.Join(ckpt, n), []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	m, err := artifact.PublishDir(artifact.PublishDirOptions{
+		Dir:  dir,
+		Meta: &artifact.CheckpointMeta{ID: "cid", Name: "vllm_p_default_uid_0"},
+		Spec: json.RawMessage(`{"ociVersion":"1.0.2"}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	snap := snapFor("node-a", snapv1.CheckpointerAgent, "file://"+dir+"/")
+	scheme := runtime.NewScheme()
+	if err := snapv1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	c := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(snap).WithStatusSubresource(snap).Build()
+
+	// No Resolver and no Runc: if the reconciler reaches either, the nil
+	// dereference is the test failing loudly, which is the point.
+	r := &CheckpointReconciler{Client: c, NodeName: "node-a"}
+	if _, err := r.Reconcile(context.Background(),
+		ctrl.Request{NamespacedName: client.ObjectKeyFromObject(snap)}); err != nil {
+		t.Fatalf("reconcile of a committed artifact failed: %v", err)
+	}
+
+	var got snapv1.PodSnapshot
+	if err := c.Get(context.Background(), client.ObjectKeyFromObject(snap), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Status.Phase != snapv1.SnapshotPhaseCompleted {
+		t.Fatalf("phase is %q, want Completed", got.Status.Phase)
+	}
+	if got.Status.Artifact.SizeBytes != m.TotalBytes {
+		t.Fatalf("size is %d, want %d", got.Status.Artifact.SizeBytes, m.TotalBytes)
 	}
 }
