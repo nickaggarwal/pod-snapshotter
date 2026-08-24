@@ -616,8 +616,14 @@ footer {
       unlinking the source. Every artifact on the cluster had a full-size
       <code>.part</code> file beside it, silently doubling storage since v1 shipped.
       Separately, <code>O_TRUNC</code> is ignored there — re-uploading a revision left
-      shrunken files carrying the previous tail. An artifact store is not a POSIX
-      filesystem just because it is mounted like one.
+      shrunken files carrying the previous tail. And <code>rmdir</code> on a non-empty
+      directory returns 0 without unlinking anything, which is enough to make Go's
+      <code>os.RemoveAll</code> report success over a tree it never touched: it tries a
+      plain <code>Remove</code> first and returns early when that "succeeds". We found
+      that one seventeen minutes into a 56&nbsp;GB dump, when CRIU refused to overwrite a
+      <code>descriptors.json</code> an hour older than the run. An artifact store is not a
+      POSIX filesystem just because it is mounted like one — and on one that isn't, a
+      return value is not evidence. Read it back.
     </div>
   </div>
 </section>
