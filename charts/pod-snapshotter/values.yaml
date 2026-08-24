@@ -99,7 +99,7 @@ agent:
     # rather than written, tarred, and untarred (design-v2.md §3). It
     # advertises agent-checkpoint in podsnapshot.io/capabilities, which is how
     # the manager knows the node is new enough to route work to.
-    tag: v0.5.3-agentckpt
+    tag: v0.5.4-agentckpt
     pullPolicy: IfNotPresent
   # Where the agent runs. Every linux node by default, not GPU nodes only: the
   # agent also publishes prereq status and serves pre-warm, and a node with no
@@ -115,6 +115,27 @@ agent:
       effect: NoSchedule
   # Paths on the host.
   fuseMount: /mnt/fuse
+  # Node-local artifact tier: a directory on the node's own NVMe, mounted into
+  # the agent at the same path it has on the host, for artifacts addressed as
+  # file:///... Empty disables the mount entirely.
+  #
+  # This is not a cache and not a fallback -- it is a second, independent place
+  # to put an artifact, chosen per build by spec.artifactURI. It exists because
+  # the distributed store is a network filesystem with its own failure modes:
+  # it has accepted writes and not persisted them, handing back correctly-sized
+  # runs of zeros that no size check can see (internal/artifact/publish.go,
+  # verifyImageMagic). A dump straight to the node's NVMe removes that whole
+  # layer from the measurement, which is what makes the dump/restore comparison
+  # about the write path rather than about the storage backend.
+  #
+  # The tradeoff is the obvious one: a file:// artifact lives on exactly one
+  # node, so the restore has to land on that node. Fine for a same-node A/B,
+  # not a way to ship snapshots between machines.
+  #
+  # Path note: this is under the NVMe mount, NOT under fuse-cache/ -- writing
+  # into fuse-client's own cache directory would leave it managing files it did
+  # not put there and could evict at any point.
+  localArtifactRoot: /mnt/fuse-nvme0n1/ps-artifacts
   checkpointsDir: /var/lib/kubelet/checkpoints
   workRoot: /var/lib/pod-snapshotter/restores
   criSocket: /run/containerd/containerd.sock

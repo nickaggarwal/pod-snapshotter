@@ -147,7 +147,20 @@ func (r *RestoreReconciler) prewarm(ctx context.Context, pr *snapv1.PodRestore) 
 		// is missing. The bad case is a tier evicted between here and there,
 		// which costs a cold read — the same read this would have done.
 		resident := false
-		if !r.StageImageLocal {
+		// A file:// artifact is already on this node's own disk -- that is
+		// what the scheme means. There is no tier to promote it into, so a
+		// pre-warm read would only pull 56 GB through the page cache to
+		// discover that the bytes are where the URI said they were. Skip it
+		// for the same reason the NVMe-tier check below skips it, and leave
+		// the page cache in whatever state the caller arranged: a restore
+		// measured after a deliberate drop_caches must not have the artifact
+		// quietly re-warmed by the step before it.
+		if uri.Scheme == artifact.SchemeFile && !r.StageImageLocal {
+			resident = true
+			n = m.TotalBytes
+			msg = fmt.Sprintf("%d bytes across %d files already node-local (%s)", n, len(m.Files), uri.String())
+		}
+		if !resident && !r.StageImageLocal {
 			if cached, cerr := (artifact.NVMeCache{Root: r.NVMeCacheRoot, HostRoot: r.HostRoot}).Resolve(uri.FusePath(), m); cached.Host != "" {
 				logger.Info("artifact already resident on the node NVMe tier; skipping pre-warm", "dir", cached.Host)
 				resident = true
