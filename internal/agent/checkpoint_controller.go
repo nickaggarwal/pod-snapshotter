@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/go-logr/logr"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -206,7 +207,7 @@ func (r *CheckpointReconciler) checkpoint(ctx context.Context, snap *snapv1.PodS
 		Spec:       spec,
 		Quiesce:    q,
 		Digest:     r.Digest,
-		Contribute: r.contribute(upperDir),
+		Contribute: r.contribute(logger, upperDir),
 	})
 	if err != nil {
 		return r.fail(ctx, snap, fmt.Sprintf("publishing the artifact: %v", err))
@@ -264,38 +265,48 @@ func (r *CheckpointReconciler) complete(
 // CRIU-scoped, and so travel with the artifact or not at all: the container's
 // /dev/shm (CRIU's link-remap targets live there, and the tmpfs dies with the
 // pod) and its writable layer. On the kubelet path both arrive inside the tar.
-func (r *CheckpointReconciler) contribute(upperDir string) func(string) ([]artifact.ManifestFile, error) {
+func (r *CheckpointReconciler) contribute(logger logr.Logger, upperDir string) func(string) ([]artifact.ManifestFile, error) {
 	return func(dstDir string) ([]artifact.ManifestFile, error) {
 		var files []artifact.ManifestFile
 
-		captured, err := restore.CaptureShm(
-			filepath.Join(dstDir, "spec.dump"),
-			r.HostRoot,
-			filepath.Join(dstDir, restore.ShmDiffName),
-		)
-		if err != nil {
-			return nil, fmt.Errorf("capturing %s: %w", restore.ShmPath, err)
-		}
-		if captured {
-			entry, err := artifact.DescribeFile(dstDir, restore.ShmDiffName)
+		// Both captures run AFTER the dump, and the dump takes the container
+		// with it. By the time we get here the pod is terminating and the
+		// kubelet is free to reap its emptyDirs, so the source directory for
+		// either diff may simply be gone. That is a race we lose sometimes,
+		// not a corrupt artifact: the diffs are supplementary, the restore
+		// treats both as optional, and a 17-minute dump of a 56 GB engine is
+		// not worth discarding because a scratch tmpfs was unmounted a second
+		// early. Log what was missed and publish what we have.
+		add := func(what, name string, capture func() (bool, error)) {
+			captured, err := capture()
 			if err != nil {
-				return nil, err
+				logger.Info("could not capture "+what+"; publishing without it",
+					"file", name, "err", err)
+				return
+			}
+			if !captured {
+				return
+			}
+			entry, err := artifact.DescribeFile(dstDir, name)
+			if err != nil {
+				logger.Info("could not describe "+what+"; publishing without it",
+					"file", name, "err", err)
+				return
 			}
 			files = append(files, entry)
 		}
 
-		captured, err = restore.CaptureRootfsDiff(
-			upperDir, r.HostRoot, filepath.Join(dstDir, restore.RootfsDiffName))
-		if err != nil {
-			return nil, fmt.Errorf("capturing the container's writable layer: %w", err)
-		}
-		if captured {
-			entry, err := artifact.DescribeFile(dstDir, restore.RootfsDiffName)
-			if err != nil {
-				return nil, err
-			}
-			files = append(files, entry)
-		}
+		add(restore.ShmPath, restore.ShmDiffName, func() (bool, error) {
+			return restore.CaptureShm(
+				filepath.Join(dstDir, "spec.dump"),
+				r.HostRoot,
+				filepath.Join(dstDir, restore.ShmDiffName),
+			)
+		})
+		add("the container's writable layer", restore.RootfsDiffName, func() (bool, error) {
+			return restore.CaptureRootfsDiff(
+				upperDir, r.HostRoot, filepath.Join(dstDir, restore.RootfsDiffName))
+		})
 		return files, nil
 	}
 }
@@ -369,19 +380,50 @@ func criuDumpTuning(snap *snapv1.PodSnapshot) map[string]string {
 }
 
 func (r *CheckpointReconciler) retry(ctx context.Context, snap *snapv1.PodSnapshot, msg string) (ctrl.Result, error) {
-	snap.Status.Message = msg
-	if err := r.Status().Update(ctx, snap); err != nil {
-		return ctrl.Result{}, client.IgnoreNotFound(err)
+	if err := r.writeStatus(ctx, snap, func(cur *snapv1.PodSnapshot) {
+		cur.Status.Message = msg
+	}); err != nil {
+		return ctrl.Result{}, err
 	}
 	return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 }
 
+// fail records why the dump stopped. Getting this write through matters more
+// than it looks: a dump holds `snap` in memory for as long as it runs -- up
+// to seventeen minutes for a 56 GB engine -- while the manager keeps writing
+// the same object's status. So by the time there is a failure to report, the
+// copy in hand is always stale and a plain Update always conflicts.
+//
+// An error path that cannot record its own error is worse than no error path.
+// The conflict propagates instead of the real message, the reconciler
+// re-enters for a container `runc checkpoint` has already taken, and the
+// snapshot spins forever still claiming to be Checkpointing. The reason the
+// dump failed is never written down anywhere.
 func (r *CheckpointReconciler) fail(ctx context.Context, snap *snapv1.PodSnapshot, msg string) (ctrl.Result, error) {
-	snap.Status.Phase = snapv1.SnapshotPhaseFailed
-	snap.Status.Message = msg
-	setCond(&snap.Status.Conditions, snapv1.ConditionCheckpointCreated, metav1.ConditionFalse, "CheckpointFailed", msg)
-	setCond(&snap.Status.Conditions, snapv1.ConditionReady, metav1.ConditionFalse, "Failed", msg)
-	return ctrl.Result{}, r.Status().Update(ctx, snap)
+	err := r.writeStatus(ctx, snap, func(cur *snapv1.PodSnapshot) {
+		cur.Status.Phase = snapv1.SnapshotPhaseFailed
+		cur.Status.Message = msg
+		setCond(&cur.Status.Conditions, snapv1.ConditionCheckpointCreated, metav1.ConditionFalse, "CheckpointFailed", msg)
+		setCond(&cur.Status.Conditions, snapv1.ConditionReady, metav1.ConditionFalse, "Failed", msg)
+	})
+	return ctrl.Result{}, err
+}
+
+// writeStatus re-reads the object and reapplies mutate on each conflict, so a
+// status write survives a resourceVersion that went stale while a long dump
+// ran. Deletion is not an error: nothing is left to tell.
+func (r *CheckpointReconciler) writeStatus(
+	ctx context.Context, snap *snapv1.PodSnapshot, mutate func(*snapv1.PodSnapshot),
+) error {
+	name := client.ObjectKeyFromObject(snap)
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		var cur snapv1.PodSnapshot
+		if err := r.Get(ctx, name, &cur); err != nil {
+			return client.IgnoreNotFound(err)
+		}
+		mutate(&cur)
+		return r.Status().Update(ctx, &cur)
+	})
 }
 
 // SetupWithManager registers the controller, narrowed to snapshots this node

@@ -211,6 +211,30 @@ was always going to live somewhere else. The dump itself (`nvme0n1`, ~200–900
 MB/s for about 140 s) is a small part of the run; the tar phases held `sda` at
 a sustained ~265 MB/s for roughly 550 s.
 
+**Measured, same node, same model, same day.** The second column is the
+agent-direct path on `aks-gpuckpt-13588264-vmss00000g` — the node that
+produced the first column, so the disks, the driver, and the engine are held
+constant and the only variable is who runs the dump:
+
+| device | kubelet + tar | agent direct |
+|---|---|---|
+| `nvme0n1` read | 24.2 GB | 0.0 GB |
+| `nvme0n1` written | 59.1 GB | 83.8 GB |
+| `sda` read | 9.0 GB | 0.4 GB |
+| `sda` written | **257.9 GB** | **0.1 GB** |
+
+The OS disk is the headline: 257.9 GB to 0.1 GB. Nothing about the workload
+changed — that quarter-terabyte was the tar, written to `/dev/root` and read
+back to be expanded, and removing the tar removed all of it.
+
+The `nvme0n1` write column looks worse until it is split by phase. 27.3 GB of
+it lands before the dump starts, while the engine is loading weights; that is
+in both columns and has nothing to do with checkpointing. The dump itself
+writes **56.5 GB and the artifact is 56.5 GB** — a write amplification of
+exactly 1.0, which is the floor and the entire point of §3. The kubelet
+column reaches its lower `nvme0n1` figure only by pushing the difference onto
+`sda`, four times over.
+
 **What shipped:** `spec.checkpointer: agent`. The node agent runs
 `runc checkpoint` against the CRI runtime's own container with `--image-path`
 on the artifact directory, so CRIU writes each image once, where it will be
@@ -224,6 +248,34 @@ metadata shape (its encoded pod UID is how images are found), `spec.dump` and
 the overlay upperdir path read from the *live* container before the dump takes
 the process with it, `dump.log` (a restore input — `scanDumpLog` reads the
 mount table out of it, not a diagnostic), `rootfs-diff.tar`, and `shm-diff.tar`.
+
+**The run that produced those numbers did not publish, and why is worth
+recording.** The dump finished cleanly — `Dumping finished successfully`, CUDA
+plugin err 0, 208 page files totalling 56.5 GB — and then the artifact was
+thrown away, because `PublishDir`'s `Contribute` hook returned an error.
+
+The hook captures two supplementary diffs, `shm-diff.tar` and
+`rootfs-diff.tar`. Both read directories belonging to the pod being
+checkpointed, and both run *after* the dump — which is precisely when that pod
+is terminating, because `runc checkpoint` took its container. The kubelet is
+then free to reap its emptyDirs. So `os.ReadDir` on `/dev/shm` returned
+ENOENT, the error propagated, and a seventeen-minute dump of a 56 GB engine
+was discarded over a scratch tmpfs that unmounted a second early. The two
+diffs are optional on the restore side; treating their absence as fatal was
+never the intent. They are now logged and skipped.
+
+The second bug is the one that made the first one hard to find. `fail()`
+wrote its message with a plain `Status().Update` against the `snap` object the
+reconciler had been holding for the whole dump. Seventeen minutes is long
+enough that the manager has written that object's status several times over,
+so the update always conflicted; the conflict propagated instead of the real
+message, the reconciler re-entered for a container that no longer existed, and
+the snapshot spun at one conflict per second still claiming to be
+`Checkpointing`. **An error path that cannot record its own error is worse
+than no error path** — the reason was never written anywhere, and the only way
+to recover it was to read the artifact directory and infer which step had left
+its output behind. `fail()` and `retry()` now go through the same re-read-on-
+conflict helper `complete()` uses.
 
 Two smaller decisions fell out of this:
 

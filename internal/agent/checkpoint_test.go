@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"github.com/go-logr/logr"
 	"os"
 	"path/filepath"
 	"testing"
@@ -189,5 +190,48 @@ func TestCheckpointCompletesFromACommittedArtifactWithoutDumping(t *testing.T) {
 	}
 	if got.Status.Artifact.SizeBytes != m.TotalBytes {
 		t.Fatalf("size is %d, want %d", got.Status.Artifact.SizeBytes, m.TotalBytes)
+	}
+}
+
+// A dump of a 56 GB engine takes minutes, and the pod it came from starts
+// terminating the moment runc takes the container. The kubelet is then free to
+// reap the emptyDirs the shm and rootfs diffs are read from, so those captures
+// can fail purely on timing -- and losing the whole artifact over a scratch
+// tmpfs that unmounted a second early is not a trade worth making.
+func TestPublishSurvivesADiffSourceThatVanished(t *testing.T) {
+	dst := t.TempDir()
+	ckpt := filepath.Join(dst, "checkpoint")
+	if err := os.MkdirAll(ckpt, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range []string{"inventory.img", "pages-1.img"} {
+		if err := os.WriteFile(filepath.Join(ckpt, f), []byte(f), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	r := &CheckpointReconciler{
+		// A path that does not exist is exactly the state the kubelet leaves
+		// behind after it reaps the pod's writable layer.
+		HostRoot: filepath.Join(dst, "no-such-host-root"),
+	}
+	contribute := r.contribute(logr.Discard(), filepath.Join(dst, "no-such-upperdir"))
+
+	m, err := artifact.PublishDir(artifact.PublishDirOptions{
+		Dir:        dst,
+		Meta:       &artifact.CheckpointMeta{ID: "abc", Name: "c_p_ns_uid_0"},
+		Spec:       []byte("{}"),
+		Contribute: contribute,
+	})
+	if err != nil {
+		t.Fatalf("publish gave up because a diff source was missing: %v", err)
+	}
+	if len(m.Files) == 0 {
+		t.Fatal("published an empty manifest")
+	}
+	// The commit marker has to be there: a restore reads it to decide the
+	// artifact is whole.
+	if _, err := artifact.ReadManifestDir(dst); err != nil {
+		t.Fatalf("no committed manifest after publish: %v", err)
 	}
 }
