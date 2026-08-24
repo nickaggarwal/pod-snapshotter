@@ -3,10 +3,12 @@ package artifact
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -186,6 +188,13 @@ func PublishDir(opts PublishDirOptions) (*Manifest, error) {
 		return nil, fmt.Errorf("artifact at %s has no pages-*.img: the dump produced no memory images", opts.Dir)
 	}
 
+	// And that the images contain what they claim to. See verifyImageMagic:
+	// the store has handed back correctly-sized runs of zeros for files whose
+	// bytes never reached it, and a size check cannot see that.
+	if err := verifyImageMagic(opts.Dir, files); err != nil {
+		return nil, err
+	}
+
 	// SourceTar stays empty: there was no tar. That is the field a reader can
 	// use to tell an agent-dumped artifact from a kubelet-dumped one.
 	m := NewManifest(files, "", opts.Quiesce)
@@ -193,4 +202,83 @@ func PublishDir(opts PublishDirOptions) (*Manifest, error) {
 		return nil, err
 	}
 	return m, nil
+}
+
+// criuImageMagic is the four bytes every CRIU image file starts with, in the
+// order they appear on disk. Taken from a known-good artifact rather than
+// from the constant in CRIU's headers, which is written byte-reversed.
+var criuImageMagic = [4]byte{0x19, 0x43, 0x56, 0x54}
+
+// verifyImageMagic reads the first four bytes of each CRIU metadata image and
+// checks they are the magic CRIU wrote.
+//
+// This exists because the artifact store has been observed to lose writes
+// silently. A dump completed, CRIU reported no error, every file was present
+// at exactly the length CRIU wrote -- and files.img and mountpoints-13.img
+// were runs of zeros with only a short tail of real data. The bytes never
+// reached origin: a second node, with its own cache, read the same zeros.
+//
+// Nothing downstream catches that. The manifest records size, and the size is
+// right. Prefetch verifies size, and the size is right. CRIU finds out 200
+// seconds into a restore, when a header does not parse:
+//
+//	Error (criu/image.c:554): Head magic doesn't match for files.img
+//
+// By then a 56 GB artifact has been pre-warmed, a pod has been placed, and
+// the restore fails on what looks like a CRIU bug rather than a storage one.
+// A four-byte read per file turns that into a failed publish, seconds after
+// the dump, naming the file.
+//
+// Only metadata images are checked. pages-*.img are raw page data with no
+// header, and reading them back would re-read the 56 GB this path exists to
+// avoid writing twice -- the check has to stay cheap enough to always be on,
+// which at roughly 1.6 MB of metadata it is. That means a zeroed pages-*.img
+// still gets through; catching that needs digests (PublishDirOptions.Digest),
+// which cost a full re-read. This check is the cheap half, not the whole
+// guarantee.
+func verifyImageMagic(dir string, files []ManifestFile) error {
+	var buf [4]byte
+	for _, f := range files {
+		base := path.Base(f.Path)
+		if !strings.HasSuffix(base, ".img") || strings.HasPrefix(base, "pages-") {
+			continue
+		}
+		// CRIU also writes gzipped tarballs under a .img name; those carry a
+		// gzip header, not the CRIU magic.
+		if strings.HasSuffix(base, ".tar.gz.img") {
+			continue
+		}
+		// inventory.img is written with IMG_INVENTORY_MAGIC rather than the
+		// common one -- it is the entry point the rest of the set is read
+		// through, so CRIU marks it differently on purpose. Verified against
+		// a known-good artifact: skipping it here rather than special-casing
+		// its magic, because one exception is cheaper to keep honest than a
+		// table of them, and a zeroed inventory.img fails the restore
+		// immediately rather than 200 seconds in.
+		if base == "inventory.img" {
+			continue
+		}
+		// A file too short to hold a header cannot be checked this way.
+		if f.Size < int64(len(buf)) {
+			continue
+		}
+		fh, err := os.Open(filepath.Join(dir, filepath.FromSlash(f.Path)))
+		if err != nil {
+			return fmt.Errorf("opening %s to verify it: %w", f.Path, err)
+		}
+		_, err = io.ReadFull(fh, buf[:])
+		fh.Close()
+		if err != nil {
+			return fmt.Errorf("reading the header of %s: %w", f.Path, err)
+		}
+		if buf != criuImageMagic {
+			return fmt.Errorf(
+				"%s does not start with the CRIU image magic (got %#x, want %#x): it is %d bytes "+
+					"on disk but does not contain what CRIU wrote, so the artifact store accepted "+
+					"the write and did not persist it -- publishing this would commit a MANIFEST "+
+					"over an artifact that cannot restore",
+				f.Path, buf, criuImageMagic, f.Size)
+		}
+	}
+	return nil
 }

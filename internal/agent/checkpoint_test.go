@@ -205,10 +205,14 @@ func TestPublishSurvivesADiffSourceThatVanished(t *testing.T) {
 	if err := os.MkdirAll(ckpt, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	for _, f := range []string{"inventory.img", "pages-1.img"} {
-		if err := os.WriteFile(filepath.Join(ckpt, f), []byte(f), 0o644); err != nil {
-			t.Fatal(err)
-		}
+	// inventory.img has to carry the CRIU magic; publishing verifies it.
+	// pages-1.img is raw page data and is not checked.
+	if err := os.WriteFile(filepath.Join(ckpt, "inventory.img"),
+		append([]byte{0x19, 0x43, 0x56, 0x54}, []byte("inv")...), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(ckpt, "pages-1.img"), []byte("pages"), 0o644); err != nil {
+		t.Fatal(err)
 	}
 
 	r := &CheckpointReconciler{

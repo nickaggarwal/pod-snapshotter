@@ -16,12 +16,14 @@ func stage(t *testing.T) string {
 	if err := os.MkdirAll(ckpt, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	for name, body := range map[string]string{
-		"pages-1.img":   "PAGES",
-		"inventory.img": "INV",
-		"core-1.img":    "CORE",
-	} {
-		if err := os.WriteFile(filepath.Join(ckpt, name), []byte(body), 0o644); err != nil {
+	// pages-1.img is raw page data and carries no header; the metadata images
+	// have to start with the CRIU magic, because publishing verifies it.
+	if err := os.WriteFile(filepath.Join(ckpt, "pages-1.img"), []byte("PAGES"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"inventory.img", "core-1.img"} {
+		body := append([]byte{0x19, 0x43, 0x56, 0x54}, []byte(name)...)
+		if err := os.WriteFile(filepath.Join(ckpt, name), body, 0o644); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -175,5 +177,75 @@ func TestPublishDirDoesNotDoubleCountContributedFiles(t *testing.T) {
 	}
 	if n != 1 {
 		t.Fatalf("shm-diff.tar appears %d times in the manifest, want 1", n)
+	}
+}
+
+// magic writes n bytes starting with the CRIU image header, the way a real
+// image file looks to the four-byte check.
+func writeImage(t *testing.T, dir, rel string, n int) {
+	t.Helper()
+	b := make([]byte, n)
+	copy(b, []byte{0x19, 0x43, 0x56, 0x54})
+	if err := os.MkdirAll(filepath.Dir(filepath.Join(dir, rel)), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, rel), b, 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// The store has handed back correctly-sized runs of zeros for files whose
+// bytes never reached origin -- a second node with its own cache read the same
+// zeros, so it is a lost write, not a stale cache. Size checks cannot see it:
+// the manifest records the right length and Prefetch verifies the right
+// length. CRIU finds out 200 seconds into a restore, when files.img will not
+// parse. Publishing must refuse instead.
+func TestPublishRefusesAnImageThatIsAllZeros(t *testing.T) {
+	dst := t.TempDir()
+	writeImage(t, dst, "checkpoint/inventory.img", 99)
+	writeImage(t, dst, "checkpoint/pages-1.img", 4096)
+	// Right length, no content: exactly what was found on the node.
+	if err := os.WriteFile(filepath.Join(dst, "checkpoint/files.img"), make([]byte, 45454), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := PublishDir(PublishDirOptions{
+		Dir:  dst,
+		Meta: &CheckpointMeta{ID: "abc", Name: "c_p_ns_uid_0"},
+		Spec: []byte("{}"),
+	})
+	if err == nil {
+		t.Fatal("committed a MANIFEST over an artifact that cannot restore")
+	}
+	if !strings.Contains(err.Error(), "files.img") {
+		t.Fatalf("the error does not name the file that is wrong: %v", err)
+	}
+	// And nothing may be committed: the MANIFEST is what makes an artifact
+	// look usable to a restore.
+	if _, err := ReadManifestDir(dst); err == nil {
+		t.Fatal("a MANIFEST was written despite the failure")
+	}
+}
+
+// The check must not reject what CRIU legitimately produces. pages-*.img are
+// raw page data with no header, and the tmpfs images are gzip.
+func TestPublishAcceptsPagesAndGzipImages(t *testing.T) {
+	dst := t.TempDir()
+	writeImage(t, dst, "checkpoint/inventory.img", 99)
+	// Raw page data: no CRIU header, and must not be read back anyway.
+	if err := os.WriteFile(filepath.Join(dst, "checkpoint/pages-1.img"), []byte{0, 1, 2, 3, 4, 5, 6, 7}, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// gzip magic, not CRIU magic.
+	if err := os.WriteFile(filepath.Join(dst, "checkpoint/tmpfs-dev-321.tar.gz.img"),
+		[]byte{0x1f, 0x8b, 0x08, 0x00, 0x09}, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := PublishDir(PublishDirOptions{
+		Dir:  dst,
+		Meta: &CheckpointMeta{ID: "abc", Name: "c_p_ns_uid_0"},
+		Spec: []byte("{}"),
+	}); err != nil {
+		t.Fatalf("rejected an artifact CRIU legitimately produced: %v", err)
 	}
 }
