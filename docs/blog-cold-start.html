@@ -569,6 +569,47 @@ footer {
       written last acts as the commit marker, so a reader that ignores an uncommitted
       prefix never sees a torn tree.
     </p>
+    <p>
+      That is the read side. The write side is where the tar costs the most, and it is
+      easy to miss because the number never appears in a restore trace. The kubelet
+      checkpoint API has no directory mode, so publishing one artifact writes its bytes
+      three times: CRIU writes the images, the kubelet reads them back and writes the
+      archive, and the agent reads the archive back and expands it into the layout a
+      restore can actually use.
+    </p>
+    <p>
+      We measured it as a controlled A/B — same node, same model, same afternoon, with
+      the only variable being who runs the dump. <code>/proc/diskstats</code> sampled
+      every five seconds across the whole build:
+    </p>
+    <table>
+      <caption>Disk I/O to produce one 56.4&nbsp;GB Qwen2.5-14B checkpoint — A100 node, same host for both runs</caption>
+      <thead>
+        <tr><th>Device</th><th class="num">kubelet + tar</th><th class="num">agent direct</th></tr>
+      </thead>
+      <tbody>
+        <tr><td><code>nvme0n1</code> read</td><td class="num">24.2 GB</td><td class="num">0.0 GB</td></tr>
+        <tr><td><code>nvme0n1</code> written</td><td class="num">59.1 GB</td><td class="num">83.8 GB</td></tr>
+        <tr><td><code>sda</code> read</td><td class="num">9.0 GB</td><td class="num">0.4 GB</td></tr>
+        <tr><td><code>sda</code> written</td><td class="num">257.9 GB</td><td class="num">0.1 GB</td></tr>
+      </tbody>
+    </table>
+    <p>
+      The OS disk is the headline: <strong>257.9&nbsp;GB down to 0.1&nbsp;GB</strong>.
+      That quarter-terabyte was the tar, staged on <code>/dev/root</code> because that is
+      where <code>/var/lib/kubelet</code> lives, then read back to be expanded. The build
+      was spending most of its I/O writing a temporary file to the slowest device on the
+      node, to produce an artifact bound for the NVMe tier all along.
+    </p>
+    <p>
+      The <code>nvme0n1</code> write column looks worse for the agent until you split it
+      by phase. 27.3&nbsp;GB lands before the dump even starts, while the engine loads
+      weights — that is in both columns and has nothing to do with checkpointing. The
+      dump itself writes <strong>56.5&nbsp;GB to produce a 56.5&nbsp;GB artifact</strong>:
+      a write amplification of exactly 1.0, which is the floor. The kubelet column only
+      reaches a lower NVMe figure by pushing the difference onto the OS disk, four times
+      over.
+    </p>
     <div class="note">
       <span class="note-lab">A trap worth naming</span>
       Our artifact store is a FUSE mount, and on it <code>rename</code> copies without
