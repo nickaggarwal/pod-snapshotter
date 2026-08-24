@@ -14,10 +14,18 @@ metadata:
   name: qwen14b
   namespace: default
 spec:
-  # Immutable; names the artifact directory under fuse:///snapshots/builds/.
+  # Immutable; names the artifact directory under <artifact-root>/builds/.
+  # The root is the manager's --artifact-root, fuse:///snapshots by default;
+  # point it at file:///<node NVMe path> to keep the artifact off the network
+  # store entirely, at the cost of pinning every restore to that one node
+  # (docs/design-v2.md §3b).
   revision: qwen2.5-14b-instruct-v1
-  # Directories are the default: expanded once here, never untarred again.
+  # Both of these are already the CRD defaults, spelled out here because they
+  # are the two that have to agree: the agent writes CRIU's images straight
+  # into a directory, so asking for a tar silently demotes the dump back to
+  # the kubelet path.
   artifactFormat: dir
+  checkpointer: agent
   # Weight load + CUDA graph capture + dump + upload, end to end.
   timeoutSeconds: 3600
   podTemplate:
