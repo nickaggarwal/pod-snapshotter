@@ -249,6 +249,26 @@ the overlay upperdir path read from the *live* container before the dump takes
 the process with it, `dump.log` (a restore input — `scanDumpLog` reads the
 mount table out of it, not a diagnostic), `rootfs-diff.tar`, and `shm-diff.tar`.
 
+**The restore side of the same node.** Condition A's artifact restored on the
+host that produced it, page cache dropped first (a 56 GB artifact fits inside
+216 GB of node RAM, so a warm run measures memory and nothing else):
+
+| t | phase |
+|---|---|
+| 5 s | pre-warming the artifact onto the node |
+| 157 s | pre-warm complete; `runc restore` starts |
+| 339 s | Running — CRIU handed the process back |
+| 344 s | `/health` answers |
+
+`nvme0n1` 103.4 GB read / 48.0 GB written; `sda` 0.3 GB / 0.2 GB. The read
+figure is close to twice the artifact: pre-warm pulls 56.4 GB onto the node
+and CRIU then reads it back, which is the copy §6c is about.
+
+The restore is verified, not merely Ready: the engine answers `The capital of
+France is` with ` Paris. The capital of Spain is Madrid`. A CRIU image can
+restore into a process whose CUDA context is subtly wrong and serve confident
+garbage, so a phase is not a pass condition — a correct completion is.
+
 **The run that produced those numbers did not publish, and why is worth
 recording.** The dump finished cleanly — `Dumping finished successfully`, CUDA
 plugin err 0, 208 page files totalling 56.5 GB — and then the artifact was
