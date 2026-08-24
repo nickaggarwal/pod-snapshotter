@@ -91,7 +91,9 @@ type SnapshotBuildSpec struct {
 	// +optional
 	Compatibility *CompatibilityKey `json:"compatibility,omitempty"`
 
-	// ArtifactURI defaults to fuse:///snapshots/builds/<revision>/.
+	// ArtifactURI defaults to <artifact-root>/builds/<revision>/, where the
+	// root is the manager's --artifact-root (chart value
+	// manager.artifactRoot, default fuse:///snapshots).
 	// +optional
 	ArtifactURI string `json:"artifactURI,omitempty"`
 
@@ -118,9 +120,12 @@ type SnapshotBuildSpec struct {
 
 	// Checkpointer selects who runs the dump, passed through to the
 	// PodSnapshot this build drives. See PodSnapshotSpec.Checkpointer:
-	// "agent" skips the kubelet's tar and has the node agent write CRIU's
-	// images straight into the artifact directory.
+	// "agent" (the default) skips the kubelet's tar and has the node agent
+	// write CRIU's images straight into the artifact directory; "kubelet"
+	// takes the v1 path. Builds default to dir artifacts already, which is
+	// what the agent path requires, so the two defaults agree.
 	// +kubebuilder:validation:Enum=kubelet;agent
+	// +kubebuilder:default=agent
 	// +optional
 	Checkpointer string `json:"checkpointer,omitempty"`
 

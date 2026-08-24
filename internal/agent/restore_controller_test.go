@@ -119,3 +119,82 @@ func TestPrewarmSkipsAFileArtifactAlreadyOnTheNode(t *testing.T) {
 		t.Fatalf("the PreWarmed condition does not say the artifact was already local: %q", cond)
 	}
 }
+
+// The restore side needs the same confinement as the dump side, and for a
+// sharper reason: a restore reads the artifact and then hands its spec.dump to
+// runc, so a file:// URI pointing anywhere on the node is a way to have a
+// privileged agent execute a container description it found lying around.
+func TestPrewarmRefusesAFileArtifactOutsideTheLocalRoot(t *testing.T) {
+	root := t.TempDir()
+	outside := t.TempDir()
+
+	pr := &snapv1.PodRestore{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "r"},
+		Status: snapv1.PodRestoreStatus{
+			ArtifactURI: "file://" + outside + "/",
+			TargetNode:  "node-a",
+			Phase:       snapv1.RestorePhasePreWarming,
+		},
+	}
+	scheme := runtime.NewScheme()
+	if err := snapv1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	c := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(pr).WithStatusSubresource(pr).Build()
+
+	r := &RestoreReconciler{Client: c, NodeName: "node-a", LocalArtifactRoot: root}
+	if _, err := r.prewarm(context.Background(), pr); err != nil {
+		t.Fatalf("prewarm returned an error instead of failing the restore: %v", err)
+	}
+	var got snapv1.PodRestore
+	if err := c.Get(context.Background(), client.ObjectKeyFromObject(pr), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Status.Phase != snapv1.RestorePhaseFailed {
+		t.Fatalf("phase is %q, want Failed", got.Status.Phase)
+	}
+	if !strings.Contains(got.Status.Message, "outside this node's local artifact root") {
+		t.Fatalf("the message does not say why it was refused: %q", got.Status.Message)
+	}
+}
+
+// Confinement must not reach fuse:// artifacts. They are relative to the mount
+// by construction and Parse has already rejected traversal, so applying the
+// local root to them would break every distributed restore on a node that
+// happens to also have an NVMe tier configured.
+func TestPrewarmDoesNotConfineAFuseArtifact(t *testing.T) {
+	pr := &snapv1.PodRestore{
+		ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "r"},
+		Status: snapv1.PodRestoreStatus{
+			ArtifactURI: "fuse:///snapshots/builds/qwen/",
+			TargetNode:  "node-a",
+			Phase:       snapv1.RestorePhasePreWarming,
+		},
+	}
+	scheme := runtime.NewScheme()
+	if err := snapv1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	c := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(pr).WithStatusSubresource(pr).Build()
+
+	// FuseMount points at an empty dir, so the manifest read misses and the
+	// restore requeues waiting for the artifact -- the not-yet-published
+	// path, not the refused path.
+	r := &RestoreReconciler{
+		Client: c, NodeName: "node-a",
+		FuseMount:         t.TempDir(),
+		LocalArtifactRoot: t.TempDir(),
+	}
+	if _, err := r.prewarm(context.Background(), pr); err != nil {
+		t.Fatalf("prewarm of a fuse artifact failed: %v", err)
+	}
+	var got snapv1.PodRestore
+	if err := c.Get(context.Background(), client.ObjectKeyFromObject(pr), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Status.Phase == snapv1.RestorePhaseFailed {
+		t.Fatalf("a fuse artifact was refused by the node-local confinement: %q", got.Status.Message)
+	}
+}

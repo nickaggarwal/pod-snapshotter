@@ -44,6 +44,13 @@ type PrereqChecker struct {
 	Client    client.Client
 	NodeName  string
 	FuseMount string
+	// LocalArtifactRoot is the node-local artifact tier (--local-artifact-root).
+	// Checked for the same reason the fuse mount is: it is a hostPath the
+	// DaemonSet is supposed to have mounted, and if the mount is missing the
+	// agent writes a dump into its own container filesystem instead -- which
+	// looks like a successful checkpoint right up until the restore, on the
+	// host, cannot find a single image file.
+	LocalArtifactRoot string
 	// HostRoot is where the host filesystem is visible (e.g. /host), used for
 	// file checks; command checks go through nsenter.
 	HostRoot string
@@ -187,6 +194,18 @@ func (p *PrereqChecker) run(ctx context.Context, node *corev1.Node) []string {
 		}
 	}
 
+	// Node-local artifact tier visible to the agent, and visible at the same
+	// path on the host -- the two are separate facts. runc resolves
+	// --image-path in the host mount namespace, so a directory that exists
+	// only inside this container is not a place a dump can go.
+	if p.LocalArtifactRoot != "" {
+		if fi, err := os.Stat(p.LocalArtifactRoot); err != nil || !fi.IsDir() {
+			failures = append(failures, "local-artifact-root-missing")
+		} else if !p.SkipHostChecks && !p.hostDirExists(p.LocalArtifactRoot) {
+			failures = append(failures, "local-artifact-root-not-on-host")
+		}
+	}
+
 	if p.SkipHostChecks {
 		return failures
 	}
@@ -278,6 +297,15 @@ func (p *PrereqChecker) hostPath(path string) string {
 func (p *PrereqChecker) hostFileExists(path string) bool {
 	_, err := os.Stat(p.hostPath(path))
 	return err == nil
+}
+
+// hostDirExists asks whether path is a directory in the *host's* namespace,
+// which for a hostPath mount is a different question from whether it exists
+// here: a mount that failed to propagate leaves an empty directory in this
+// container and nothing at all on the node.
+func (p *PrereqChecker) hostDirExists(path string) bool {
+	fi, err := os.Stat(p.hostPath(path))
+	return err == nil && fi.IsDir()
 }
 
 // parseCriuVersionString returns the full version CRIU printed ("4.2.1"),

@@ -42,6 +42,7 @@ spec:
             - --stage-image-local={{ .Values.agent.stageImageLocal }}
             - --prefetch-parallelism={{ .Values.agent.prefetchParallelism }}
             - --nvme-cache-root={{ .Values.agent.nvmeCacheRoot }}
+            - --local-artifact-root={{ .Values.agent.localArtifactRoot }}
             - --digest-artifacts={{ .Values.agent.digestArtifacts }}
           env:
             - name: NODE_NAME

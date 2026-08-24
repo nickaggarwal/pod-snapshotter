@@ -321,3 +321,88 @@ func TestClearArtifactDirReportsAStoreThatDidNotDelete(t *testing.T) {
 		t.Fatalf("the error does not name what survived: %v", err)
 	}
 }
+
+// A file:// URI on a CRD is a raw host path, and the agent that acts on it is
+// privileged and runs `runc checkpoint` in the host mount namespace. Without
+// confinement, "artifactURI: file:///etc" is a request to have root clear and
+// repopulate /etc on the node. With --local-artifact-root set, the only place
+// this agent will write is the artifact tier the DaemonSet actually mounts.
+//
+// The failure has to be terminal and legible, not a retry: the URI is not
+// going to become legal on the next reconcile.
+func TestCheckpointRefusesAFileArtifactOutsideTheLocalRoot(t *testing.T) {
+	root := t.TempDir()
+	outside := t.TempDir()
+
+	snap := snapFor("node-a", snapv1.CheckpointerAgent, "file://"+outside+"/escape/")
+	scheme := runtime.NewScheme()
+	if err := snapv1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	c := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(snap).WithStatusSubresource(snap).Build()
+
+	// No Resolver, no Runc: reaching either is a nil dereference, which is
+	// the test catching a dump that should never have been attempted.
+	r := &CheckpointReconciler{Client: c, NodeName: "node-a", LocalArtifactRoot: root}
+	if _, err := r.Reconcile(context.Background(),
+		ctrl.Request{NamespacedName: client.ObjectKeyFromObject(snap)}); err != nil {
+		t.Fatalf("reconcile returned an error instead of failing the snapshot: %v", err)
+	}
+
+	var got snapv1.PodSnapshot
+	if err := c.Get(context.Background(), client.ObjectKeyFromObject(snap), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Status.Phase != snapv1.SnapshotPhaseFailed {
+		t.Fatalf("phase is %q, want Failed", got.Status.Phase)
+	}
+	if !strings.Contains(got.Status.Message, "outside this node's local artifact root") {
+		t.Fatalf("the message does not say why it was refused: %q", got.Status.Message)
+	}
+	// And nothing was created out there.
+	if _, err := os.Stat(filepath.Join(outside, "escape")); !os.IsNotExist(err) {
+		t.Fatalf("the refused path was created anyway: %v", err)
+	}
+}
+
+// The fuse mount has a client underneath making parent directories appear on
+// demand; the node's own NVMe does not. A first dump into a fresh
+// file:// prefix therefore has to create the directory itself, or `runc
+// checkpoint` fails on an --image-path that does not exist -- after the
+// container has already been quiesced for it.
+//
+// Driven through the already-committed shortcut so the test does not need a
+// real runc: what it proves is that the directory exists by the time the
+// reconciler is reading it, which is the same MkdirAll either path depends on.
+func TestCheckpointCreatesTheNodeLocalArtifactDirectory(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "builds", "qwen-r1")
+
+	snap := snapFor("node-a", snapv1.CheckpointerAgent, "file://"+dir+"/")
+	scheme := runtime.NewScheme()
+	if err := snapv1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	c := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(snap).WithStatusSubresource(snap).Build()
+
+	// Resolver is nil, so a reconcile that gets past the manifest check and
+	// into the dump panics. Here it must get past MkdirAll and stop at the
+	// resolver -- so the panic is the expected outcome, and the directory
+	// existing afterwards is the assertion.
+	r := &CheckpointReconciler{Client: c, NodeName: "node-a", LocalArtifactRoot: root}
+	func() {
+		defer func() { _ = recover() }()
+		_, _ = r.Reconcile(context.Background(),
+			ctrl.Request{NamespacedName: client.ObjectKeyFromObject(snap)})
+	}()
+
+	fi, err := os.Stat(dir)
+	if err != nil {
+		t.Fatalf("the node-local artifact directory was not created: %v", err)
+	}
+	if !fi.IsDir() {
+		t.Fatalf("%s is not a directory", dir)
+	}
+}

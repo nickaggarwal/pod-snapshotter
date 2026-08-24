@@ -43,6 +43,7 @@ func main() {
 		kubeletCAFile        string
 		fuseAPIEndpoint      string
 		requirePrereqs       bool
+		artifactRoot         string
 	)
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "Metrics endpoint address (0 to disable).")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8082", "Health probe endpoint address.")
@@ -52,12 +53,27 @@ func main() {
 	flag.StringVar(&kubeletCAFile, "kubelet-ca-file", "", "Extra CA bundle for kubelet serving certs.")
 	flag.StringVar(&fuseAPIEndpoint, "fuse-api-endpoint", "", "fuse-client HTTP API endpoint for artifact stat/delete, e.g. http://fuse-client.fuse-system:8081. Empty disables artifact verification.")
 	flag.BoolVar(&requirePrereqs, "require-node-prereqs", true, "Only checkpoint pods on nodes whose agent reports prereqs ok.")
+	flag.StringVar(&artifactRoot, "artifact-root", artifact.DefaultRoot,
+		"Scheme and prefix that default artifact URIs hang off, e.g. fuse:///snapshots (the distributed mount, readable from every node) or "+
+			"file:///mnt/fuse-nvme0n1/ps-artifacts (the node's own NVMe -- much faster to dump to and restore from, but the artifact then exists "+
+			"on exactly one node and the restore has to be pinned there). Specs that set artifactURI ignore this.")
 
 	opts := zap.Options{Development: false}
 	opts.BindFlags(flag.CommandLine)
 	flag.Parse()
 
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
+
+	// Resolved once here so a typo is a startup failure with one clear line,
+	// rather than every snapshot in the cluster failing to parse its own
+	// default URI.
+	root, rerr := artifact.ParseRoot(artifactRoot)
+	if rerr != nil {
+		setupLog.Error(rerr, "invalid --artifact-root")
+		os.Exit(1)
+	}
+	artifactRoot = root
+	setupLog.Info("default artifact root", "root", artifactRoot)
 
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
 		Scheme:                 scheme,
@@ -89,6 +105,7 @@ func main() {
 		Kubelet:        kubeletClient,
 		Artifacts:      store,
 		RequirePrereqs: requirePrereqs,
+		ArtifactRoot:   artifactRoot,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "PodSnapshot")
 		os.Exit(1)
@@ -101,8 +118,9 @@ func main() {
 		os.Exit(1)
 	}
 	if err := (&controller.SnapshotBuildReconciler{
-		Client:    mgr.GetClient(),
-		Artifacts: store,
+		Client:       mgr.GetClient(),
+		Artifacts:    store,
+		ArtifactRoot: artifactRoot,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "SnapshotBuild")
 		os.Exit(1)

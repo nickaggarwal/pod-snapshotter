@@ -393,6 +393,99 @@ build. This is the same class of failure as the CRIU marker drift in §6: the
 artifact that says what is installed is not the thing that is running, and
 only the running thing counts.
 
+### 3b. The storage tier is a variable, and it is the larger half
+
+§3 removed the tar. What it did not remove was the network filesystem
+underneath, and separating the two turns out to matter: they cost different
+amounts, on different sides, and only one of them is what §3 was about.
+
+The artifact root is now configurable — `--artifact-root` on the manager,
+`manager.artifactRoot` in the chart — and it selects the tier rather than just
+the path. `fuse:///snapshots` is the distributed mount, restorable from any
+node. `file:///mnt/fuse-nvme0n1/ps-artifacts` is the node's own NVMe, mounted
+into the agent at the same path it has on the host (`agent.localArtifactRoot`)
+because `runc checkpoint` resolves `--image-path` in the host mount namespace
+while the agent reads the same files in its container. Both directions use it:
+the dump writes CRIU's images into it, and the restore reads them back out of
+it with no pre-warm, no promotion, and no pin — the bytes are already on the
+device `runc` will read them from.
+
+Four arms, same node (`aks-gpuckpt…00000g`), same 56 GB Qwen2.5-14B, same pod
+template, same patched CRIU 4.2.1 (`GitID 6c683e4`, verified installed before
+all three restores), no CRIU tuning annotations on any of them:
+
+| Arm | Storage | Dump path | Quiesce→ckpt | Checkpointing | Upload | **Snapshot** |
+|---|---|---|---|---|---|---|
+| A | fuse | kubelet+tar | — | — | — | **3364 s** |
+| B0 | fuse | agent direct | 220 s | 1205 s | none | **1425 s** |
+| C | NVMe | kubelet+tar | 209 s | 914 s | 156 s | **1279 s** |
+| B | NVMe | agent direct | 231 s | 66 s | none | **297 s** |
+
+Restores, all with the page cache dropped before the clock starts:
+
+| Arm | Pre-warm | CRIU done | **Serving** | nvme read / write |
+|---|---|---|---|---|
+| A | 153 s | 339 s | **344 s** | 103.4 / 48.0 GB |
+| C | 3 s | 40 s | **43 s** | 56.4 / 0.0 GB |
+| B | 2 s | 37 s | **42 s** | 56.5 / 0.0 GB |
+
+All three served the same correct completion (` Paris. The capital of Spain is
+Madrid…`), which is the pass condition — a phase is not.
+
+**On the restore, the tar contributes nothing and the storage is everything.**
+B and C are the same within noise, because by restore time they *are* the same
+thing: a ~56 GB directory of CRIU images (636 files for B, 640 for C, the
+difference being kubelet's own bookkeeping files rather than anything CRIU
+reads). Whether a tar existed an hour
+ago on the write side leaves no trace on the read side. What separates them
+from A is 8.0×, and the I/O columns say why — A reads 103.4 GB to restore a
+56 GB artifact and writes 48.0 GB doing it, which is pre-warm promoting the
+artifact into the NVMe tier and then reading it back. B and C read 56.5 GB and
+write nothing: amplification exactly 1.0.
+
+**On the dump, both matter and they compound.** The tar costs 982 s (C vs B),
+the network filesystem costs 1128 s (B0 vs B), and A→B is 11.3× overall.
+
+**The untar is the small half of the tar.** From CRIU's own `dump.log` —
+arm C `(121.17445) Dumping finished successfully`, arm B `(67.702426)` — arm
+C's 914 s Checkpointing phase is 121 s of CRIU and roughly 793 s of tar
+*creation*: `sda` writes hold ~250 MB/s from t=231 s to t=1123 s, 201.2 GB.
+The expand that follows is only 156 s (nvme 52.3 GB at 335 MB/s, and `sda`
+read of **0.0 GB** — the tar it is expanding is served entirely from page
+cache). So of the archive's cost, ~81% is writing it and ~16% is reading it
+back. Removing the untar was worth 156 s; removing the tar was worth 793 s.
+
+CRIU itself is also slower in arm C (121 s vs 68 s) for a reason that has
+nothing to do with CRIU: the kubelet path makes it write to `/var/lib/kubelet`
+on the OS disk, while the agent path points it at the NVMe. Same binary, same
+flags, different device.
+
+**What it costs.** A `file://` artifact exists on exactly one node, so every
+restore of it has to be pinned there (`spec.nodeName`). That makes the NVMe
+tier a per-node warm pool, not a way to ship a snapshot between machines — the
+right default is still `fuse:///snapshots`, and the tier is a per-deployment
+or per-snapshot choice rather than a replacement.
+
+**And a boundary that comes with it.** A `file://` URI on a CRD is a raw host
+path handed to a privileged agent that runs `runc` in the host mount
+namespace, which without confinement makes `artifactURI: file:///etc` a
+request to clear and repopulate `/etc` as root. When `agent.localArtifactRoot`
+is set it is the only place the agent will read or write a `file://` artifact
+(`artifact.CheckLocalRoot`), and it is also the only host path the DaemonSet
+mounts writable. `fuse://` URIs are unaffected — they are relative to the
+mount by construction and `Parse` already rejects traversal.
+
+**Defaults follow the measurement.** `spec.checkpointer` now defaults to
+`agent` and `spec.artifactFormat` to `dir`, on PodSnapshot and SnapshotBuild
+alike. The two have to move together: an agent default over a tar default
+routes every snapshot into the kubelet fallback and quietly measures the old
+path, so a test asserts the shipped CRDs carry both
+(`api/v1alpha1/crd_defaults_test.go` — the marker comment is a wish, the
+generated YAML is the fact). The fallback in `agentCheckpoints()` is what
+makes the flip safe mid-upgrade: a tar artifact or a node that does not
+advertise `agent-checkpoint` degrades to the kubelet path with the reason in
+the snapshot's status.
+
 ---
 
 ## 4. Workstream 2 — quiesce/resume hooks
@@ -1136,6 +1229,7 @@ distributed cache is good at.
 | 4 | `--stream` restore, measured (§6a) | not started — `criu-image-streamer` is not on the node images, and the restore is not currently CRIU-read-bound (see below) |
 | 5 | Fork CRIU only if §4 measured short (§6b) | **done** — [nickaggarwal/criu](https://github.com/nickaggarwal/criu), branch `pod-snapshotter/v4.2.1-restore-parallelism` |
 | 6 | Put the memfd bytes on the AIO path (§6d) | **done** — fork commits `4377264`+`6c683e4`, image `v4.2.1-ps5`, live on both GPU nodes. CF-8/9/10/11 measured 2026-08-22: read path 21.4 s → 19.4 s cold, `O_DIRECT` 12575/12575, and the unbounded-chunk control gives the win back (22.0 s). Smaller than predicted; §6d says why |
+| 7 | Selectable storage tier, agent dump by default (§3b) | **done** in code — `manager.artifactRoot` / `agent.localArtifactRoot`, `checkpointer: agent` + `artifactFormat: dir` as CRD defaults. Four-arm measurement 2026-08-24: snapshot 3364 s → 297 s (11.3×), restore 344 s → 42 s (8.0×). Not yet deployed: the running manager/agent images predate both flags |
 
 ### Benchmark table to fill in
 
@@ -1267,7 +1361,7 @@ than uvloop, so that a *restored* process is still dumpable.
 
 ## 11. Storage behavior that shaped the design
 
-Two things about the fuse-client mount, both measured, both of which changed
+Three things about the fuse-client mount, all measured, all of which changed
 the §3 implementation:
 
 - **`rename` copies without unlinking the source.** Every artifact tar on the
@@ -1284,5 +1378,23 @@ the §3 implementation:
   overwrite. The manifest's per-file sizes are what caught this — a tar
   artifact would have carried the corruption into `runc restore`.
 
-Neither is a bug report against fuse-cache so much as a reminder that an
+- **A lost write comes back as zeros, not as an error.** Three separate dumps
+  of the same build died at publish on
+  `checkpoint/files.img does not start with the CRIU image magic (got
+  0x00000000, want 0x19435654): it is 45454 bytes on disk` — the same file, at
+  the same size, all three times. The store had accepted the write, reported
+  success, and served back a correctly-sized run of zeros. No size check can
+  see this, which is why `verifyImageMagic` exists and why it checks a
+  content invariant instead of a length. It did its job — the failure landed
+  seconds after the dump rather than 200 s into a restore — but it could not
+  make the store keep the bytes. §3b's `file://` tier is the response: the
+  fastest way to stop losing writes to a layer is to take the layer out of the
+  path.
+
+Also worth recording, though they did not change the design: `rmdir` on a
+non-empty directory returns 0 without unlinking anything (which makes
+`os.RemoveAll` report success while leaving the whole tree in place — see
+`clearArtifactDir`), and setting a mode at create time fails.
+
+None of this is a bug report against fuse-cache so much as a reminder that an
 artifact store is not a POSIX filesystem just because it is mounted like one.

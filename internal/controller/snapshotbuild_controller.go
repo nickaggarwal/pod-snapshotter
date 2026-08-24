@@ -33,6 +33,10 @@ type SnapshotBuildReconciler struct {
 	// Artifacts is optional; when nil, DeletionPolicy=Delete only removes the
 	// finalizer without deleting the artifact (logged).
 	Artifacts ArtifactDeleter
+
+	// ArtifactRoot is the scheme+prefix that default artifact URIs hang off
+	// (artifact.ParseRoot). Empty means artifact.DefaultRoot.
+	ArtifactRoot string
 }
 
 // +kubebuilder:rbac:groups=podsnapshot.io,resources=snapshotbuilds,verbs=get;list;watch;create;update;patch;delete
@@ -95,7 +99,7 @@ func (r *SnapshotBuildReconciler) reconcileBuildPending(ctx context.Context, bui
 	}
 	uriStr := build.Spec.ArtifactURI
 	if uriStr == "" {
-		uriStr = artifact.DefaultBuildURI(build.Spec.Revision, buildFormat(build))
+		uriStr = artifact.DefaultBuildURI(r.ArtifactRoot, build.Spec.Revision, buildFormat(build))
 	}
 	uri, err := artifact.Parse(uriStr)
 	if err != nil {
@@ -189,9 +193,11 @@ func (r *SnapshotBuildReconciler) reconcileBuilding(ctx context.Context, build *
 				DeletionPolicy: snapv1.DeletionPolicyRetain,
 				// The dump itself, once the workload has already quiesced.
 				TimeoutSeconds: build.Spec.TimeoutSeconds,
-				// Empty passes through as empty, which the PodSnapshot CRD
-				// then defaults to kubelet -- so an old build spec keeps its
-				// old behaviour rather than inheriting a new default here.
+				// Passed through verbatim. Empty stays empty and the
+				// PodSnapshot CRD applies its own default -- which means a
+				// build written before checkpointer existed follows whatever
+				// the cluster's current default is, rather than being frozen
+				// to the default that was in force when it was authored.
 				Checkpointer: build.Spec.Checkpointer,
 			},
 		}

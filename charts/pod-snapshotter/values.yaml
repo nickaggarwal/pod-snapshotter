@@ -29,6 +29,32 @@ manager:
   # Refuse to checkpoint pods on nodes whose agent has not reported
   # prerequisites ok (annotation podsnapshot.io/prereqs=ok).
   requireNodePrereqs: true
+  # Scheme and prefix every default artifact URI hangs off. A PodSnapshot
+  # becomes <artifactRoot>/<namespace>/<name>/<container>/ and a SnapshotBuild
+  # becomes <artifactRoot>/builds/<revision>/. Specs that set artifactURI
+  # themselves ignore this entirely.
+  #
+  # Two tiers are available, and the choice is a real trade:
+  #
+  #   fuse:///snapshots
+  #     The distributed mount. Any node can restore the artifact, which is
+  #     what you want for a snapshot that outlives the node that took it.
+  #     Slower on both sides, and the write path has its own failure mode --
+  #     it has accepted writes without persisting them and handed back
+  #     correctly-sized runs of zeros, which is why publish verifies CRIU's
+  #     image magic (internal/artifact/publish.go, verifyImageMagic).
+  #
+  #   file:///mnt/fuse-nvme0n1/ps-artifacts
+  #     The node's own NVMe -- agent.localArtifactRoot below, which must be
+  #     set to the same path. No network filesystem in either direction.
+  #     Measured on an A100 node with a 56 GB Qwen2.5-14B checkpoint: dump
+  #     1425 s -> 297 s, restore-to-serving 344 s -> 42 s. The catch is that
+  #     the artifact exists on exactly one node, so every restore of it has to
+  #     be pinned to that node (podrestore spec.nodeName).
+  #
+  # Default is the portable one. Point it at the NVMe path when the workload
+  # is a node-local warm pool rather than a cluster-wide image.
+  artifactRoot: fuse:///snapshots
   # fuse-client HTTP API used for artifact existence checks and deletion.
   # The service is named client-headless, not fuse-client: it is the headless
   # service in front of the client DaemonSet (selector app=client). The name
@@ -99,7 +125,7 @@ agent:
     # rather than written, tarred, and untarred (design-v2.md §3). It
     # advertises agent-checkpoint in podsnapshot.io/capabilities, which is how
     # the manager knows the node is new enough to route work to.
-    tag: v0.5.4-agentckpt
+    tag: v0.5.5-nvme
     pullPolicy: IfNotPresent
   # Where the agent runs. Every linux node by default, not GPU nodes only: the
   # agent also publishes prereq status and serves pre-warm, and a node with no
@@ -115,21 +141,32 @@ agent:
       effect: NoSchedule
   # Paths on the host.
   fuseMount: /mnt/fuse
-  # Node-local artifact tier: a directory on the node's own NVMe, mounted into
-  # the agent at the same path it has on the host, for artifacts addressed as
-  # file:///... Empty disables the mount entirely.
+  # Node-local artifact tier: the directory on the node's own NVMe that holds
+  # file:// artifacts, mounted into the agent at the same path it has on the
+  # host. Both directions go through it -- a dump writes CRIU's images straight
+  # into it, and a restore reads them back out of it, with no network
+  # filesystem in either path.
   #
-  # This is not a cache and not a fallback -- it is a second, independent place
-  # to put an artifact, chosen per build by spec.artifactURI. It exists because
-  # the distributed store is a network filesystem with its own failure modes:
-  # it has accepted writes and not persisted them, handing back correctly-sized
-  # runs of zeros that no size check can see (internal/artifact/publish.go,
-  # verifyImageMagic). A dump straight to the node's NVMe removes that whole
-  # layer from the measurement, which is what makes the dump/restore comparison
-  # about the write path rather than about the storage backend.
+  # Set manager.artifactRoot to file://<this path> to make it the default
+  # destination for new snapshots; leave the manager on fuse:/// and this is
+  # still the tier any explicit file:// artifactURI resolves against.
+  #
+  # It is also a confinement boundary, not only a location. A file:// URI on a
+  # CRD is a raw host path handed to a privileged agent, so when this is set
+  # the agent refuses to read or write a file:// artifact anywhere else
+  # (artifact.CheckLocalRoot). Empty disables the mount and the check both,
+  # which is the dev/test posture.
+  #
+  # Why it earns its place: the distributed store is a network filesystem with
+  # its own failure modes -- it has accepted writes and not persisted them,
+  # handing back correctly-sized runs of zeros that no size check can see
+  # (internal/artifact/publish.go, verifyImageMagic). Taking it out of the path
+  # removes that layer, and the numbers say the layer was most of the cost:
+  # 56 GB Qwen2.5-14B on an A100 node, dump 1425 s -> 297 s, restore-to-serving
+  # 344 s -> 42 s.
   #
   # The tradeoff is the obvious one: a file:// artifact lives on exactly one
-  # node, so the restore has to land on that node. Fine for a same-node A/B,
+  # node, so the restore has to be pinned to that node. A warm pool per node,
   # not a way to ship snapshots between machines.
   #
   # Path note: this is under the NVMe mount, NOT under fuse-cache/ -- writing

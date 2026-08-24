@@ -63,6 +63,12 @@ type RestoreReconciler struct {
 	// the FUSE mount — measured ~7x faster for bytes that are already local
 	// (internal/artifact.NVMeCache). Empty disables the bypass.
 	NVMeCacheRoot string
+	// LocalArtifactRoot is the node-local artifact tier holding file://
+	// artifacts, at the same path here as on the host. Restoring reads
+	// straight out of it: no fuse mount, no pre-warm, no NVMe-cache
+	// indirection, because the bytes are already on the device runc will
+	// read them from. Empty leaves file:// URIs unconfined (dev and tests).
+	LocalArtifactRoot string
 
 	Resolver SandboxResolver
 	Runc     restore.RuncRunner
@@ -122,6 +128,10 @@ func (r *RestoreReconciler) prewarm(ctx context.Context, pr *snapv1.PodRestore) 
 		if err := r.Pinner.Pin(ctx, pinVolumeID(pr), rootPath); err != nil {
 			logger.Info("pinning failed; continuing unpinned", "err", err)
 		}
+	}
+
+	if err := artifact.CheckLocalRoot(uri, r.LocalArtifactRoot); err != nil {
+		return r.fail(ctx, pr, err.Error())
 	}
 
 	hostPath := uri.HostPath(r.FuseMount)
@@ -241,6 +251,9 @@ func (r *RestoreReconciler) restore(ctx context.Context, pr *snapv1.PodRestore) 
 
 	uri, err := artifact.Parse(pr.Status.ArtifactURI)
 	if err != nil {
+		return r.fail(ctx, pr, err.Error())
+	}
+	if err := artifact.CheckLocalRoot(uri, r.LocalArtifactRoot); err != nil {
 		return r.fail(ctx, pr, err.Error())
 	}
 	artifactPath := uri.HostPath(r.FuseMount)

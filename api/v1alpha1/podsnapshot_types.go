@@ -64,10 +64,11 @@ const (
 
 // Checkpointer values for PodSnapshotSpec.Checkpointer.
 const (
-	// CheckpointerKubelet POSTs to the kubelet checkpoint API (v1 default).
+	// CheckpointerKubelet POSTs to the kubelet checkpoint API (the v1 path,
+	// and still the fallback for tar artifacts and pre-capability agents).
 	CheckpointerKubelet = "kubelet"
 	// CheckpointerAgent runs `runc checkpoint` on the node agent, with CRIU
-	// writing directly into the artifact directory.
+	// writing directly into the artifact directory. The default since v2.
 	CheckpointerAgent = "agent"
 )
 
@@ -120,8 +121,11 @@ type PodSnapshotSpec struct {
 	//   fuse:///<path>  — a path under the fuse-client mount (/mnt/fuse/<path> on nodes)
 	//   file:///<path>  — an absolute node-local path (testing only)
 	// A trailing slash makes it a directory prefix (artifactFormat: dir).
-	// Defaults to fuse:///snapshots/<namespace>/<name>/<container>.tar,
-	// or .../<container>/ when artifactFormat is dir.
+	// Defaults to <artifact-root>/<namespace>/<name>/<container>/, where the
+	// root is the manager's --artifact-root (chart value
+	// manager.artifactRoot, default fuse:///snapshots). Point that at a
+	// file:// path on the node's NVMe to keep the network filesystem out of
+	// the dump and restore paths entirely.
 	// +optional
 	ArtifactURI string `json:"artifactURI,omitempty"`
 
@@ -134,8 +138,12 @@ type PodSnapshotSpec struct {
 	//         critical path (docs/design-v2.md §3).
 	//
 	// Ignored when artifactURI is set explicitly — the trailing slash decides.
+	//
+	// Defaults to dir, which is what the default checkpointer (agent) needs:
+	// asking for tar silently demotes the dump back to the kubelet path,
+	// because there is no tar for the agent to hand back.
 	// +kubebuilder:validation:Enum=tar;dir
-	// +kubebuilder:default=tar
+	// +kubebuilder:default=dir
 	// +optional
 	ArtifactFormat string `json:"artifactFormat,omitempty"`
 
@@ -155,11 +163,12 @@ type PodSnapshotSpec struct {
 
 	// Checkpointer selects who runs the dump:
 	//
+	//   agent   — (default) the node agent runs `runc checkpoint` itself,
+	//             with CRIU writing its images straight into the artifact
+	//             directory.
 	//   kubelet — POST to the kubelet checkpoint API, which drives CRIU and
 	//             hands back a tar. The agent then expands that tar into the
 	//             artifact directory.
-	//   agent   — the node agent runs `runc checkpoint` itself, with CRIU
-	//             writing its images straight into the artifact directory.
 	//
 	// The two produce the same artifact. What differs is how many times the
 	// bytes are written to get there: the kubelet path writes them into a
@@ -168,11 +177,19 @@ type PodSnapshotSpec struct {
 	// /var/lib/kubelet — the OS disk on a stock AKS GPU node, not the NVMe
 	// tier the artifact is bound for. See docs/design-v2.md §3.
 	//
-	// agent requires artifactFormat: dir (there is no tar to hand back), and
-	// falls back to kubelet if the node's agent is too old to advertise the
-	// capability.
+	// Measured on an A100 node, Qwen2.5-14B, 56 GB of images, both arms
+	// writing to the same node NVMe: kubelet 1279 s, agent 297 s. Of the
+	// kubelet arm's extra time, ~793 s is building the tar and 156 s is
+	// expanding it again — the archive is the cost, not CRIU (docs/design-v2.md
+	// §3).
+	//
+	// agent requires artifactFormat: dir (there is no tar to hand back). It
+	// falls back to kubelet, with the reason in the snapshot's status, when
+	// the artifact is a tar or the node's agent is too old to advertise the
+	// capability — which is what makes it safe as a default on a cluster
+	// that is mid-upgrade.
 	// +kubebuilder:validation:Enum=kubelet;agent
-	// +kubebuilder:default=kubelet
+	// +kubebuilder:default=agent
 	// +optional
 	Checkpointer string `json:"checkpointer,omitempty"`
 }

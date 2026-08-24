@@ -6,7 +6,11 @@
 //	                 On every node this resolves to <fuse-mount>/<path>
 //	                 (default /mnt/fuse/<path>); fuse-client persists writes
 //	                 to its cloud tier and serves reads through NVMe/peers.
-//	file:///<path> — an absolute node-local path, for testing without fuse.
+//	file:///<path> — an absolute node-local path: the node's own disk, most
+//	                 usefully its NVMe. There is no network filesystem in the
+//	                 path at all, which is the fast tier for dump and restore
+//	                 both, and also the narrow one -- the artifact exists on
+//	                 exactly one node, so the restore has to land there.
 //
 // A URI naming a single object (…/vllm.tar) is a v1 tar artifact. A URI with
 // a trailing slash (…/vllm/) is a v2 image-directory prefix: the CRIU image
@@ -133,16 +137,53 @@ func (u URI) CommitPath() URI {
 	return URI{Scheme: u.Scheme, Path: u.Path + "/" + ManifestName}
 }
 
-// DefaultURI builds the default artifact URI for a snapshot. format is
-// FormatTar (a single .tar object) or FormatDir (a directory prefix).
-func DefaultURI(namespace, name, container, format string) string {
-	return withFormat(fmt.Sprintf("fuse:///snapshots/%s/%s/%s", namespace, name, container), format)
+// DefaultRoot is the artifact root used when nothing configures one: the
+// fuse-client distributed mount, which is the only tier every node can read.
+const DefaultRoot = "fuse:///snapshots"
+
+// ParseRoot validates an artifact root -- a scheme plus a directory prefix
+// that DefaultURI and DefaultBuildURI hang snapshot paths off, e.g.
+// "fuse:///snapshots" or "file:///mnt/fuse-nvme0n1/ps-artifacts". It returns
+// the root with any trailing slash removed, so callers can concatenate.
+//
+// This exists so a misconfigured root is a startup error in one place rather
+// than a per-snapshot parse failure: the manager resolves it once at boot,
+// and every URI built from it is then known to parse.
+func ParseRoot(root string) (string, error) {
+	if root == "" {
+		root = DefaultRoot
+	}
+	root = strings.TrimRight(root, "/")
+	// Probe with a path component: a bare root has nothing after the scheme
+	// for Parse to accept, and it is the joined form that has to be legal.
+	if _, err := Parse(root + "/probe"); err != nil {
+		return "", fmt.Errorf("invalid artifact root %q: %w", root, err)
+	}
+	return root, nil
 }
 
-// DefaultBuildURI builds the default artifact URI for a SnapshotBuild.
-// Builds are keyed by revision, not by pod: one artifact, many restores.
-func DefaultBuildURI(revision, format string) string {
-	return withFormat("fuse:///snapshots/builds/"+revision, format)
+// DefaultURI builds the default artifact URI for a snapshot under root (see
+// ParseRoot; empty means DefaultRoot). format is FormatTar (a single .tar
+// object) or FormatDir (a directory prefix).
+func DefaultURI(root, namespace, name, container, format string) string {
+	return withFormat(fmt.Sprintf("%s/%s/%s/%s", rootOrDefault(root), namespace, name, container), format)
+}
+
+// DefaultBuildURI builds the default artifact URI for a SnapshotBuild under
+// root. Builds are keyed by revision, not by pod: one artifact, many restores.
+func DefaultBuildURI(root, revision, format string) string {
+	return withFormat(rootOrDefault(root)+"/builds/"+revision, format)
+}
+
+// rootOrDefault is the lenient counterpart to ParseRoot, for callers holding a
+// root that was already validated (or that never configured one). It does not
+// re-validate: a root that got here unparseable produces an unparseable URI,
+// which the caller's Parse then reports against the actual snapshot.
+func rootOrDefault(root string) string {
+	if root == "" {
+		return DefaultRoot
+	}
+	return strings.TrimRight(root, "/")
 }
 
 func withFormat(base, format string) string {
@@ -150,4 +191,29 @@ func withFormat(base, format string) string {
 		return base + "/"
 	}
 	return base + ".tar"
+}
+
+// CheckLocalRoot rejects a file:// URI that points outside root.
+//
+// A file:// artifact is a raw host path, and on the agent it is a raw host
+// path written by a privileged process — so the URI on a CRD is, without
+// this, a request to have the agent create directories and image files
+// anywhere on the node. Confining them to one configured directory (the
+// agent's --local-artifact-root, which is also the only host path the
+// DaemonSet mounts writable) turns that into a bounded blast radius: the
+// worst a bad URI can do is make a mess inside the artifact tier.
+//
+// An empty root disables the check, which is what unit tests and single-node
+// dev clusters run with — there, file:// under a t.TempDir() is the point.
+// fuse:// URIs are never affected: they are relative to the mount by
+// construction and Parse has already rejected traversal.
+func CheckLocalRoot(u URI, root string) error {
+	if u.Scheme != SchemeFile || root == "" {
+		return nil
+	}
+	root = strings.TrimRight(path.Clean(root), "/")
+	if u.Path != root && !strings.HasPrefix(u.Path, root+"/") {
+		return fmt.Errorf("artifact %s is outside this node's local artifact root %s", u.String(), root)
+	}
+	return nil
 }

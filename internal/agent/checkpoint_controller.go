@@ -49,6 +49,18 @@ type CheckpointReconciler struct {
 	// FuseMount is the node's fuse-client mount point, as this container
 	// sees it.
 	FuseMount string
+	// LocalArtifactRoot is the node-local artifact tier -- a directory on
+	// this node's own disk, typically its NVMe, holding file:// artifacts.
+	//
+	// It must be mounted at the same path here as it has on the host. `runc
+	// checkpoint` runs through nsenter in the host mount namespace, so the
+	// --image-path computed here is resolved by the host, while the publish
+	// that follows reads the same files in this container. One path, or they
+	// are two directories that happen to share a name.
+	//
+	// Empty means file:// artifacts are unconfined (dev and tests); set, it
+	// is the only place this agent will write one. See artifact.CheckLocalRoot.
+	LocalArtifactRoot string
 	// WorkRoot is node-local scratch; CRIU's work directory (its logs and
 	// stats) goes here, never into the artifact.
 	WorkRoot string
@@ -103,7 +115,20 @@ func (r *CheckpointReconciler) checkpoint(ctx context.Context, snap *snapv1.PodS
 			"checkpointer %q needs a directory artifact; %s is a tar", snapv1.CheckpointerAgent, uri.String()))
 	}
 
+	if err := artifact.CheckLocalRoot(uri, r.LocalArtifactRoot); err != nil {
+		return r.fail(ctx, snap, err.Error())
+	}
 	dstDir := uri.HostPath(r.FuseMount)
+
+	// A file:// artifact directory is this agent's to create -- there is no
+	// fuse-client underneath making parents appear on demand. MkdirAll before
+	// the already-committed check below, so a first dump reads an empty
+	// directory rather than ENOENT.
+	if uri.Scheme == artifact.SchemeFile {
+		if err := os.MkdirAll(dstDir, 0o755); err != nil {
+			return r.fail(ctx, snap, fmt.Sprintf("creating the node-local artifact directory %s: %v", dstDir, err))
+		}
+	}
 
 	// A dump is not repeatable: `runc checkpoint` takes the container with it,
 	// so once it has succeeded there is no process left to dump a second time.

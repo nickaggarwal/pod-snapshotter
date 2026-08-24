@@ -115,19 +115,77 @@ cuda-checkpoint, driver ≥ 570, runc config, feature gates).
 ## Artifact URIs
 
 ```
-fuse:///snapshots/<ns>/<name>/<ctr>.tar   → a single tar object (v1 default)
-fuse:///snapshots/<ns>/<name>/<ctr>/      → an image directory (trailing slash)
-fuse:///snapshots/builds/<revision>/      → a SnapshotBuild output
-file:///abs/path.tar                      → node-local path (testing)
+<root>/<ns>/<name>/<ctr>/      → a PodSnapshot's image directory (trailing slash)
+<root>/<ns>/<name>/<ctr>.tar   → the same, as a single tar object (v1 layout)
+<root>/builds/<revision>/      → a SnapshotBuild output
 ```
 
-A trailing slash makes it a directory artifact: the CRI archive expanded into
-per-file objects, committed by a `MANIFEST` written last. A prefix without a
-complete MANIFEST reads as absent, never as partial — that rule is what
-replaces the atomic rename a tar got for free.
+`<root>` is the manager's `--artifact-root` (chart value
+`manager.artifactRoot`), and it is where the storage tier is chosen:
+
+| Root | Where the bytes live | Restorable from |
+|---|---|---|
+| `fuse:///snapshots` (default) | the fuse-client distributed mount | any node |
+| `file:///mnt/fuse-nvme0n1/ps-artifacts` | the node's own NVMe | that node only |
+
+A spec that sets `artifactURI` itself ignores the root entirely, so the two
+tiers can be mixed per snapshot.
+
+A trailing slash makes it a directory artifact: CRIU's images as per-file
+objects, committed by a `MANIFEST` written last. A prefix without a complete
+MANIFEST reads as absent, never as partial — that rule is what replaces the
+atomic rename a tar got for free.
 
 Anything that can produce a CRI checkpoint tar can be restored — point
 `spec.artifactURI` at it.
+
+## Where the dump is written, and by whom
+
+`spec.checkpointer` picks the writer, and it defaults to `agent`:
+
+- **`agent`** — the node agent runs `runc checkpoint` itself and CRIU writes
+  its images straight into the artifact directory. One pass over the bytes.
+- **`kubelet`** — POST to the kubelet checkpoint API, which drives CRIU into a
+  tar; the agent then expands that tar into the same directory. Three passes,
+  most of them on whichever disk holds `/var/lib/kubelet`.
+
+The agent path needs `artifactFormat: dir` (there is no tar to hand back) and
+a node whose agent advertises `agent-checkpoint`. When either is missing the
+manager falls back to the kubelet path and says so in the snapshot's status —
+which is what makes `agent` safe as the default on a cluster mid-upgrade.
+
+Measured on an A100 node, Qwen2.5-14B, 56 GB of CRIU images, both directions
+cold (`drop_caches` before the clock):
+
+| Dump path | Storage | Snapshot | Restore → serving |
+|---|---|---|---|
+| kubelet + tar | fuse mount | 3364 s | 344 s |
+| agent direct | fuse mount | 1425 s | — |
+| kubelet + tar | node NVMe | 1279 s | 43 s |
+| **agent direct** | **node NVMe** | **297 s** | **42 s** |
+
+The two axes do different work. On the **dump**, both matter and compound:
+the tar costs ~950 s (of which ~793 s is writing the archive and 156 s is
+expanding it again) and the network filesystem costs ~1130 s. On the
+**restore**, the tar contributes nothing — by then both artifacts are the same
+632-file directory — and the storage tier is the entire 8× difference.
+[docs/design-v2.md](docs/design-v2.md) has the full decomposition.
+
+To put both sides on the node's NVMe:
+
+```yaml
+manager:
+  artifactRoot: file:///mnt/fuse-nvme0n1/ps-artifacts
+agent:
+  localArtifactRoot: /mnt/fuse-nvme0n1/ps-artifacts   # same path, mounted from the host
+```
+
+`agent.localArtifactRoot` is also a confinement boundary: a `file://` URI is a
+raw host path handed to a privileged agent, so when it is set the agent
+refuses to read or write a `file://` artifact anywhere else. It has to be
+mounted at the same path in the agent as on the host — `runc checkpoint` runs
+through `nsenter` in the host mount namespace, so `--image-path` is resolved
+there while the agent reads the same files in its own container.
 
 ## Node prerequisites (summary)
 
@@ -142,10 +200,16 @@ mounted at `/mnt/fuse`.
 
 ## fuse-client integration
 
-- **Upload**: the agent streams the kubelet tar to the FUSE mount
-  (atomic `.part` + rename); fuse-client's write-through persists it to cloud.
-- **Pre-warm**: before restore, the agent sequentially reads the tar through
-  the mount — fuse-client promotes every miss to local NVMe (peers → cloud).
+All three steps below are `fuse://` only. A `file://` artifact skips every one
+of them by construction — there is no mount to write through, no tier to
+promote into, and nothing that could evict bytes already on the node's own
+disk.
+
+- **Upload**: the agent writes into the FUSE mount — CRIU's images directly on
+  the agent path, the kubelet's tar expanded on the kubelet path;
+  fuse-client's write-through persists it to cloud.
+- **Pre-warm**: before restore, the agent reads the artifact through the
+  mount — fuse-client promotes every miss to local NVMe (peers → cloud).
 - **Pin**: the agent creates a pinned session over the fuse-client agent
   socket (`/var/run/fuse-client/agent.sock`) so the artifact can't be evicted
   mid-restore; unpinned at teardown.

@@ -45,6 +45,11 @@ type PodSnapshotReconciler struct {
 	// the agent. Disable in tests / CPU-only trials.
 	RequirePrereqs bool
 
+	// ArtifactRoot is the scheme+prefix that default artifact URIs hang off
+	// (artifact.ParseRoot). Empty means artifact.DefaultRoot. A spec that
+	// names artifactURI explicitly ignores it entirely.
+	ArtifactRoot string
+
 	// inflight tracks running checkpoint calls keyed by namespaced name, so a
 	// reconcile re-entry does not launch a duplicate kubelet call.
 	inflight sync.Map
@@ -163,7 +168,7 @@ func (r *PodSnapshotReconciler) reconcilePending(ctx context.Context, snap *snap
 	// trailing slash (or absence) decides the format.
 	uriStr := snap.Spec.ArtifactURI
 	if uriStr == "" {
-		uriStr = artifact.DefaultURI(snap.Namespace, snap.Name, container, snap.Spec.ArtifactFormat)
+		uriStr = artifact.DefaultURI(r.ArtifactRoot, snap.Namespace, snap.Name, container, snap.Spec.ArtifactFormat)
 	}
 	uri, err := artifact.Parse(uriStr)
 	if err != nil {

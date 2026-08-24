@@ -24,6 +24,7 @@ spec:
             - --leader-elect={{ .Values.manager.leaderElect }}
             - --kubelet-insecure-tls={{ .Values.manager.kubeletInsecureTLS }}
             - --require-node-prereqs={{ .Values.manager.requireNodePrereqs }}
+            - --artifact-root={{ .Values.manager.artifactRoot }}
             {{- if .Values.manager.fuseAPIEndpoint }}
             - --fuse-api-endpoint={{ .Values.manager.fuseAPIEndpoint }}
             {{- end }}

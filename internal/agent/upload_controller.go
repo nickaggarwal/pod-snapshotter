@@ -39,6 +39,9 @@ type UploadReconciler struct {
 	NodeName string
 	// FuseMount is the node's fuse-client mount point (default /mnt/fuse).
 	FuseMount string
+	// LocalArtifactRoot confines file:// artifacts to the node-local tier,
+	// as in CheckpointReconciler. Empty disables the check.
+	LocalArtifactRoot string
 	// CheckpointsHostPath is where kubelet tars appear inside the agent
 	// container (hostPath mount of /var/lib/kubelet/checkpoints).
 	CheckpointsHostPath string
@@ -96,7 +99,21 @@ func (r *UploadReconciler) upload(ctx context.Context, snap *snapv1.PodSnapshot)
 	if err != nil {
 		return r.fail(ctx, snap, err.Error())
 	}
+	if err := artifact.CheckLocalRoot(uri, r.LocalArtifactRoot); err != nil {
+		return r.fail(ctx, snap, err.Error())
+	}
 	dst := uri.HostPath(r.FuseMount)
+
+	// No fuse-client to conjure parents for a node-local destination.
+	if uri.Scheme == artifact.SchemeFile {
+		parent := dst
+		if !uri.Dir {
+			parent = filepath.Dir(dst)
+		}
+		if err := os.MkdirAll(parent, 0o755); err != nil {
+			return r.fail(ctx, snap, fmt.Sprintf("creating the node-local artifact directory %s: %v", parent, err))
+		}
+	}
 
 	info, err := os.Stat(src)
 	if err != nil {
