@@ -1229,7 +1229,8 @@ distributed cache is good at.
 | 4 | `--stream` restore, measured (§6a) | not started — `criu-image-streamer` is not on the node images, and the restore is not currently CRIU-read-bound (see below) |
 | 5 | Fork CRIU only if §4 measured short (§6b) | **done** — [nickaggarwal/criu](https://github.com/nickaggarwal/criu), branch `pod-snapshotter/v4.2.1-restore-parallelism` |
 | 6 | Put the memfd bytes on the AIO path (§6d) | **done** — fork commits `4377264`+`6c683e4`, image `v4.2.1-ps5`, live on both GPU nodes. CF-8/9/10/11 measured 2026-08-22: read path 21.4 s → 19.4 s cold, `O_DIRECT` 12575/12575, and the unbounded-chunk control gives the win back (22.0 s). Smaller than predicted; §6d says why |
-| 7 | Selectable storage tier, agent dump by default (§3b) | **done** in code — `manager.artifactRoot` / `agent.localArtifactRoot`, `checkpointer: agent` + `artifactFormat: dir` as CRD defaults. Four-arm measurement 2026-08-24: snapshot 3364 s → 297 s (11.3×), restore 344 s → 42 s (8.0×). Not yet deployed: the running manager/agent images predate both flags |
+| 7 | Selectable storage tier, agent dump by default (§3b) | **done** — `manager.artifactRoot` / `agent.localArtifactRoot`, `checkpointer: agent` + `artifactFormat: dir` as CRD defaults. Four-arm measurement 2026-08-24: snapshot 3364 s → 297 s (11.3×), restore 344 s → 42 s (8.0×). Deployed as manager `v0.4.0-artifactroot` / agent `v0.6.0-artifactroot`; `hack/deploy.sh` verifies clean |
+| — | Stock-CRIU control for §6 (`hack/measure-criu-control.sh`) | **not run** — every restore figure in §6 was taken on the fork, so "the fork is worth 225 s" is an attribution rather than a controlled result. The script restores one artifact twice on the same node and transport, reverting via `criu.uninstall` in between. Needs a free GPU |
 
 ### Benchmark table to fill in
 

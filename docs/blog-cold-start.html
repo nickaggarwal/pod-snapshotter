@@ -1028,6 +1028,18 @@ nvme0n1      0 B/s     <span class="cmt">← the 894 GB local NVMe</span></code>
       end-to-end, they are still ahead, and we know exactly which component accounts for
       it.
     </p>
+    <div class="note">
+      <span class="note-lab">The control we still owe</span>
+      Every restore figure on this page was measured on the patched CRIU. That makes
+      "the fork is worth 225&nbsp;s" an attribution rather than a controlled result — the
+      transport work underneath moved more time than the patches did, and it moved it for
+      both binaries. The missing arm is the same artifact restored on the same node and
+      the same transport with stock CRIU 4.2.1, which the distro package on these hosts
+      happens to be exactly. We have the harness for it and have not run it, because both
+      GPUs in the pool are occupied. Until we do, treat the 35/65 split between patches
+      and configuration as our best estimate rather than a measurement — and note that
+      the direction of any error makes the patches look better than they were, not worse.
+    </div>
   </div>
 </section>
 
