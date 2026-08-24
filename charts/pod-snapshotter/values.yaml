@@ -112,7 +112,14 @@ criu:
     # installer now rolls back and parks instead of crashlooping. The 22.04
     # agentpool node had been restarting forever, which made a clean deploy
     # indistinguishable from a broken one.
-    tag: v4.2.1-ps5.3
+    # ps5.4 exists only because ps5.3 was pushed five times while that install
+    # script was being fixed. The nodes cached the first push and IfNotPresent
+    # kept it there, so a tag that reads as one version stood for five images
+    # and a restart could not correct it. Same fork commit throughout, so
+    # nothing measured against ps5.3 is wrong -- but a tag that is not a
+    # version is exactly the drift hack/deploy.sh exists to catch, so it gets
+    # a name of its own rather than a sixth push.
+    tag: v4.2.1-ps5.4
     pullPolicy: IfNotPresent
 
 agent:

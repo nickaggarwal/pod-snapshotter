@@ -237,6 +237,14 @@ for p in $(kubectl -n "$NAMESPACE" get pods --no-headers -o custom-columns=:meta
   gitid=$(echo "$out" | sed -n 's/^GitID: //p')
   if [ "$path" = "/usr/local/sbin/criu" ] && [ "$gitid" = "$want_gitid" ]; then
     ok "$node runs patched CRIU $gitid"
+  elif kubectl -n "$NAMESPACE" logs "$p" --tail=20 2>/dev/null | grep -q '^SKIPPED:'; then
+    # The installer refuses to leave a binary the host cannot exec, and an
+    # older glibc than the build is not something a rollout fixes -- it parks
+    # and keeps the distro CRIU. That is the designed outcome on a pool this
+    # image was never built for, so reporting it as a failure trains people to
+    # ignore a check that is otherwise the one thing standing between a
+    # measurement and the wrong binary. Say what happened; do not fail.
+    info "$node deliberately skipped: $(kubectl -n "$NAMESPACE" logs "$p" --tail=20 2>/dev/null | sed -n 's/^SKIPPED: //p' | head -1)"
   else
     bad "$node resolves criu to '${path:-?}' gitid '${gitid:-none}' (want /usr/local/sbin/criu $want_gitid)"
   fi
