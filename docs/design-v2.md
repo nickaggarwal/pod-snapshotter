@@ -297,6 +297,47 @@ to recover it was to read the artifact directory and infer which step had left
 its output behind. `fail()` and `retry()` now go through the same re-read-on-
 conflict helper `complete()` uses.
 
+**A third bug surfaced on the retry, and it is the most instructive of the
+three.** The re-run failed with
+
+```
+open .../qwen2.5-14b-instruct-agent/checkpoint/descriptors.json: operation not permitted
+```
+
+seventeen minutes in, with `descriptors.json` timestamped an hour earlier.
+CRIU will not overwrite an image file it did not create, so a stale one from a
+dead attempt stops the dump — and by the time it does, `runc` has already
+taken the container and there is nothing left to checkpoint a second time.
+
+The cleanup that should have prevented it looked correct: `os.RemoveAll` on
+the image directory, right before the dump, its error checked. It returned
+nil. The directory still held 632 files.
+
+`RemoveAll` tries a plain `Remove` on the path first and returns early when
+that succeeds. On the fuse-client mount an `rmdir` of a *non-empty* directory
+returns 0 without unlinking anything — so the call reported success, never
+recursed, and the `MkdirAll` behind it re-created the same name over a tree
+that was entirely intact. The directory's mtime moved; its contents did not.
+This belongs on the same list as the store's other POSIX departures: rename
+copies without unlinking, `O_TRUNC` is ignored, and mode-on-create fails with
+`No data available`. `Store.Delete` already knew better and goes over the
+fuse-client HTTP API rather than `os.Remove`; the agent trusted the syscall.
+
+The failure mode that did *not* happen is the one worth designing against.
+CRIU appends to image files it finds, so a `pages-*.img` carried over from a
+previous attempt is indistinguishable from a good one once the MANIFEST
+commits on top of it. An EPERM that costs seventeen minutes is the loud
+version; a silently-corrupt 56 GB artifact that restores into a subtly wrong
+process is the quiet one, and nothing downstream would catch it.
+
+So the clear is now verified rather than attempted: unlink the entries one at
+a time, then read the directory back, and treat a non-empty result as a
+failure *before* the dump rather than after. It covers the whole artifact
+directory, not just `checkpoint/` — `dump.log` and `spec.dump` sit at the top
+level, the restore reads the container's mount table back out of them, and the
+old cleanup never touched them at all. **On a filesystem that does not
+implement POSIX faithfully, a return value is not evidence; a read-back is.**
+
 Two smaller decisions fell out of this:
 
 - **Digesting is opt-in and off.** The manifest walk originally hashed every
