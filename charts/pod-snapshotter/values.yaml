@@ -30,7 +30,12 @@ manager:
   # prerequisites ok (annotation podsnapshot.io/prereqs=ok).
   requireNodePrereqs: true
   # fuse-client HTTP API used for artifact existence checks and deletion.
-  fuseAPIEndpoint: "http://fuse-client.fuse-system.svc.cluster.local:8081"
+  # The service is named client-headless, not fuse-client: it is the headless
+  # service in front of the client DaemonSet (selector app=client). The name
+  # matters more than it looks -- a restore's very first act is to HEAD the
+  # MANIFEST through this endpoint, so a wrong host here fails every restore
+  # in Pending with a DNS error and never reaches the checkpoint at all.
+  fuseAPIEndpoint: "http://client-headless.fuse-system.svc.cluster.local:8081"
   resources:
     requests: {cpu: 50m, memory: 128Mi}
     limits: {memory: 512Mi}
@@ -94,7 +99,7 @@ agent:
     # rather than written, tarred, and untarred (design-v2.md §3). It
     # advertises agent-checkpoint in podsnapshot.io/capabilities, which is how
     # the manager knows the node is new enough to route work to.
-    tag: v0.5.1-agentckpt
+    tag: v0.5.2-agentckpt
     pullPolicy: IfNotPresent
   # Where the agent runs. Every linux node by default, not GPU nodes only: the
   # agent also publishes prereq status and serves pre-warm, and a node with no
