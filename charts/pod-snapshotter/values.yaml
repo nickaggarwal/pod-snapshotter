@@ -19,7 +19,10 @@ manager:
     # for checkpointer: agent and the node can honor it, instead of calling
     # the kubelet checkpoint API. Everything else falls back, with the reason
     # in the snapshot's status.
-    tag: v0.3.1-agentckpt
+    # v0.4.0 takes --artifact-root: the scheme+prefix every default artifact
+    # URI hangs off (artifactRoot below). Older managers reject the flag and
+    # crash-loop, so this tag and that value have to move together.
+    tag: v0.4.0-artifactroot
     pullPolicy: IfNotPresent
   replicas: 1
   leaderElect: false
@@ -125,7 +128,10 @@ agent:
     # rather than written, tarred, and untarred (design-v2.md §3). It
     # advertises agent-checkpoint in podsnapshot.io/capabilities, which is how
     # the manager knows the node is new enough to route work to.
-    tag: v0.5.5-nvme
+    # v0.6.0 takes --local-artifact-root: the node-local directory that holds
+    # file:// artifacts, for dump and restore both, and the only place this
+    # agent will touch one. Older agents reject the flag and crash-loop.
+    tag: v0.6.0-artifactroot
     pullPolicy: IfNotPresent
   # Where the agent runs. Every linux node by default, not GPU nodes only: the
   # agent also publishes prereq status and serves pre-warm, and a node with no

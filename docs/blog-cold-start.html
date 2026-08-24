@@ -554,7 +554,7 @@ footer {
   <div class="col">
     <div class="stage-head">
       <span class="stage-num">02</span>
-      <h2>Ship a directory, not a tarball</h2>
+      <h2>Ship a directory, not a tarball — and put it on the right disk</h2>
     </div>
     <p>
       <code>runc restore --image-path</code> takes a directory. We were handing it one —
@@ -610,6 +610,99 @@ footer {
       reaches its own NVMe figure only by pushing the difference onto the OS disk, four
       times over.
     </p>
+    <h3>Then we ran the arm we had been assuming</h3>
+    <p>
+      Everything above is the write side. We had been quietly carrying an assumption into
+      the read side too — that shipping a directory instead of a tar would make restores
+      faster, for the obvious reason that there is no longer an untar in front of them.
+      It was time to stop assuming, so we ran the full cross: two dump paths × two
+      storage tiers, four builds of the same 56&nbsp;GB model on the same node, then
+      restored three of them from a cold page cache.
+    </p>
+
+    <div class="tablewrap">
+      <table>
+        <caption>Snapshot — time to a published artifact, same node, same 56 GB Qwen2.5-14B</caption>
+        <thead>
+          <tr><th>Storage</th><th>Dump path</th><th class="num">Quiesce&nbsp;→&nbsp;ckpt</th><th class="num">Checkpointing</th><th class="num">Publish</th><th class="num">Total</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>FUSE mount</td><td>kubelet + tar</td><td class="num dim">—</td><td class="num dim">—</td><td class="num dim">—</td><td class="num">3364 s</td></tr>
+          <tr><td>FUSE mount</td><td>agent direct</td><td class="num">220 s</td><td class="num">1205 s</td><td class="num">none</td><td class="num">1425 s</td></tr>
+          <tr><td>node NVMe</td><td>kubelet + tar</td><td class="num">209 s</td><td class="num">914 s</td><td class="num">156 s</td><td class="num">1279 s</td></tr>
+          <tr class="hi"><td>node NVMe</td><td>agent direct</td><td class="num">231 s</td><td class="num">66 s</td><td class="num">none</td><td class="num">297 s</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="tablewrap">
+      <table>
+        <caption>Restore — cold page cache, dropped before the clock starts, verified by generation</caption>
+        <thead>
+          <tr><th>Artifact came from</th><th class="num">Pre-warm</th><th class="num">CRIU done</th><th class="num">Serving</th><th class="num">nvme read / write</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>FUSE · kubelet + tar</td><td class="num">153 s</td><td class="num">339 s</td><td class="num">344 s</td><td class="num">103.4 / 48.0 GB</td></tr>
+          <tr><td>NVMe · kubelet + tar</td><td class="num">3 s</td><td class="num">40 s</td><td class="num">43 s</td><td class="num">56.4 / 0.0 GB</td></tr>
+          <tr class="hi"><td>NVMe · agent direct</td><td class="num">2 s</td><td class="num">37 s</td><td class="num">42 s</td><td class="num">56.5 / 0.0 GB</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p>
+      <strong>On the restore, the tar contributes nothing.</strong> 43&nbsp;s against
+      42&nbsp;s is noise. That is not a disappointing result, it is an obvious one in
+      hindsight: by restore time the two artifacts <em>are the same thing</em>. Both are
+      ~56&nbsp;GB of CRIU images sitting in a directory. Whether a tar existed an hour
+      earlier on the write side leaves no trace on the read side, because we untar at
+      publish, not at restore. What actually separates those rows from the first one is
+      the storage tier, and that is worth <strong>8.0×</strong>.
+    </p>
+    <div class="note">
+      <span class="note-lab">How this squares with the 677 s at the top</span>
+      It does not contradict it — it is a later slice through the same system. Every row
+      in these two tables runs the <em>finished</em> stack: patched CRIU, no staging copy,
+      prefetch at 4. So the 344&nbsp;s FUSE row is not the old baseline, it is what
+      today's restore costs when the artifact happens to live on the mount. The
+      677&nbsp;s number is the honest starting point of the whole project; the
+      344&nbsp;s number is the price of one remaining decision.
+    </div>
+    <p>
+      The I/O column says why in one line. The FUSE row reads
+      <strong>103.4&nbsp;GB to restore a 56&nbsp;GB artifact, and writes 48.0&nbsp;GB
+      doing it</strong> — pre-warm pulling the artifact down onto the local tier, then
+      reading it back off. The two NVMe rows read 56.5&nbsp;GB and write nothing:
+      amplification exactly 1.0, the same floor the write side hit.
+    </p>
+    <p>
+      <strong>On the snapshot, both matter, and they compound.</strong> Holding storage
+      fixed, the tar costs 982&nbsp;s. Holding the dump path fixed, the network
+      filesystem costs 1128&nbsp;s. Together they are the difference between 3364&nbsp;s
+      and 297&nbsp;s — <strong>11.3×</strong> on the same node, the same model, the same
+      afternoon.
+    </p>
+    <p>
+      And within the tar's 982&nbsp;s, the split is not where we would have guessed. CRIU
+      logs its own duration, so we can subtract it: the kubelet arm's 914&nbsp;s
+      Checkpointing phase contains 121&nbsp;s of actual CRIU and about
+      <strong>793&nbsp;s of writing the archive</strong> — <code>sda</code> holding
+      ~250&nbsp;MB/s for the better part of fifteen minutes, 201.2&nbsp;GB of it. The
+      expand that follows is only 156&nbsp;s, and it reads <em>0.0&nbsp;GB</em> from
+      <code>sda</code> because the tar it is expanding is still entirely in page cache.
+      So of the archive's total cost, roughly 81% is creating it and 16% is reading it
+      back. We had spent our attention on the untar. The untar was the cheap half.
+    </p>
+    <div class="note">
+      <span class="note-lab">One more thing that was not CRIU</span>
+      CRIU itself is slower in the kubelet arm — 121&nbsp;s against 68&nbsp;s — and it is
+      the same binary with the same flags in both. The kubelet checkpoint API writes to
+      <code>/var/lib/kubelet</code>, which is on the OS disk; the agent points
+      <code>--image-path</code> at the NVMe. A 1.8× difference in "CRIU time" that is
+      entirely a choice of device. If you take one thing from this section, take that
+      every number here was a property of where the bytes were going, not of the software
+      moving them.
+    </div>
+
     <div class="note">
       <span class="note-lab">One number that moved, and why</span>
       An earlier run of the same build measured 83.8&nbsp;GB on that NVMe write row. The
@@ -631,9 +724,18 @@ footer {
       <code>os.RemoveAll</code> report success over a tree it never touched: it tries a
       plain <code>Remove</code> first and returns early when that "succeeds". We found
       that one seventeen minutes into a 56&nbsp;GB dump, when CRIU refused to overwrite a
-      <code>descriptors.json</code> an hour older than the run. An artifact store is not a
-      POSIX filesystem just because it is mounted like one — and on one that isn't, a
-      return value is not evidence. Read it back.
+      <code>descriptors.json</code> an hour older than the run.
+      <br><br>
+      The worst one is the quietest. Three separate dumps of the same build died at
+      publish on the same file, at the same size, every time:
+      <code>files.img does not start with the CRIU image magic (got 0x00000000)</code>.
+      The store had accepted that write, reported success, and served back a
+      correctly-sized run of zeros. No length check can see that, which is why we verify
+      a content invariant — the four-byte CRIU magic — on every image before publishing,
+      and why the fastest fix for losing writes to a layer turned out to be removing the
+      layer from the path.
+      An artifact store is not a POSIX filesystem just because it is mounted like one —
+      and on one that isn't, a return value is not evidence. Read it back.
     </div>
   </div>
 </section>
@@ -885,6 +987,11 @@ nvme0n1      0 B/s     <span class="cmt">← the 894 GB local NVMe</span></code>
       <li><span class="n">06</span><span class="t"><strong>Audit constants that were right once.</strong>
         <span>Prefetch was pinned at 2 to dodge an OOM. The OOM was real. The ceiling
         outlived the reason, and nobody re-derived it.</span></span></li>
+      <li><span class="n">07</span><span class="t"><strong>Change one variable, even when two arrived together.</strong>
+        <span>"Skip the tar" and "write to NVMe" shipped in the same change, so for weeks
+        we had one number and two explanations for it. Running the full cross took an
+        afternoon and inverted the answer: on the restore side the tar is worth 1.0× and
+        the storage tier is worth 8.0×. We had been crediting the wrong one.</span></span></li>
     </ol>
   </div>
 </section>
