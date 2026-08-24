@@ -158,8 +158,18 @@ func (r *CheckpointReconciler) checkpoint(ctx context.Context, snap *snapv1.PodS
 	// A retry must not inherit a half-written tree: CRIU appends to whatever
 	// image files it finds, and a stale pages-*.img from a failed dump is
 	// indistinguishable from a good one once the MANIFEST is written.
-	if err := os.RemoveAll(imageDir); err != nil {
-		return ctrl.Result{}, err
+	//
+	// The whole artifact directory goes, not just checkpoint/. dump.log and
+	// spec.dump sit at the top level and are read back by the restore to
+	// rebuild the mount table; a pair left over from a previous attempt
+	// describes a container that no longer matches the images beside it.
+	//
+	// This has to be verified rather than attempted -- see clearArtifactDir.
+	// Failing here is cheap; failing after the dump is not, because by then
+	// runc has already taken the container and there is nothing left to
+	// checkpoint a second time.
+	if err := clearArtifactDir(dstDir); err != nil {
+		return r.fail(ctx, snap, fmt.Sprintf("clearing the artifact directory before the dump: %v", err))
 	}
 	if err := os.RemoveAll(workDir); err != nil {
 		return ctrl.Result{}, err
@@ -451,4 +461,69 @@ func (r *CheckpointReconciler) owns(snap *snapv1.PodSnapshot) bool {
 		snap.Status.Phase == snapv1.SnapshotPhaseCheckpointing &&
 		snap.Spec.Checkpointer == snapv1.CheckpointerAgent &&
 		snap.Status.Artifact != nil && snap.Status.Artifact.URI != ""
+}
+
+// clearArtifactDir empties a previous attempt out of the artifact directory,
+// and — the part that matters — checks that it actually happened.
+//
+// os.RemoveAll is not trustworthy here. It tries a plain Remove on the path
+// first and returns early when that succeeds, and on the fuse-client mount an
+// rmdir of a non-empty directory returns 0 without unlinking anything. So
+// RemoveAll reports success, never recurses, and the MkdirAll behind it
+// re-creates the same name over a tree that is still fully populated. The
+// directory's mtime moves; its 632 files do not.
+//
+// What that costs is not a wasted retry. CRIU refuses to overwrite an image
+// file it did not create, so the second dump dies on `descriptors.json:
+// operation not permitted` — seventeen minutes and a 56 GB engine after the
+// container was already taken, with the real reason (a stale file from an
+// hour ago) nowhere in the error. Worse is the case where it does not fail:
+// CRIU appends to the image files it finds, and a pages-*.img carried over
+// from a dead run is indistinguishable from a good one once the MANIFEST
+// commits on top of it.
+//
+// So: walk the entries and unlink them one at a time, then read the directory
+// back. An empty read is the only evidence the clear worked; anything else is
+// reported as the failure it is, before the dump rather than after.
+func clearArtifactDir(dir string) error {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("reading %s to clear it: %w", dir, err)
+	}
+	for _, e := range entries {
+		p := filepath.Join(dir, e.Name())
+		if e.IsDir() {
+			if err := clearArtifactDir(p); err != nil {
+				return err
+			}
+		}
+		if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("removing %s: %w", p, err)
+		}
+	}
+
+	// Trust the read, not the return values above.
+	left, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("re-reading %s after clearing it: %w", dir, err)
+	}
+	if len(left) > 0 {
+		names := make([]string, 0, 3)
+		for _, e := range left[:min(3, len(left))] {
+			names = append(names, e.Name())
+		}
+		return fmt.Errorf(
+			"%s still holds %d file(s) after removing them (%s): the artifact store "+
+				"reported the deletes as successful without performing them, and a dump "+
+				"into this directory would either fail on the first file CRIU cannot "+
+				"overwrite or silently append to a previous attempt's images",
+			dir, len(left), strings.Join(names, ", "))
+	}
+	return nil
 }

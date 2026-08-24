@@ -6,6 +6,7 @@ import (
 	"github.com/go-logr/logr"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -233,5 +234,86 @@ func TestPublishSurvivesADiffSourceThatVanished(t *testing.T) {
 	// artifact is whole.
 	if _, err := artifact.ReadManifestDir(dst); err != nil {
 		t.Fatalf("no committed manifest after publish: %v", err)
+	}
+}
+
+// The artifact store lies about deletion. An rmdir of a non-empty directory
+// returns 0 there without unlinking anything, which is enough to make
+// os.RemoveAll report success while leaving the whole tree in place -- it
+// tries a plain Remove first and returns early when that "succeeds".
+//
+// A dump that starts on top of a previous attempt's images either dies on the
+// first file CRIU will not overwrite (descriptors.json: operation not
+// permitted, seventeen minutes after the container was already taken) or,
+// worse, appends to a stale pages-*.img and commits a MANIFEST over it. So
+// the clear has to be checked, not attempted.
+func TestClearArtifactDirRemovesAPreviousAttempt(t *testing.T) {
+	dir := t.TempDir()
+	ckpt := filepath.Join(dir, "checkpoint")
+	if err := os.MkdirAll(ckpt, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// What was actually found in the artifact directory after the failure:
+	// images and descriptors.json underneath, and the top-level pair that the
+	// old cleanup never touched at all.
+	for _, f := range []string{
+		"checkpoint/descriptors.json",
+		"checkpoint/inventory.img",
+		"checkpoint/pages-1.img",
+		"dump.log",
+		"spec.dump",
+		"config.dump",
+	} {
+		if err := os.WriteFile(filepath.Join(dir, f), []byte("stale"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if err := clearArtifactDir(dir); err != nil {
+		t.Fatalf("clearing a directory holding a previous attempt: %v", err)
+	}
+
+	left, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(left) != 0 {
+		var names []string
+		for _, e := range left {
+			names = append(names, e.Name())
+		}
+		t.Fatalf("previous attempt survived the clear: %v", names)
+	}
+}
+
+// Nothing to clear is not an error: the first dump of a new revision starts
+// on a path that does not exist yet.
+func TestClearArtifactDirOnAPathThatIsNotThere(t *testing.T) {
+	if err := clearArtifactDir(filepath.Join(t.TempDir(), "never-created")); err != nil {
+		t.Fatalf("a missing directory should clear trivially: %v", err)
+	}
+}
+
+// The case the check exists for. If the files are still readable back after
+// being removed, the caller has to hear about it before the dump rather than
+// after -- a clear that silently did nothing is exactly what produced the
+// descriptors.json failure.
+func TestClearArtifactDirReportsAStoreThatDidNotDelete(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "pages-1.img"), []byte("stale"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Deny the unlink the way the mount does: the entry stays readable.
+	if err := os.Chmod(dir, 0o555); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o755) })
+
+	err := clearArtifactDir(dir)
+	if err == nil {
+		t.Fatal("reported a successful clear over files that are still there")
+	}
+	if !strings.Contains(err.Error(), "pages-1.img") {
+		t.Fatalf("the error does not name what survived: %v", err)
 	}
 }
