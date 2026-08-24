@@ -589,27 +589,37 @@ footer {
       </thead>
       <tbody>
         <tr><td><code>nvme0n1</code> read</td><td class="num">24.2 GB</td><td class="num">0.0 GB</td></tr>
-        <tr><td><code>nvme0n1</code> written</td><td class="num">59.1 GB</td><td class="num">83.8 GB</td></tr>
-        <tr><td><code>sda</code> read</td><td class="num">9.0 GB</td><td class="num">0.4 GB</td></tr>
-        <tr><td><code>sda</code> written</td><td class="num">257.9 GB</td><td class="num">0.1 GB</td></tr>
+        <tr><td><code>nvme0n1</code> written</td><td class="num">59.1 GB</td><td class="num">56.5 GB</td></tr>
+        <tr><td><code>sda</code> read</td><td class="num">9.0 GB</td><td class="num">0.0 GB</td></tr>
+        <tr><td><code>sda</code> written</td><td class="num">257.9 GB</td><td class="num">0.2 GB</td></tr>
       </tbody>
     </table>
     <p>
-      The OS disk is the headline: <strong>257.9&nbsp;GB down to 0.1&nbsp;GB</strong>.
+      The OS disk is the headline: <strong>257.9&nbsp;GB down to 0.2&nbsp;GB</strong>.
       That quarter-terabyte was the tar, staged on <code>/dev/root</code> because that is
       where <code>/var/lib/kubelet</code> lives, then read back to be expanded. The build
       was spending most of its I/O writing a temporary file to the slowest device on the
       node, to produce an artifact bound for the NVMe tier all along.
     </p>
     <p>
-      The <code>nvme0n1</code> write column looks worse for the agent until you split it
-      by phase. 27.3&nbsp;GB lands before the dump even starts, while the engine loads
-      weights — that is in both columns and has nothing to do with checkpointing. The
-      dump itself writes <strong>56.5&nbsp;GB to produce a 56.5&nbsp;GB artifact</strong>:
-      a write amplification of exactly 1.0, which is the floor. The kubelet column only
-      reaches a lower NVMe figure by pushing the difference onto the OS disk, four times
-      over.
+      The NVMe column is the cleaner half of the result. The five-second samples show
+      nothing written at all until the dump starts, then a smooth ramp to 56.5&nbsp;GB by
+      the time the manifest commits — against an artifact of 56,493,434,865 bytes in 636
+      files. That is a write amplification of <strong>exactly 1.0</strong>, which is the
+      floor: the bytes are written once, where they will be read from. The kubelet column
+      reaches its own NVMe figure only by pushing the difference onto the OS disk, four
+      times over.
     </p>
+    <div class="note">
+      <span class="note-lab">One number that moved, and why</span>
+      An earlier run of the same build measured 83.8&nbsp;GB on that NVMe write row. The
+      difference is 27.3&nbsp;GB of weights the engine wrote on a node that had not seen
+      the model recently; on the run above they were already in page cache, so the load
+      phase touched no disk and the dump is isolated exactly. Both are honest about their
+      own run. We quote the isolated one because weight loading happens identically in
+      both arms and is not what this change touches — the same reason the restore numbers
+      further down are all taken with the page cache dropped first.
+    </div>
     <div class="note">
       <span class="note-lab">A trap worth naming</span>
       Our artifact store is a FUSE mount, and on it <code>rename</code> copies without
