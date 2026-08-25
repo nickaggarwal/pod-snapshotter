@@ -93,6 +93,31 @@ say "arm 2 of 2 -- stock CRIU 4.2.1"
 say "result -- same artifact, same node, same transport, cold both times"
 for a in patched stock; do
   f="/tmp/criu-control-$a/summary.txt"
-  printf '  %-8s %s\n' "$a" "$(grep 'restored' "$f" 2>/dev/null || echo '(no result)')"
-  printf '  %-8s %s\n' "" "$(grep 'serving' "$f" 2>/dev/null || true)"
+  echo "  $a:"
+  grep -E 'restored|serving|CRIU proper' "$f" 2>/dev/null | sed 's/^/    /' || echo "    (no result)"
 done
+
+# The wall clock and CRIU's own clock answer different questions and only the
+# second one is attributable to the binary. Everything outside restore.log --
+# image pull, sandbox setup, prewarm, the engine re-taking its KV cache -- is
+# identical across the arms by construction, so a delta in the wall clock that
+# is not also in CRIU's clock is noise in the harness, not a property of the
+# patches. Print both deltas; a claim about the fork rests on the second.
+say "delta -- what the patches are worth"
+python3 - "$@" <<'EOF'
+import re, sys
+def read(a):
+    try: t = open(f"/tmp/criu-control-{a}/summary.txt").read()
+    except OSError: return {}
+    g = lambda p: (lambda m: float(m.group(1)) if m else None)(re.search(p, t))
+    return {"wall": g(r'serving .*in (\d+)s'),
+            "criu": g(r'CRIU proper \(restore.log\) ([\d.]+)s')}
+p, s = read("patched"), read("stock")
+for k, label in (("criu", "CRIU proper "), ("wall", "wall to serving")):
+    a, b = p.get(k), s.get(k)
+    if a and b:
+        print(f"  {label}  patched {a:8.1f}s   stock {b:8.1f}s   "
+              f"{b - a:+.1f}s  ({b / a:.2f}x)")
+    else:
+        print(f"  {label}  incomplete (patched={a}, stock={b})")
+EOF

@@ -1157,6 +1157,65 @@ fifth of a restore whose GPU half is fixed, and §7 is the only lever left that
 touches the other four fifths — which is the same conclusion §6c reached, from
 the other direction.
 
+### 6e. The control: stock CRIU on the finished transport
+
+Every restore number above this line was taken on the fork, which makes them
+measurements of *our stack* rather than of the patches. The transport work
+underneath — deleting the staging copy, bypassing the mount, prefetch at 4 —
+moved more time than the patches did, and it moved it for both binaries. So
+"the fork is worth 225 s" was an attribution, not a result.
+
+Run 2026-08-25 on `aks-gpuckpt-13588264-vmss00000g`: the same
+`qwen2.5-14b-instruct-kubenvme` artifact, restored twice, `drop_caches` before
+each arm, reverting between them via `criu.uninstall=true` so the node falls
+back to its distro package — which on these hosts is CRIU **4.2.1**, the exact
+upstream base the fork is built from. Nothing else changed.
+
+| | CRIU proper | wall to serving | nvme0n1 read | effective |
+|---|---|---|---|---|
+| patched (fork `6c683e4`) | **35.9 s** | 43 s | 56.4 GB | 1.31 GB/s |
+| stock CRIU 4.2.1 | 72.6 s | 79 s | 56.4 GB | 0.71 GB/s |
+| | **2.02×** | 1.84× | identical | |
+
+**The wall clock and CRIU's clock agree, which is the check that matters.**
+CRIU's own log accounts for 36.7 s of a 36 s wall-clock delta. Everything
+outside `restore.log` — image pull, sandbox setup, prewarm, the engine
+re-taking its KV cache — is identical across the arms by construction, so had
+the wall delta exceeded CRIU's, the difference would have been harness noise
+rather than a property of the binary. It did not.
+
+**One phase moved, and it is the phase the patches are about.** From the logs,
+the memfd inode restore:
+
+| | memfd phase | rest of restore |
+|---|---|---|
+| patched | 205 inodes on 8 threads, **0.003 s** wide | 16.0 s |
+| stock | 205 inodes, one at a time, **56.8 s** wide | 15.6 s |
+
+The tail after the last inode is 16.0 s vs 15.6 s — the same work, within
+noise, as it should be: those patches do not touch it. The entire 36.7 s
+difference is one serial loop becoming eight parallel ones. This is a cleaner
+attribution than we expected; there is no second effect hiding in the total.
+
+**Read bandwidth is the same story from the device's side.** Both arms read
+exactly 56.4 GB off `nvme0n1` — the patches do not read less, they read the
+same bytes while the device is kept busy. Stock CRIU issues one read, waits,
+issues the next; the disk idles between them. At 0.71 GB/s the stock arm is
+leaving most of an NVMe drive unused.
+
+**What this revises.** The §8 estimate credited the fork with 225 s of the
+637 s removed (35%) and transport with 412 s (65%). The controlled figure is
+36.7 s on a restore that now takes 43 s end-to-end. Both are true of different
+baselines: 225 s was measured when a serial memfd loop ran against a slow
+transport, so removing the serialization removed slow reads; 36.7 s is what
+the same change is worth once the transport is fast. That is the honest
+statement of it — **the patches are worth 2× on the finished stack, and were
+worth more before the transport was fixed because there was more to waste.**
+The earlier note that the error direction flattered the patches was right in
+sign: 35% was too generous for the stack as it now stands.
+
+---
+
 ### Against the blog
 
 The blog's table is *CRIU restore only*, so the honest comparison is against
@@ -1230,7 +1289,7 @@ distributed cache is good at.
 | 5 | Fork CRIU only if §4 measured short (§6b) | **done** — [nickaggarwal/criu](https://github.com/nickaggarwal/criu), branch `pod-snapshotter/v4.2.1-restore-parallelism` |
 | 6 | Put the memfd bytes on the AIO path (§6d) | **done** — fork commits `4377264`+`6c683e4`, image `v4.2.1-ps5`, live on both GPU nodes. CF-8/9/10/11 measured 2026-08-22: read path 21.4 s → 19.4 s cold, `O_DIRECT` 12575/12575, and the unbounded-chunk control gives the win back (22.0 s). Smaller than predicted; §6d says why |
 | 7 | Selectable storage tier, agent dump by default (§3b) | **done** — `manager.artifactRoot` / `agent.localArtifactRoot`, `checkpointer: agent` + `artifactFormat: dir` as CRD defaults. Four-arm measurement 2026-08-24: snapshot 3364 s → 297 s (11.3×), restore 344 s → 42 s (8.0×). Deployed as manager `v0.4.0-artifactroot` / agent `v0.6.0-artifactroot`; `hack/deploy.sh` verifies clean |
-| — | Stock-CRIU control for §6 (`hack/measure-criu-control.sh`) | **not run** — every restore figure in §6 was taken on the fork, so "the fork is worth 225 s" is an attribution rather than a controlled result. The script restores one artifact twice on the same node and transport, reverting via `criu.uninstall` in between. Needs a free GPU |
+| — | Stock-CRIU control for §6 (`hack/measure-criu-control.sh`) | **done** — run 2026-08-25 on `…vmss00000g`. Same artifact, same transport, cold both arms: CRIU-proper 35.9 s patched vs 72.6 s stock, **2.02×**. §6e |
 
 ### Benchmark table to fill in
 

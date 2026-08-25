@@ -960,9 +960,10 @@ nvme0n1      0 B/s     <span class="cmt">← the 894 GB local NVMe</span></code>
     <h2>If you are doing this yourself</h2>
     <p>
       The generalizable lesson is not any particular patch. It is that we spent weeks on
-      kernel work worth 35% of the win while two configuration flags worth 65% sat
-      undiagnosed, and only found them by instrumenting per-device throughput. In order
-      of expected value:
+      kernel work worth at most 35% of the win — and, once we finally ran the control,
+      closer to 2× on a 17× total — while two configuration flags worth the larger share
+      sat undiagnosed, and only found them by instrumenting per-device throughput. In
+      order of expected value:
     </p>
 
     <ol class="check">
@@ -992,6 +993,13 @@ nvme0n1      0 B/s     <span class="cmt">← the 894 GB local NVMe</span></code>
         we had one number and two explanations for it. Running the full cross took an
         afternoon and inverted the answer: on the restore side the tar is worth 1.0× and
         the storage tier is worth 8.0×. We had been crediting the wrong one.</span></span></li>
+      <li><span class="n">08</span><span class="t"><strong>Run the control before you publish the attribution.</strong>
+        <span>We shipped a forked CRIU and quoted what it was worth for weeks without ever
+        having restored the same artifact on the stock binary. When we finally did it took
+        four minutes, and it moved the number by more than half. If your optimization is a
+        drop-in replacement for something, the unpatched arm is the cheapest measurement
+        available to you — and the one you are least likely to run, because by then you
+        already believe the answer.</span></span></li>
     </ol>
   </div>
 </section>
@@ -1028,17 +1036,84 @@ nvme0n1      0 B/s     <span class="cmt">← the 894 GB local NVMe</span></code>
       end-to-end, they are still ahead, and we know exactly which component accounts for
       it.
     </p>
+    <h3>The control we owed</h3>
+    <p>
+      Every restore figure above was measured on our patched CRIU, which made "the fork is
+      worth 225&nbsp;s" an attribution rather than a result. The transport work underneath
+      moved more time than the patches did, and it moved it for both binaries. So we ran
+      the arm that separates them: the same artifact, the same node, the same transport,
+      cold both times, with the patched binary swapped out for the host's distro package
+      in between — which on these machines is CRIU&nbsp;4.2.1, the exact upstream base our
+      fork is built from.
+    </p>
+
+    <div class="tablewrap">
+      <table>
+        <caption>Same 56 GB artifact restored twice, cold page cache, only the CRIU binary differs</caption>
+        <thead>
+          <tr><th>CRIU</th><th class="num">CRIU proper</th><th class="num">Wall to serving</th><th class="num">Read from NVMe</th><th class="num">Effective</th></tr>
+        </thead>
+        <tbody>
+          <tr class="hi"><td>patched (our fork)</td><td class="num">35.9 s</td><td class="num">43 s</td><td class="num">56.4 GB</td><td class="num">1.31 GB/s</td></tr>
+          <tr><td>stock 4.2.1</td><td class="num">72.6 s</td><td class="num">79 s</td><td class="num">56.4 GB</td><td class="num">0.71 GB/s</td></tr>
+          <tr><td><strong>difference</strong></td><td class="num"><strong>2.02×</strong></td><td class="num">1.84×</td><td class="num dim">identical</td><td class="num">1.84×</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p>
+      <strong>The two clocks agree, which is the check that matters.</strong> CRIU's own log
+      accounts for 36.7&nbsp;s of a 36&nbsp;s wall-clock gap. Everything outside that log —
+      image pull, sandbox setup, prefetch, the engine re-taking its KV cache — is identical
+      across the two arms by construction. Had the wall gap been larger than CRIU's, the
+      excess would have been noise in our harness rather than a property of the binary.
+      It was not.
+    </p>
+
+    <p>
+      <strong>And exactly one phase moved.</strong> The logs are specific about which: both
+      arms restore 205 memfd inodes, and the patched binary spreads them over eight threads
+      while stock does them one at a time.
+    </p>
+
+    <div class="tablewrap">
+      <table>
+        <caption>Where the 36.7 s lives</caption>
+        <thead>
+          <tr><th>CRIU</th><th>memfd inode restore</th><th class="num">Phase width</th><th class="num">Everything after it</th></tr>
+        </thead>
+        <tbody>
+          <tr class="hi"><td>patched</td><td>205 inodes, 8 threads</td><td class="num">0.003 s</td><td class="num">16.0 s</td></tr>
+          <tr><td>stock</td><td>205 inodes, serial</td><td class="num">56.8 s</td><td class="num">15.6 s</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p>
+      The tail after the last inode is 16.0&nbsp;s against 15.6&nbsp;s — the same work within
+      noise, as it should be, because those patches do not touch it. The whole difference is
+      one serial loop becoming eight parallel ones. We expected to spend a paragraph
+      untangling several overlapping effects and there was only ever one.
+    </p>
+
+    <p>
+      The device tells the same story from the other side. Both arms read exactly
+      56.4&nbsp;GB off the NVMe drive: the patches do not read <em>less</em>, they read the
+      same bytes while keeping the disk busy. Stock CRIU issues a read, waits for it, issues
+      the next; at 0.71&nbsp;GB/s most of an NVMe drive sits idle waiting to be asked.
+    </p>
+
     <div class="note">
-      <span class="note-lab">The control we still owe</span>
-      Every restore figure on this page was measured on the patched CRIU. That makes
-      "the fork is worth 225&nbsp;s" an attribution rather than a controlled result — the
-      transport work underneath moved more time than the patches did, and it moved it for
-      both binaries. The missing arm is the same artifact restored on the same node and
-      the same transport with stock CRIU 4.2.1, which the distro package on these hosts
-      happens to be exactly. We have the harness for it and have not run it, because both
-      GPUs in the pool are occupied. Until we do, treat the 35/65 split between patches
-      and configuration as our best estimate rather than a measurement — and note that
-      the direction of any error makes the patches look better than they were, not worse.
+      <span class="note-lab">What this revises</span>
+      Earlier on this page we credited the fork with 225&nbsp;s of the 637&nbsp;s removed —
+      35%, against 65% for configuration — and flagged that the error probably flattered the
+      patches. It did. The controlled figure is 36.7&nbsp;s on a restore that now finishes in
+      43. Both numbers are true of different baselines: 225&nbsp;s was measured when a serial
+      memfd loop ran against a slow transport, so removing the serialization also removed a
+      lot of slow reading. 36.7&nbsp;s is what the same patches are worth once the transport
+      underneath them is fast. The honest version is that <strong>the fork is a 2× on the
+      finished stack, and was worth more before the transport was fixed because there was
+      more waste to hide in.</strong>
     </div>
   </div>
 </section>

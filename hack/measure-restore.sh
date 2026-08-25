@@ -105,12 +105,38 @@ while :; do
   sleep "$INTERVAL"
 done
 
+# Copy CRIU's own log off the node NOW, in the same iteration that produced it.
+# The agent GCs the whole work dir when the PodRestore is deleted, and this
+# script deletes before it creates -- so the next run of any sweep destroys the
+# previous run's log. Without this the wall clock survives and the "Restoring
+# finished successfully" line, which is the only number that isolates CRIU from
+# everything around it, does not.
+UID_=$(kubectl -n "$NS" get podrestore "$NAME" -o jsonpath='{.metadata.uid}' 2>/dev/null || true)
+if [ -n "$UID_" ]; then
+  for f in criu-work/restore.log criu-work/runc-restore.log; do
+    kubectl -n "$AGENT_NS" exec "$AGENT" -- \
+      cat "/var/lib/pod-snapshotter/restores/$UID_/$f" \
+      > "$OUT/$(basename "$f")" 2>/dev/null || rm -f "$OUT/$(basename "$f")"
+  done
+fi
+
+# CRIU stamps every line with seconds since it started, so the last line is its
+# own elapsed time -- independent of image pull, sandbox setup, prewarm, and the
+# engine's post-restore warmup, all of which sit inside the wall clock.
+criu_secs() {
+  [ -s "$OUT/restore.log" ] || return 0
+  # "Restore finished successfully", not "Restoring" -- CRIU's own wording, and
+  # the last stamped line before it hands control back.
+  sed -n 's/^(\([0-9.]*\)).*Restore finished successfully.*/\1/p' "$OUT/restore.log" | tail -1
+}
+
 {
   echo "restore: $NAME  ($MANIFEST)"
   echo "node:    $NODE"
   echo "ended:   $(date -u +%Y-%m-%dT%H:%M:%SZ)"
   [ -n "$RUNNING_AT" ] && echo "restored (CRIU done) in ${RUNNING_AT}s from a cold page cache"
   [ -n "$READY_AT" ] && echo "serving (/health ok)  in ${READY_AT}s from a cold page cache"
+  cs=$(criu_secs); [ -n "$cs" ] && echo "CRIU proper (restore.log) ${cs}s"
   echo
   echo "phases (t seconds from create):"
   cat "$OUT/phases.tsv"
