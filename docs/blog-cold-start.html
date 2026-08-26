@@ -1,4 +1,4 @@
-<title>The 39-Second Restore</title>
+<title>Snapshot and Restore, Measured</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wght@500;600;700;800&family=Newsreader:opsz,wght@6..72,300;6..72,400;6..72,500&family=IBM+Plex+Mono:wght@400;500;600&display=swap">
@@ -147,7 +147,10 @@ h1 {
   letter-spacing: .1em;
   text-transform: uppercase;
   color: var(--ink-faint);
+  line-height: 1.5;  /* these labels wrap to a second line carrying the figures */
 }
+/* the two multiplier items are the same rank; the seconds figure is the payoff */
+.bignum-item:not(.after) .bignum-val { color: var(--ink); }
 .bignum-arrow {
   font-family: var(--f-display);
   font-size: clamp(1.6rem, 4vw, 2.8rem);
@@ -202,8 +205,10 @@ ul, ol { margin: 0 0 1.15rem; padding-left: 1.3rem; }
 li { margin-bottom: .5rem; }
 li::marker { color: var(--ink-faint); }
 
-/* stage number rides the section head, and the sequence is real:
-   each benchmark row below depends on the one above it */
+/* stage number rides the section head, and the sequence is real: each benchmark
+   row depends on the one before it. Stages 01-02 are the snapshot half and
+   03-04 the restore half, which is why the numbering runs across both parts
+   rather than restarting -- the four are one chain, not two lists of two. */
 .stage-head { display: flex; gap: 1.1rem; align-items: baseline; margin-bottom: 1.4rem; }
 .stage-num {
   font-family: var(--f-mono);
@@ -300,6 +305,40 @@ tr.hi td { background: var(--measured-bg); color: var(--measured); font-weight: 
 tr.hi td:first-child { color: var(--measured); }
 td.dim { color: var(--ink-faint); }
 
+/* ---------- part dividers ----------
+   The four stages are two pairs, and which pair a change belongs to is the
+   thing readers most often get wrong about this work: a tar removed on the
+   write side is not a tar removed on the read side. The divider makes the
+   halves structural rather than something the prose has to keep asserting. */
+
+.part {
+  padding: clamp(2.4rem, 6vw, 4rem) 0 clamp(1.4rem, 3vw, 2rem);
+  border-bottom: 1px solid var(--rule);
+}
+.part-lab {
+  font-family: var(--f-mono);
+  font-size: var(--step--1);
+  font-weight: 600;
+  letter-spacing: .14em;
+  text-transform: uppercase;
+  color: var(--measured);
+  margin: 0 0 .8rem;
+}
+.part h2 {
+  font-size: var(--step-3);
+  font-weight: 800;
+  letter-spacing: -.028em;
+  margin: 0 0 1rem;
+  max-width: 18ch;
+}
+.part p { color: var(--ink-soft); max-width: var(--measure); }
+.part-num {
+  font-family: var(--f-mono);
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+  color: var(--ink);
+}
+
 /* ---------- callouts ---------- */
 
 .note {
@@ -389,25 +428,25 @@ footer {
     </p>
     <h1>How we cut GPU cold start from 11 minutes to 39 seconds</h1>
     <p class="standfirst">
-      Restoring a 52&nbsp;GiB checkpointed vLLM engine used to take <strong>677 seconds</strong>.
-      It now takes <strong>39</strong>. Two thirds of that came from configuration
-      mistakes, not from the kernel patches we set out to write — and the patches
-      themselves delivered about a ninth of what we predicted.
+      A snapshot of a 56&nbsp;GB vLLM engine used to take <strong>56 minutes</strong> to
+      publish and <strong>677 seconds</strong> to restore. It now takes <strong>5
+      minutes</strong> and <strong>39 seconds</strong>. Most of that came from
+      configuration mistakes, not from the kernel patches we set out to write — and the
+      patches themselves delivered about a ninth of what we predicted.
     </p>
 
     <div class="bignum">
-      <div class="bignum-item before">
-        <div class="bignum-val">677<span style="font-size:.4em;letter-spacing:0"> s</span></div>
-        <div class="bignum-lab">Baseline</div>
-      </div>
-      <div class="bignum-arrow" aria-hidden="true">→</div>
-      <div class="bignum-item after">
-        <div class="bignum-val">39<span style="font-size:.4em;letter-spacing:0"> s</span></div>
-        <div class="bignum-lab">Now · cold cache</div>
+      <div class="bignum-item">
+        <div class="bignum-val" style="font-size:var(--step-2)">11.3×</div>
+        <div class="bignum-lab">Part one · snapshot<br>3364 s → 297 s</div>
       </div>
       <div class="bignum-item">
         <div class="bignum-val" style="font-size:var(--step-2)">17×</div>
-        <div class="bignum-lab">Same node, same artifact</div>
+        <div class="bignum-lab">Part two · restore<br>677 s → 39 s</div>
+      </div>
+      <div class="bignum-item after">
+        <div class="bignum-val">39<span style="font-size:.4em;letter-spacing:0"> s</span></div>
+        <div class="bignum-lab">Cold cache · verified by generation</div>
       </div>
     </div>
   </div>
@@ -437,6 +476,16 @@ footer {
       its health check but produces garbage tokens has not been restored, it has been
       resurrected badly. The prompt was <code>"The capital of France is"</code> and the
       answer had to be Paris.
+    </p>
+  </div>
+
+  <div class="col">
+    <h3>The two halves, before anything is explained</h3>
+    <p>
+      The work divides into making the artifact and reading it back, and the two have
+      almost nothing in common — different bottlenecks, different fixes, and one change
+      that helps enormously on one side and not at all on the other. Restore first,
+      because it is where we started and where the forecast broke:
     </p>
   </div>
 
@@ -476,6 +525,50 @@ footer {
       build beats it while also paying for 56.4&nbsp;GB of real device reads. Being able
       to say that is worth more than a rounder number.
     </div>
+  </div>
+
+  <div class="col">
+    <p>
+      And the snapshot side, which we measured much later and which turned out to be the
+      larger of the two in absolute seconds — an hour per artifact rather than eleven
+      minutes per restore:
+    </p>
+  </div>
+
+  <div class="waterfall" aria-label="Time to publish one artifact, by configuration">
+    <div class="wf-row">
+      <div class="wf-lab">FUSE mount · kubelet + tar<br><span style="color:var(--ink-faint)">where v1 shipped</span></div>
+      <div class="wf-track"><div class="wf-bar" style="--w:100%"></div></div>
+      <div class="wf-val">3364 s</div>
+    </div>
+    <div class="wf-row">
+      <div class="wf-lab">node NVMe · kubelet + tar<br><span style="color:var(--ink-faint)">right disk, still tarred</span></div>
+      <div class="wf-track"><div class="wf-bar" style="--w:38.0%"></div></div>
+      <div class="wf-val">1279 s</div>
+    </div>
+    <div class="wf-row">
+      <div class="wf-lab">FUSE mount · agent direct<br><span style="color:var(--ink-faint)">no tar, wrong disk</span></div>
+      <div class="wf-track"><div class="wf-bar" style="--w:42.4%"></div></div>
+      <div class="wf-val">1425 s</div>
+    </div>
+    <div class="wf-row final">
+      <div class="wf-lab">node NVMe · agent direct<br><span style="color:var(--ink-faint)">both</span></div>
+      <div class="wf-track"><div class="wf-bar" style="--w:8.8%"></div></div>
+      <div class="wf-val">297 s</div>
+    </div>
+  </div>
+</section>
+
+<section class="part">
+  <div class="col">
+    <p class="part-lab">Part one · faster snapshot</p>
+    <h2>Making the artifact</h2>
+    <p>
+      Two stages, and neither one is about CRIU being slow. The first is about
+      checkpointing a process that is holding things a checkpoint cannot hold; the
+      second is about writing the result once instead of four times, onto a disk chosen
+      on purpose. Together: <span class="part-num">3364 s → 297 s</span>.
+    </p>
   </div>
 </section>
 
@@ -554,7 +647,7 @@ footer {
   <div class="col">
     <div class="stage-head">
       <span class="stage-num">02</span>
-      <h2>Ship a directory, not a tarball — and put it on the right disk</h2>
+      <h2>Write the artifact once, not four times</h2>
     </div>
     <p>
       <code>runc restore --image-path</code> takes a directory. We were handing it one —
@@ -610,14 +703,13 @@ footer {
       reaches its own NVMe figure only by pushing the difference onto the OS disk, four
       times over.
     </p>
-    <h3>Then we ran the arm we had been assuming</h3>
+    <h3>Both variables at once, and they compound</h3>
     <p>
-      Everything above is the write side. We had been quietly carrying an assumption into
-      the read side too — that shipping a directory instead of a tar would make restores
-      faster, for the obvious reason that there is no longer an untar in front of them.
-      It was time to stop assuming, so we ran the full cross: two dump paths × two
-      storage tiers, four builds of the same 56&nbsp;GB model on the same node, then
-      restored three of them from a cold page cache.
+      The A/B above holds storage fixed and varies the dump path. But the storage tier is
+      a variable too, and the two had always shipped together, so we ran the full cross:
+      two dump paths × two storage tiers, four builds of the same 56&nbsp;GB model on the
+      same node, same afternoon. (We restored three of them as well, from a cold cache —
+      that half opens part two, because it does not say what we assumed it would.)
     </p>
 
     <div class="tablewrap">
@@ -635,45 +727,6 @@ footer {
       </table>
     </div>
 
-    <div class="tablewrap">
-      <table>
-        <caption>Restore — cold page cache, dropped before the clock starts, verified by generation</caption>
-        <thead>
-          <tr><th>Artifact came from</th><th class="num">Pre-warm</th><th class="num">CRIU done</th><th class="num">Serving</th><th class="num">nvme read / write</th></tr>
-        </thead>
-        <tbody>
-          <tr><td>FUSE · kubelet + tar</td><td class="num">153 s</td><td class="num">339 s</td><td class="num">344 s</td><td class="num">103.4 / 48.0 GB</td></tr>
-          <tr><td>NVMe · kubelet + tar</td><td class="num">3 s</td><td class="num">40 s</td><td class="num">43 s</td><td class="num">56.4 / 0.0 GB</td></tr>
-          <tr class="hi"><td>NVMe · agent direct</td><td class="num">2 s</td><td class="num">37 s</td><td class="num">42 s</td><td class="num">56.5 / 0.0 GB</td></tr>
-        </tbody>
-      </table>
-    </div>
-
-    <p>
-      <strong>On the restore, the tar contributes nothing.</strong> 43&nbsp;s against
-      42&nbsp;s is noise. That is not a disappointing result, it is an obvious one in
-      hindsight: by restore time the two artifacts <em>are the same thing</em>. Both are
-      ~56&nbsp;GB of CRIU images sitting in a directory. Whether a tar existed an hour
-      earlier on the write side leaves no trace on the read side, because we untar at
-      publish, not at restore. What actually separates those rows from the first one is
-      the storage tier, and that is worth <strong>8.0×</strong>.
-    </p>
-    <div class="note">
-      <span class="note-lab">How this squares with the 677 s at the top</span>
-      It does not contradict it — it is a later slice through the same system. Every row
-      in these two tables runs the <em>finished</em> stack: patched CRIU, no staging copy,
-      prefetch at 4. So the 344&nbsp;s FUSE row is not the old baseline, it is what
-      today's restore costs when the artifact happens to live on the mount. The
-      677&nbsp;s number is the honest starting point of the whole project; the
-      344&nbsp;s number is the price of one remaining decision.
-    </div>
-    <p>
-      The I/O column says why in one line. The FUSE row reads
-      <strong>103.4&nbsp;GB to restore a 56&nbsp;GB artifact, and writes 48.0&nbsp;GB
-      doing it</strong> — pre-warm pulling the artifact down onto the local tier, then
-      reading it back off. The two NVMe rows read 56.5&nbsp;GB and write nothing:
-      amplification exactly 1.0, the same floor the write side hit.
-    </p>
     <p>
       <strong>On the snapshot, both matter, and they compound.</strong> Holding storage
       fixed, the tar costs 982&nbsp;s. Holding the dump path fixed, the network
@@ -737,6 +790,95 @@ footer {
       An artifact store is not a POSIX filesystem just because it is mounted like one —
       and on one that isn't, a return value is not evidence. Read it back.
     </div>
+  </div>
+</section>
+
+<section class="part">
+  <div class="col">
+    <p class="part-lab">Part two · faster restore</p>
+    <h2>Reading it back</h2>
+    <p>
+      A published artifact is a different problem from a fast one. Nothing in part one
+      makes a restore quicker on its own — by the time we read it back, a tarred build
+      and a direct one are the same directory of images. What is left is getting
+      56&nbsp;GB off a disk and into a process: which disk, and how many reads at a
+      time. Together: <span class="part-num">677 s → 39 s</span>.
+    </p>
+  </div>
+</section>
+
+<section>
+  <div class="col">
+    <h2>First, the thing part one did not buy us</h2>
+    <p>
+      Removing the tar was worth 11.3× on the snapshot. The natural assumption — ours,
+      for weeks — is that it must be worth something on the restore too, since there is
+      no longer an untar in front of it. We restored three of the four builds from the
+      cross above, cold cache dropped before each clock starts, to find out.
+    </p>
+    <div class="tablewrap">
+      <table>
+        <caption>Restore — cold page cache, dropped before the clock starts, verified by generation</caption>
+        <thead>
+          <tr><th>Artifact came from</th><th class="num">Pre-warm</th><th class="num">CRIU done</th><th class="num">Serving</th><th class="num">nvme read / write</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>FUSE · kubelet + tar</td><td class="num">153 s</td><td class="num">339 s</td><td class="num">344 s</td><td class="num">103.4 / 48.0 GB</td></tr>
+          <tr><td>NVMe · kubelet + tar</td><td class="num">3 s</td><td class="num">40 s</td><td class="num">43 s</td><td class="num">56.4 / 0.0 GB</td></tr>
+          <tr class="hi"><td>NVMe · agent direct</td><td class="num">2 s</td><td class="num">37 s</td><td class="num">42 s</td><td class="num">56.5 / 0.0 GB</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p>
+      <strong>On the restore, the tar contributes nothing.</strong> 43&nbsp;s against
+      42&nbsp;s is noise. That is not a disappointing result, it is an obvious one in
+      hindsight: by restore time the two artifacts <em>are the same thing</em>. Both are
+      ~56&nbsp;GB of CRIU images sitting in a directory. Whether a tar existed an hour
+      earlier on the write side leaves no trace on the read side, because we untar at
+      publish, not at restore. What actually separates those rows from the first one is
+      the storage tier, and that is worth <strong>8.0×</strong>.
+    </p>
+    <div class="note">
+      <span class="note-lab">How this squares with the 677 s at the top</span>
+      It does not contradict it — it is a later slice through the same system. Every row
+      in these two tables runs the <em>finished</em> stack: patched CRIU, no staging copy,
+      prefetch at 4. So the 344&nbsp;s FUSE row is not the old baseline, it is what
+      today's restore costs when the artifact happens to live on the mount. The
+      677&nbsp;s number is the honest starting point of the whole project; the
+      344&nbsp;s number is the price of one remaining decision.
+    </div>
+    <p>
+      The I/O column says why in one line. The FUSE row reads
+      <strong>103.4&nbsp;GB to restore a 56&nbsp;GB artifact, and writes 48.0&nbsp;GB
+      doing it</strong> — pre-warm pulling the artifact down onto the local tier, then
+      reading it back off. The two NVMe rows read 56.5&nbsp;GB and write nothing:
+      amplification exactly 1.0, the same floor the write side hit.
+    </p>
+
+    <p>
+      <strong>On the restore, the tar contributes nothing.</strong> 43&nbsp;s against
+      42&nbsp;s is noise. That is not a disappointing result, it is an obvious one in
+      hindsight: by restore time the two artifacts <em>are the same thing</em>. Both are
+      ~56&nbsp;GB of CRIU images sitting in a directory. Whether a tar existed an hour
+      earlier on the write side leaves no trace on the read side, because we untar at
+      publish, not at restore. What actually separates those rows from the first one is
+      the storage tier, and that is worth <strong>8.0×</strong>.
+    </p>
+    <div class="note">
+      <span class="note-lab">How this squares with the 677 s at the top</span>
+      It does not contradict it — it is a later slice through the same system. Every row
+      in this table runs the <em>finished</em> stack: patched CRIU, no staging copy,
+      prefetch at 4. So the 344&nbsp;s FUSE row is not the old baseline, it is what
+      today's restore costs when the artifact happens to live on the mount. The
+      677&nbsp;s number is the honest starting point of the whole project; the
+      344&nbsp;s number is the price of one remaining decision.
+    </div>
+    <p>
+      So the two halves of this post divide differently than the work did. Part one's
+      changes are worth almost nothing here, and the two stages that follow — one a
+      config flag, one six kernel patches — are worth all of it.
+    </p>
   </div>
 </section>
 
@@ -872,6 +1014,18 @@ nvme0n1      0 B/s     <span class="cmt">← the 894 GB local NVMe</span></code>
       Unbounded gives the entire win back. Depth and the coalescing cap are one
       mechanism, not two — without the cap there is nothing for the depth to be deep
       <em>with</em>.
+    </p>
+  </div>
+</section>
+
+<section class="part">
+  <div class="col">
+    <p class="part-lab">Both halves · what it cost to learn</p>
+    <h2>What we got wrong</h2>
+    <p>
+      Four stages, two of them not what we predicted and one of them the opposite of what
+      we assumed. The rest of this page is the accounting: where the forecast broke, what
+      is left on the table, and the controls we should have run before quoting any of it.
     </p>
   </div>
 </section>
@@ -1130,16 +1284,21 @@ nvme0n1      0 B/s     <span class="cmt">← the 894 GB local NVMe</span></code>
 </footer>
 
 <script>
-  // Bars fill once, when the chart first enters view.
+  // Bars fill once, when each chart first enters view. Every .waterfall is
+  // observed, not just the first: a chart left un-revealed sits at scale 0 and
+  // reads as an empty track rather than as an animation that has not run yet.
   (function () {
-    var wf = document.getElementById('wf');
-    if (!wf) return;
-    if (!('IntersectionObserver' in window)) { wf.classList.add('in'); return; }
+    var charts = document.querySelectorAll('.waterfall');
+    if (!charts.length) return;
+    if (!('IntersectionObserver' in window)) {
+      charts.forEach(function (c) { c.classList.add('in'); });
+      return;
+    }
     var io = new IntersectionObserver(function (entries) {
       entries.forEach(function (e) {
-        if (e.isIntersecting) { wf.classList.add('in'); io.disconnect(); }
+        if (e.isIntersecting) { e.target.classList.add('in'); io.unobserve(e.target); }
       });
     }, { threshold: 0.25 });
-    io.observe(wf);
+    charts.forEach(function (c) { io.observe(c); });
   })();
 </script>
