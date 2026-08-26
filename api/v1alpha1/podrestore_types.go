@@ -31,10 +31,43 @@ const TeardownFinalizer = "podsnapshot.io/restore-teardown"
 // RestoreAnnotation links a placeholder pod back to its PodRestore (ns/name).
 const RestoreAnnotation = "podsnapshot.io/restore"
 
+// Restore read-path tuning for the patched CRIU (hack/criu/patches). These
+// are passed to `runc restore` in its environment, so they take effect for
+// one restore without changing anything on the node — and they are simply
+// ignored by a stock CRIU, which makes them safe to set unconditionally.
+const (
+	// CRIUAIODepthAnnotation is how many page reads the async read path
+	// keeps in flight. "0" or "1" falls back to the one-at-a-time preadv
+	// loop, which is what stock CRIU does.
+	CRIUAIODepthAnnotation = "podsnapshot.io/criu-aio-depth"
+	// CRIUShmemThreadsAnnotation is how many shmem/memfd objects are
+	// restored concurrently. "1" disables the thread pool.
+	CRIUShmemThreadsAnnotation = "podsnapshot.io/criu-shmem-threads"
+	// CRIUImageIOModeAnnotation is "writeback" (buffered, default) or
+	// "direct" (O_DIRECT for the block-aligned reads).
+	//
+	// "direct" is also the only way to measure the storage path without a
+	// node-wide side effect: it bypasses the page cache for CRIU's reads
+	// alone, where drop_caches and a POSIX_FADV_DONTNEED sweep would
+	// affect every workload on the node.
+	CRIUImageIOModeAnnotation = "podsnapshot.io/criu-image-io-mode"
+	// CRIUAIOChunkAnnotation caps how many bytes one queued async read may
+	// grow to before the next page starts a fresh one, in bytes and a
+	// multiple of the page size. "0" restores unbounded coalescing.
+	//
+	// It exists because coalescing and queue depth pull against each
+	// other. A memfd is a contiguous run of offsets into one mmap, so
+	// without a cap the whole object becomes a single submission and the
+	// device sees a queue of one however deep CRIUAIODepthAnnotation is.
+	// Ignored by CRIU builds before v4.2.1-ps5.
+	CRIUAIOChunkAnnotation = "podsnapshot.io/criu-aio-chunk"
+)
+
 // PodRestoreSpec defines the desired state of PodRestore.
 type PodRestoreSpec struct {
-	// ArtifactURI points at the checkpoint tar (fuse:// or file:// scheme).
-	// Exactly one of ArtifactURI or SnapshotRef must be set.
+	// ArtifactURI points at the checkpoint (fuse:// or file:// scheme); a
+	// trailing slash means an image-directory artifact. Exactly one of
+	// ArtifactURI, SnapshotRef or BuildRef must be set.
 	// +optional
 	ArtifactURI string `json:"artifactURI,omitempty"`
 
@@ -43,11 +76,18 @@ type PodRestoreSpec struct {
 	// +optional
 	SnapshotRef *corev1.LocalObjectReference `json:"snapshotRef,omitempty"`
 
+	// BuildRef names a completed SnapshotBuild in the same namespace. Its
+	// artifact is used, and its compatibility tuple constrains placement:
+	// the placeholder pod is confined to nodes whose environment matches,
+	// instead of discovering the mismatch inside `runc restore`.
+	// +optional
+	BuildRef *corev1.LocalObjectReference `json:"buildRef,omitempty"`
+
 	// PodTemplate for the target pod. The image MUST match the checkpointed
 	// container's image and the template must request the same GPU count.
 	// The controller rewrites the target container's command to a keeper
 	// process; the restored workload joins this pod's namespaces.
-	PodTemplate corev1.PodTemplateSpec `json:"podTemplate"`
+	PodTemplate PodTemplate `json:"podTemplate"`
 
 	// Container in the template that receives the restored workload.
 	// Defaults to the first container.
@@ -111,6 +151,11 @@ type PodRestoreStatus struct {
 	// PrewarmBytes read through the cache during pre-warm.
 	// +optional
 	PrewarmBytes int64 `json:"prewarmBytes,omitempty"`
+
+	// Compatibility is the environment tuple the artifact was built against,
+	// when it came from a SnapshotBuild.
+	// +optional
+	Compatibility *CompatibilityKey `json:"compatibility,omitempty"`
 
 	// +optional
 	Conditions []metav1.Condition `json:"conditions,omitempty"`

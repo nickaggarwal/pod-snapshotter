@@ -1,0 +1,92 @@
+# Builds pod-snapshotter's CRIU fork: upstream v4.2.1 plus the restore-path
+# patches, as published at
+#
+#   https://github.com/nickaggarwal/criu
+#   branch pod-snapshotter/v4.2.1-restore-parallelism
+#
+# (docs/design-v2.md §6b). The fork is the source of truth; the copies in
+# hack/criu/patches are kept in sync with it so the series stays reviewable
+# from this repo and can be re-cut against a newer upstream base.
+#
+# v4.2.1 is the base on purpose — it is what the AKS Ubuntu 24.04 GPU nodes
+# already run, so the CUDA plugin, the NVIDIA driver and the CRIU image format
+# all stay at a combination that is known to work end to end. The patches only
+# touch the restore read path.
+#
+# The output is a tarball of just the pieces a node needs, so the installer
+# DaemonSet can lay them down beside the distro package rather than replacing
+# it: /usr/local wins on PATH, and reverting is `rm`.
+ARG UBUNTU_VERSION=24.04
+FROM ubuntu:${UBUNTU_VERSION} AS build
+
+ARG CRIU_VERSION=4.2.1
+ENV DEBIAN_FRONTEND=noninteractive
+
+# CRIU's own build deps (see its INSTALL.md). libaio-dev is not among them —
+# the AIO patch calls io_setup/io_submit/io_getevents by raw syscall so that
+# the fork does not add a link-time dependency the distro package lacks.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential ca-certificates curl git pkg-config \
+        libprotobuf-dev libprotobuf-c-dev protobuf-c-compiler protobuf-compiler \
+        python3-minimal python3-protobuf \
+        libcap-dev libnl-3-dev libnet1-dev libbsd-dev libnftables-dev \
+        libgnutls28-dev libdrm-dev uuid-dev iproute2 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Pinned to a commit, not to the branch tip: what shipped to a node has to be
+# reconstructible later, and a moving branch would make the tag ambiguous.
+# Bump CRIU_FORK_COMMIT deliberately when the branch advances.
+ARG CRIU_FORK_REPO=https://github.com/nickaggarwal/criu.git
+ARG CRIU_FORK_COMMIT=6c683e43ab6edd9907588797f27a413af4d7cf35
+
+WORKDIR /src
+RUN set -eux; \
+    git init -q .; \
+    git remote add origin "${CRIU_FORK_REPO}"; \
+    git fetch -q --depth 1 origin "${CRIU_FORK_COMMIT}"; \
+    git checkout -q FETCH_HEAD
+
+# The base must be the version we claim. The fork branches off the v4.2.1 tag,
+# so Makefile.versions has to still read exactly that — if a rebase ever lands
+# this branch on a different upstream base, fail here rather than shipping a
+# binary whose CRIU image format silently disagrees with the node's CUDA
+# plugin. (Makefile.versions is the source; criu/include/version.h is
+# generated from it during the build and does not exist yet at this point.)
+RUN set -eux; \
+    v() { sed -n "s/^CRIU_VERSION_$1[[:space:]]*:=[[:space:]]*\\([0-9]*\\).*/\\1/p" Makefile.versions; }; \
+    maj="$(v MAJOR)"; min="$(v MINOR)"; sub="$(v SUBLEVEL)"; \
+    got="${maj}${min:+.${min}}${sub:+.${sub}}"; \
+    echo "fork base version: ${got} (expected ${CRIU_VERSION})"; \
+    test "${got}" = "${CRIU_VERSION}"; \
+    git log --oneline -6
+
+RUN make -j"$(nproc)" criu cuda_plugin
+
+# Sanity: the binary runs, reports a version, and carries our marker.
+RUN ./criu/criu --version && ./criu/criu check --help >/dev/null
+
+# Only the binary ships. The fork's compiled-in plugin directory is
+# /usr/lib/criu -- the same one the distro package uses -- so the patched CRIU
+# loads the node's existing cuda_plugin.so. That is deliberate: the fork is
+# based on the exact version the node already runs, so the plugin ABI matches,
+# and the GPU-critical piece stays byte-identical to what has been validated
+# there. The freshly built plugin is carried alongside only for nodes that do
+# not have one.
+RUN set -eux; \
+    mkdir -p /out/usr/local/sbin; \
+    cp criu/criu /out/usr/local/sbin/criu; \
+    tar -C /out -czf /criu-dist.tar.gz usr; \
+    cp plugins/cuda/cuda_plugin.so /cuda_plugin.so; \
+    ./criu/criu --version > /criu-gitid
+
+# The runtime image is the installer payload: the DaemonSet copies the tarball
+# onto the host and unpacks it there.
+FROM ubuntu:${UBUNTU_VERSION}
+COPY --from=build /criu-dist.tar.gz /criu-dist.tar.gz
+COPY --from=build /cuda_plugin.so /cuda_plugin.so
+# The binary's own gitid, so install.sh can tell two images apart even when
+# CRIU_BUILD_VERSION was not updated alongside the image (see install.sh).
+COPY --from=build /criu-gitid /criu-gitid
+COPY hack/criu/install.sh /install.sh
+RUN chmod +x /install.sh
+ENTRYPOINT ["/install.sh"]

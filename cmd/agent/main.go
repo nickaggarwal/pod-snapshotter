@@ -1,8 +1,9 @@
 // The pod-snapshotter agent runs as a privileged DaemonSet on every
-// checkpoint-capable node. It uploads kubelet checkpoint tars to the
-// fuse-client mount, pre-warms and pins artifacts, performs runc/CRIU
-// restores into placeholder pod sandboxes, and publishes node prerequisite
-// status.
+// checkpoint-capable node. It publishes checkpoints to the fuse-client mount
+// (as a tar or an expanded image directory), waits for quiesce-capable
+// workloads to reach their checkpoint-safe point, pre-warms and pins
+// artifacts, performs runc/CRIU restores into placeholder pod sandboxes, and
+// publishes node prerequisite status.
 package main
 
 import (
@@ -36,17 +37,22 @@ func init() {
 
 func main() {
 	var (
-		metricsAddr     string
-		probeAddr       string
-		nodeName        string
-		fuseMount       string
-		fuseAPIEndpoint string
-		fuseAgentSocket string
-		checkpointsDir  string
-		workRoot        string
-		criSocket       string
-		hostRoot        string
-		skipHostChecks  bool
+		metricsAddr       string
+		probeAddr         string
+		nodeName          string
+		fuseMount         string
+		fuseAPIEndpoint   string
+		fuseAgentSocket   string
+		checkpointsDir    string
+		workRoot          string
+		criSocket         string
+		hostRoot          string
+		skipHostChecks    bool
+		stageImageLocal   bool
+		prefetchWorkers   int
+		nvmeCacheRoot     string
+		digestArtifacts   bool
+		localArtifactRoot string
 	)
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8083", "Metrics endpoint address (0 to disable).")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8084", "Health probe endpoint address.")
@@ -59,6 +65,14 @@ func main() {
 	flag.StringVar(&criSocket, "cri-socket", "/run/containerd/containerd.sock", "CRI runtime socket.")
 	flag.StringVar(&hostRoot, "host-root", "", "Host filesystem mount for file checks (e.g. /host).")
 	flag.BoolVar(&skipHostChecks, "skip-host-checks", false, "Skip nsenter-based prereq checks (dev only).")
+	flag.BoolVar(&stageImageLocal, "stage-image-local", false, "Copy directory artifacts to node-local storage during pre-warm instead of restoring in place through the fuse mount.")
+	flag.IntVar(&prefetchWorkers, "prefetch-parallelism", 0, "Files fetched concurrently from a directory artifact (0 = default).")
+	flag.BoolVar(&digestArtifacts, "digest-artifacts", false, "sha256 every image file when publishing an agent-dumped artifact. Costs a full extra read of the checkpoint immediately after writing it; the manifest records sizes either way.")
+	flag.StringVar(&localArtifactRoot, "local-artifact-root", "",
+		"Node-local artifact tier: the directory on this node's own disk (typically its NVMe) that holds file:// artifacts, mounted here at the same "+
+			"path it has on the host. Dumps write CRIU's images straight into it and restores read them back out of it, with no network filesystem in "+
+			"either path. When set, it is also the only place this agent will write or read a file:// artifact. Empty leaves file:// URIs unconfined.")
+	flag.StringVar(&nvmeCacheRoot, "nvme-cache-root", "", "fuse-client's node-local NVMe cache tier (e.g. /host/mnt/fuse-nvme0n1/fuse-cache). When set, restores read pre-warmed CRIU images straight off the device instead of back through the fuse mount. Empty disables.")
 
 	opts := zap.Options{Development: false}
 	opts.BindFlags(flag.CommandLine)
@@ -88,6 +102,8 @@ func main() {
 		NodeName:            nodeName,
 		FuseMount:           fuseMount,
 		CheckpointsHostPath: checkpointsDir,
+		HostRoot:            hostRoot,
+		LocalArtifactRoot:   localArtifactRoot,
 	}
 	if fuseAPIEndpoint != "" {
 		fuseHTTP := fuseclient.NewHTTPClient(fuseAPIEndpoint)
@@ -105,13 +121,17 @@ func main() {
 		os.Exit(1)
 	}
 	restoreCtrl := &agent.RestoreReconciler{
-		Client:    mgr.GetClient(),
-		NodeName:  nodeName,
-		FuseMount: fuseMount,
-		WorkRoot:  workRoot,
-		HostRoot:  hostRoot,
-		Resolver:  resolver,
-		Runc:      restore.NewHostRunc(),
+		Client:              mgr.GetClient(),
+		NodeName:            nodeName,
+		FuseMount:           fuseMount,
+		WorkRoot:            workRoot,
+		HostRoot:            hostRoot,
+		StageImageLocal:     stageImageLocal,
+		PrefetchParallelism: prefetchWorkers,
+		NVMeCacheRoot:       nvmeCacheRoot,
+		LocalArtifactRoot:   localArtifactRoot,
+		Resolver:            resolver,
+		Runc:                restore.NewHostRunc(),
 	}
 	if fuseAgentSocket != "" {
 		if pinner, err := fuseclient.DialSession(fuseAgentSocket); err != nil {
@@ -125,13 +145,49 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Checkpoint controller: runs `runc checkpoint` for snapshots that asked
+	// for checkpointer: agent, writing CRIU's images straight into the
+	// artifact directory instead of routing them through the kubelet's tar
+	// (docs/design-v2.md §3).
+	checkpointCtrl := &agent.CheckpointReconciler{
+		Client:            mgr.GetClient(),
+		NodeName:          nodeName,
+		FuseMount:         fuseMount,
+		LocalArtifactRoot: localArtifactRoot,
+		WorkRoot:          workRoot,
+		HostRoot:          hostRoot,
+		Digest:            digestArtifacts,
+		Resolver:          resolver,
+		Runc:              restore.NewHostRunc(),
+	}
+	if err := checkpointCtrl.SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "agent-checkpoint")
+		os.Exit(1)
+	}
+
+	// Quiesce controller: waits for the workload shim's presence file before
+	// the manager issues the checkpoint.
+	if err := (&agent.QuiesceReconciler{
+		Client:   mgr.GetClient(),
+		NodeName: nodeName,
+		Resolver: resolver,
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "agent-quiesce")
+		os.Exit(1)
+	}
+
 	// Prereq checker.
 	prereq := &agent.PrereqChecker{
-		Client:         mgr.GetClient(),
-		NodeName:       nodeName,
-		FuseMount:      fuseMount,
-		HostRoot:       hostRoot,
-		SkipHostChecks: skipHostChecks,
+		Client:            mgr.GetClient(),
+		NodeName:          nodeName,
+		FuseMount:         fuseMount,
+		LocalArtifactRoot: localArtifactRoot,
+		HostRoot:          hostRoot,
+		SkipHostChecks:    skipHostChecks,
+		// Claimed only because the controller above was wired successfully.
+		// The manager routes work on the strength of this annotation, so it
+		// has to describe this process, not this binary.
+		Capabilities: []string{snapv1.AgentCheckpointCapability},
 	}
 	if err := mgr.Add(prereq); err != nil {
 		setupLog.Error(err, "unable to add prereq checker")

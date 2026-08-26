@@ -140,3 +140,88 @@ func TestOldPodUID(t *testing.T) {
 		t.Errorf("OldPodUID(nil) = %q", got)
 	}
 }
+
+func TestOpenDirectory(t *testing.T) {
+	dir := t.TempDir()
+	imageDir := filepath.Join(dir, "artifact")
+	workDir := filepath.Join(dir, "work")
+	rootfs := filepath.Join(dir, "rootfs")
+	for _, d := range []string{filepath.Join(imageDir, "checkpoint"), rootfs} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write := func(rel, content string) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(imageDir, rel), []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("checkpoint/inventory", "img")
+	write("config.dump", `{"id":"ctr1","sandbox":{"uid":"old-uid"}}`)
+	write("spec.dump", `{"ociVersion":"1.1.0"}`)
+
+	b, err := Open(imageDir, workDir, rootfs)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The CRIU images are used where they are — no copy into the work dir.
+	if b.CheckpointDir != filepath.Join(imageDir, "checkpoint") {
+		t.Errorf("CheckpointDir = %q, want the artifact's own checkpoint dir", b.CheckpointDir)
+	}
+	if b.SpecDumpPath != filepath.Join(imageDir, "spec.dump") {
+		t.Errorf("SpecDumpPath = %q", b.SpecDumpPath)
+	}
+	// Everything written goes to node-local scratch, never the artifact.
+	if b.SpecPath != filepath.Join(workDir, "bundle", "config.json") {
+		t.Errorf("SpecPath = %q, want it under the work dir", b.SpecPath)
+	}
+	if _, err := os.Stat(filepath.Join(imageDir, "bundle")); !os.IsNotExist(err) {
+		t.Error("Open must not create anything inside the artifact directory")
+	}
+	if b.ConfigDump["id"] != "ctr1" {
+		t.Errorf("config.dump not parsed: %+v", b.ConfigDump)
+	}
+	if OldPodUID(b.ConfigDump) != "old-uid" {
+		t.Errorf("OldPodUID = %q", OldPodUID(b.ConfigDump))
+	}
+}
+
+func TestOpenAppliesRootfsDiff(t *testing.T) {
+	dir := t.TempDir()
+	imageDir := filepath.Join(dir, "artifact")
+	rootfs := filepath.Join(dir, "rootfs")
+	for _, d := range []string{filepath.Join(imageDir, "checkpoint"), rootfs} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(imageDir, "checkpoint", "inventory"), []byte("img"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	makeCheckpointTar(t, filepath.Join(imageDir, "rootfs-diff.tar"), map[string]string{
+		"var/log/app.log": "written-at-runtime",
+	})
+
+	if _, err := Open(imageDir, filepath.Join(dir, "work"), rootfs); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(filepath.Join(rootfs, "var", "log", "app.log"))
+	if err != nil {
+		t.Fatalf("rootfs-diff.tar not applied: %v", err)
+	}
+	if string(got) != "written-at-runtime" {
+		t.Errorf("rootfs diff content = %q", got)
+	}
+}
+
+func TestOpenRejectsNonCheckpointDirectory(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "random.txt"), []byte("hello"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Open(dir, filepath.Join(dir, "work"), ""); err == nil {
+		t.Error("expected error for a directory without checkpoint/")
+	}
+}

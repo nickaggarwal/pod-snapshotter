@@ -41,6 +41,7 @@ rules:
   resources:
   - podrestores
   - podsnapshots
+  - snapshotbuilds
   verbs:
   - create
   - delete
@@ -54,6 +55,7 @@ rules:
   resources:
   - podrestores/finalizers
   - podsnapshots/finalizers
+  - snapshotbuilds/finalizers
   verbs:
   - update
 - apiGroups:
@@ -61,6 +63,7 @@ rules:
   resources:
   - podrestores/status
   - podsnapshots/status
+  - snapshotbuilds/status
   verbs:
   - get
   - patch

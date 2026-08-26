@@ -1,0 +1,22 @@
+restore: restore-kubenvme  (/tmp/restore-kubenvme.yaml)
+node:    aks-gpuckpt-13588264-vmss00000g
+ended:   2026-08-25T15:49:29Z
+restored (CRIU done) in 40s from a cold page cache
+serving (/health ok)  in 43s from a cold page cache
+
+phases (t seconds from create):
+t	phase	message
+0	Preparing 	waiting for stale placeholder pod restore-kubenvme-restored to terminate
+3	Restoring 0/1	pre-warm complete; restoring
+40	Running 0/1	
+43	Running 1/1	
+
+disk I/O over the run (GB, 512-byte sectors):
+  device          read GB     write GB
+  sda                 0.2          0.2
+  nvme0n1            56.4          0.0
+
+artifact:
+  uri file:///mnt/fuse-nvme0n1/ps-artifacts/qwen2.5-14b-instruct-kubenvme/
+  node aks-gpuckpt-13588264-vmss00000g
+  prewarm 56423319899

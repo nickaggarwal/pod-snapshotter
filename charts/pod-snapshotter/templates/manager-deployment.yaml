@@ -18,12 +18,13 @@ spec:
       serviceAccountName: pod-snapshotter-manager
       containers:
         - name: manager
-          image: "{{ .Values.manager.image.repository }}:{{ .Values.manager.image.tag }}"
+          image: "{{ include "pod-snapshotter.image" (dict "img" .Values.manager.image "root" $) }}"
           imagePullPolicy: {{ .Values.manager.image.pullPolicy }}
           args:
             - --leader-elect={{ .Values.manager.leaderElect }}
             - --kubelet-insecure-tls={{ .Values.manager.kubeletInsecureTLS }}
             - --require-node-prereqs={{ .Values.manager.requireNodePrereqs }}
+            - --artifact-root={{ .Values.manager.artifactRoot }}
             {{- if .Values.manager.fuseAPIEndpoint }}
             - --fuse-api-endpoint={{ .Values.manager.fuseAPIEndpoint }}
             {{- end }}

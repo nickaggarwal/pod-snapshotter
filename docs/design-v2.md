@@ -1,0 +1,1460 @@
+# Design v2 — aligning with NVIDIA Dynamo Snapshot
+
+Status: **§3–§5 and §6b implemented and verified on A100.** v1 (tar
+artifacts, live-pod checkpoints) keeps working unchanged — `artifactFormat`
+defaults to `tar`, and a pod without the quiesce annotation takes the v1 path.
+
+| Workstream | State |
+|---|---|
+| §3 image directories | shipped — `artifactFormat: dir`, MANIFEST commit, parallel pre-warm, restore reads the images in place |
+| §4 quiesce/resume | shipped — `podsnapshot.io/quiesce`, `Quiescing` phase, [hack/snapshot-shim.py](../hack/snapshot-shim.py) |
+| §5 build artifacts | shipped — `SnapshotBuild` CRD, `PodRestore.spec.buildRef`, compatibility-constrained placement |
+| §6a `--stream` restore | not started — `criu-image-streamer` is not on the node images |
+| §6b forked CRIU | shipped — v4.2.1 + 3 patches, opt-in DaemonSet, per-restore tunables |
+| §7 weight decoupling | not started |
+
+Measured numbers are in [§8](#8-rollout). What running §4 against a real vLLM
+engine actually cost is in [§10](#10-what-the-workload-had-to-give-up), and
+the two fuse-mount behaviors that shaped §3 are in [§11](#11-storage-behavior-that-shaped-the-design).
+
+NVIDIA published
+[Dynamo Snapshot](https://developer.nvidia.com/blog/nvidia-dynamo-snapshot-fast-startup-for-inference-workloads-on-kubernetes/)
+in the same problem space as this repo: CRIU + `cuda-checkpoint` to kill LLM
+cold starts on Kubernetes. Their architecture is close enough to ours that the
+differences are directly actionable, and several of them are *also* the fix for
+problems we already hit (the io_uring dump wall, the multi-GB tar, the 10-minute
+`runtimeRequestTimeout` pressure).
+
+This document records those differences and the plan to close them.
+
+---
+
+## 1. Where we differ today
+
+| Dimension | Dynamo Snapshot | pod-snapshotter today |
+|---|---|---|
+| Checkpoint driver | Agent calls CRIU / `runc checkpoint` directly, images written straight to storage | kubelet `/checkpoint` API → **CRI tar**; restore must untar before CRIU starts |
+| Workload cooperation | Quiesce/resume hooks; checkpoint taken at a chosen safe point | Checkpoint a live serving pod as-is (hence the io_uring wall) |
+| KV cache | Physically unmapped before dump: 190 GiB → 6 GiB (Qwen3-0.6B, B200) | Whole live process including all device memory |
+| CRIU read path | Patched: threaded memfd restore + native AIO (`io_submit`, 128-deep, `O_DIRECT`) | Upstream single-threaded `preadv` |
+| Weights | Decoupled into a separate artifact (GMS), restored in parallel with the process | Inside the CRIU image, serialized behind it |
+| Artifact lifecycle | Built once, restored many times | One tar per live pod checkpoint |
+
+Their published restore numbers, for calibration — these are *CRIU restore
+only*, not end-to-end pod ready:
+
+| Model | CRIU image | Upstream CRIU | Patched CRIU | Speedup |
+|---|---|---|---|---|
+| Qwen3-0.6B | 6.2 GiB | 6.8 s | 2.4 s | 2.8× |
+| Qwen3-8B | 26 GiB | 24 s | 4.7 s | 5.1× |
+| gpt-oss-120b | 129 GiB | 119 s | 15 s | 7.9× |
+
+With GMS (weights split out and restored over a striped-NVMe channel in
+parallel with CRIU) they report gpt-oss-120b ready in **under 5 s**, ~21×
+better than cold start.
+
+Our own restore-path breakdown is dominated by a step Dynamo simply does not
+have: **untar**. `internal/restore/bundle.go` `Unpack()` walks the whole CRI
+archive and writes every CRIU image file out again before `runc restore` has
+read a single page. On a multi-GB artifact that is seconds of pure copy, on the
+critical path, single-threaded, before the work we actually care about begins.
+
+That makes the payoff order below start somewhere other than where the blog
+starts.
+
+---
+
+## 2. Target architecture
+
+```
+BUILD TIME (once per image × model × GPU SKU)     SCALE-UP (every 0→1)
+─────────────────────────────────────────────     ────────────────────
+SnapshotBuild CR                                  PodRestore CR
+  │                                                 │ (artifact = build output)
+  ▼ one-shot Job on a GPU node                      ▼ manager
+engine init (weights, warmup, CUDA graphs)        placeholder pod scheduled
+  │                                                 │  (keeper holds sandbox + GPU)
+  ▼ shim: llm.sleep(level=1) / torch_memory_saver   │
+KV physical pages released (cuMemUnmap +          ┌─┴─ overlapped ─┐
+  cuMemRelease), VA reservation kept              │                │
+  │                                          prefetch image   placeholder
+  ▼ touch /snapshot/ready-for-checkpoint      dir → node NVMe   reaches Ready
+  ▼ blocks on /snapshot/restore-complete           └─┬─ join ─┘
+  │                                                 ▼ node agent
+  ▼ node agent: cuda-checkpoint + criu dump       runc restore --image-path <dir>
+IMAGE DIRECTORY on node NVMe                        │  (no untar; parallel reads)
+  │  images/<revision>/{checkpoint/,spec.dump,…}    ▼
+  ▼ sync dir (not tar) to fuse/S3                 shim observes restore-complete
+                                                    ▼ wake_up() → KV remapped
+                                                    ▼ frontend + distributed runtime
+                                                  readiness probe → Ready
+```
+
+Four workstreams, in payoff order.
+
+---
+
+## 3. Workstream 1 — image directories, not tars
+
+**Payoff: removes the untar step entirely from the restore critical path.**
+
+`runc restore --image-path <dir>` already takes a directory — we hand it
+`<work>/checkpoint` *after* materializing it from the tar. The tar exists only
+because the kubelet checkpoint API returns one.
+
+### Checkpoint side
+
+Keep the kubelet path as a fallback, but add a direct path that writes CRIU
+images straight to node NVMe:
+
+```
+/var/lib/kubelet/pod-snapshotter/images/<revision>/
+  checkpoint/        CRIU image files (incl. CUDA plugin dumps)
+  spec.dump          original OCI runtime spec
+  config.dump        runtime metadata
+  rootfs-diff.tar    filesystem writes (stays a tar — it is small and is
+                     applied to the rootfs, not read by CRIU)
+  dump.log
+```
+
+Produced either by `crictl checkpoint` with a directory output, or by the agent
+calling `runc checkpoint --image-path <dir>` directly against the CRI container
+(the Dynamo "no runtime modifications" approach — it is also how we escape the
+kubelet's `runtimeRequestTimeout`).
+
+### Transport
+
+Sync the **directory**, not a tar. `fuse:///snapshots/<ns>/<name>/<ctr>/` as a
+prefix rather than a `.tar` object. Per-file objects are what make the next two
+things possible:
+
+- **Parallel prefetch** — N files fetched concurrently through fuse-client
+  instead of one sequential stream. Today `prewarm()` in
+  `internal/agent/restore_controller.go` does a single `io.CopyBuffer` over one
+  huge file; a directory lets us fan out.
+- **Overlapped prefetch** — start pulling the image directory to node NVMe at
+  *pod-schedule* time, concurrently with placeholder pod startup, instead of
+  strictly after it.
+
+### Code changes
+
+| File | Change |
+|---|---|
+| `internal/restore/bundle.go` | Split `Unpack()`: new `Open(imageDir, rootfsDir)` builds a `Bundle` from an existing directory; `Unpack()` becomes tar→dir + `Open()`, kept for v1 artifacts |
+| `internal/artifact/uri.go` | Accept directory URIs (trailing `/` or a `kind: dir` marker); `DefaultURI()` emits a prefix |
+| `internal/agent/restore_controller.go` | `prewarm()` walks the prefix and fetches files concurrently; `restore()` passes the prefetched dir as `ImagePath` with no unpack |
+| `internal/agent/upload_controller.go` | Upload a directory tree (atomic per-file `.part` + rename, then a `MANIFEST` written last as the commit marker) |
+| `api/v1alpha1/podsnapshot_types.go` | `ArtifactStatus` gains `Format: tar\|dir`, `FileCount`, per-file digests in a manifest object |
+
+**Compatibility:** `Format` defaults to `tar` when absent, so existing artifacts
+and existing `PodRestore`s keep working unchanged.
+
+### What shipped, and where it differs from the plan above
+
+- A directory URI is one with a trailing slash. `artifact.URI` carries `Dir`,
+  and `CommitPath()` returns the MANIFEST for a directory and the tar itself
+  for a tar, so the manager can Stat one path either way.
+- `restore.Unpack()` split into `Open(imageDir, workDir, rootfsDir)` over an
+  existing directory plus the tar path that feeds it. `Open` only ever reads
+  the artifact; everything it writes (the rewritten OCI config, CRIU's work
+  dir) goes to node-local scratch.
+- **Per-file `.part` + rename was dropped.** On the fuse-client mount, rename
+  copies without unlinking the source — every artifact tar on the cluster had
+  a full-size `.tar.part` beside it — so per-file temp files would double the
+  cost of every artifact for no benefit: the MANIFEST is what commits the
+  tree, and a reader that ignores an uncommitted prefix does not care whether
+  individual files are torn. Image files are written straight to their final
+  names; `RenamePublish` handles the one rename that remains. See §11.
+- The expansion also captures the container's `/dev/shm` as `shm-diff.tar`.
+  It is pod-scoped and external to the CRIU image, so nothing else carries
+  it, and CRIU needs it back — same idea as `rootfs-diff.tar`.
+- Pre-warm defaults to reading the files through the mount (fuse-client
+  promotes every miss to node NVMe) and `runc restore --image-path` then
+  points straight at the artifact: no copy anywhere on the restore path.
+  `--stage-image-local` copies to node NVMe instead, so the two can be
+  measured against each other. They were, and staging lost badly — it wrote
+  to the OS disk rather than the NVMe (§6c). Better still is
+  `--nvme-cache-root`, which skips pre-warm entirely when fuse-client has
+  already promoted the artifact and points `--image-path` at the cache tier
+  on the device.
+
+### 3a. The write side, and why it took a second pass
+
+The checkpoint side above shipped as a *description* of the artifact, not as
+a separate write path. The kubelet still ran the dump, and the agent still
+turned its tar into the directory the restore wanted. Everything in §3 was
+true of the restore; the write side was tar all the way down.
+
+That gap is expensive, and the cost is structural rather than incidental. The
+kubelet checkpoint API returns a tar — there is no directory mode to ask for
+— so publishing one artifact means writing its bytes three times:
+
+1. CRIU writes the images.
+2. The kubelet reads them back and writes them again, into the archive.
+3. The agent reads the archive back and writes them a third time, expanding
+   it into the layout a restore can use.
+
+Measured on the A100 pool with a 56.4 GB Qwen2.5-14B checkpoint, sampling
+`/proc/diskstats` every 5 s across the whole build:
+
+| device | read | written |
+|---|---|---|
+| `nvme0n1` (artifact tier, 880 G) | 24.2 GB | 59.1 GB |
+| `sda` (OS disk, 247 G) | 9.0 GB | **257.9 GB** |
+
+The ratio is bad enough on its own. The device split is worse: `sda` is
+`/dev/root`, and on a stock AKS GPU node it is also where `/var/lib/kubelet`
+lives — so the kubelet's tar is staged on the OS disk, not on the NVMe tier
+the artifact is bound for. The build spends most of its I/O writing a
+temporary file to the slowest device on the node, to produce an artifact that
+was always going to live somewhere else. The dump itself (`nvme0n1`, ~200–900
+MB/s for about 140 s) is a small part of the run; the tar phases held `sda` at
+a sustained ~265 MB/s for roughly 550 s.
+
+**Measured, same node, same model, same day.** The second column is the
+agent-direct path on `aks-gpuckpt-13588264-vmss00000g` — the node that
+produced the first column, so the disks, the driver, and the engine are held
+constant and the only variable is who runs the dump:
+
+| device | kubelet + tar | agent direct |
+|---|---|---|
+| `nvme0n1` read | 24.2 GB | 0.0 GB |
+| `nvme0n1` written | 59.1 GB | 56.5 GB |
+| `sda` read | 9.0 GB | 0.0 GB |
+| `sda` written | **257.9 GB** | **0.2 GB** |
+
+The OS disk is the headline: 257.9 GB to 0.2 GB. Nothing about the workload
+changed — that quarter-terabyte was the tar, written to `/dev/root` and read
+back to be expanded, and removing the tar removed all of it.
+
+The `nvme0n1` column is the cleaner result. Sampling `/proc/diskstats` every
+five seconds through the run shows **nothing written at all before the dump
+starts** at t=220 s, then a smooth ramp to 56.5 GB by the time the MANIFEST
+commits — against an artifact of 56,493,434,865 bytes across 636 files. A
+write amplification of **exactly 1.0**, which is the floor and the entire
+point of §3.
+
+That the pre-dump phase contributes zero is worth a note, because an earlier
+run of the same build measured 83.8 GB. The difference is 27.3 GB of weights
+the engine wrote to NVMe on a node that had not seen the model recently; here
+they were already in page cache, so the load phase touched no disk and the
+dump is isolated exactly. Both figures are honest about their own run — the
+one to quote for the write path is the isolated one, since weight loading is
+present in both arms of the comparison and is not what §3 changes.
+
+**What shipped:** `spec.checkpointer: agent`. The node agent runs
+`runc checkpoint` against the CRI runtime's own container with `--image-path`
+on the artifact directory, so CRIU writes each image once, where it will be
+read from. `artifact.PublishDir` then adds four small files and the MANIFEST.
+Nothing is copied.
+
+The artifact has to be indistinguishable from a kubelet-produced one, because
+`restore.Open` parses both and cannot tell them apart. So the agent
+reconstructs what containerd used to put in the tar: `config.dump` in the CRI
+metadata shape (its encoded pod UID is how images are found), `spec.dump` and
+the overlay upperdir path read from the *live* container before the dump takes
+the process with it, `dump.log` (a restore input — `scanDumpLog` reads the
+mount table out of it, not a diagnostic), `rootfs-diff.tar`, and `shm-diff.tar`.
+
+**The restore side of the same node.** Condition A's artifact restored on the
+host that produced it, page cache dropped first (a 56 GB artifact fits inside
+216 GB of node RAM, so a warm run measures memory and nothing else):
+
+| t | phase |
+|---|---|
+| 5 s | pre-warming the artifact onto the node |
+| 157 s | pre-warm complete; `runc restore` starts |
+| 339 s | Running — CRIU handed the process back |
+| 344 s | `/health` answers |
+
+`nvme0n1` 103.4 GB read / 48.0 GB written; `sda` 0.3 GB / 0.2 GB. The read
+figure is close to twice the artifact: pre-warm pulls 56.4 GB onto the node
+and CRIU then reads it back, which is the copy §6c is about.
+
+The restore is verified, not merely Ready: the engine answers `The capital of
+France is` with ` Paris. The capital of Spain is Madrid`. A CRIU image can
+restore into a process whose CUDA context is subtly wrong and serve confident
+garbage, so a phase is not a pass condition — a correct completion is.
+
+**The run that produced those numbers did not publish, and why is worth
+recording.** The dump finished cleanly — `Dumping finished successfully`, CUDA
+plugin err 0, 208 page files totalling 56.5 GB — and then the artifact was
+thrown away, because `PublishDir`'s `Contribute` hook returned an error.
+
+The hook captures two supplementary diffs, `shm-diff.tar` and
+`rootfs-diff.tar`. Both read directories belonging to the pod being
+checkpointed, and both run *after* the dump — which is precisely when that pod
+is terminating, because `runc checkpoint` took its container. The kubelet is
+then free to reap its emptyDirs. So `os.ReadDir` on `/dev/shm` returned
+ENOENT, the error propagated, and a seventeen-minute dump of a 56 GB engine
+was discarded over a scratch tmpfs that unmounted a second early. The two
+diffs are optional on the restore side; treating their absence as fatal was
+never the intent. They are now logged and skipped.
+
+The second bug is the one that made the first one hard to find. `fail()`
+wrote its message with a plain `Status().Update` against the `snap` object the
+reconciler had been holding for the whole dump. Seventeen minutes is long
+enough that the manager has written that object's status several times over,
+so the update always conflicted; the conflict propagated instead of the real
+message, the reconciler re-entered for a container that no longer existed, and
+the snapshot spun at one conflict per second still claiming to be
+`Checkpointing`. **An error path that cannot record its own error is worse
+than no error path** — the reason was never written anywhere, and the only way
+to recover it was to read the artifact directory and infer which step had left
+its output behind. `fail()` and `retry()` now go through the same re-read-on-
+conflict helper `complete()` uses.
+
+**A third bug surfaced on the retry, and it is the most instructive of the
+three.** The re-run failed with
+
+```
+open .../qwen2.5-14b-instruct-agent/checkpoint/descriptors.json: operation not permitted
+```
+
+seventeen minutes in, with `descriptors.json` timestamped an hour earlier.
+CRIU will not overwrite an image file it did not create, so a stale one from a
+dead attempt stops the dump — and by the time it does, `runc` has already
+taken the container and there is nothing left to checkpoint a second time.
+
+The cleanup that should have prevented it looked correct: `os.RemoveAll` on
+the image directory, right before the dump, its error checked. It returned
+nil. The directory still held 632 files.
+
+`RemoveAll` tries a plain `Remove` on the path first and returns early when
+that succeeds. On the fuse-client mount an `rmdir` of a *non-empty* directory
+returns 0 without unlinking anything — so the call reported success, never
+recursed, and the `MkdirAll` behind it re-created the same name over a tree
+that was entirely intact. The directory's mtime moved; its contents did not.
+This belongs on the same list as the store's other POSIX departures: rename
+copies without unlinking, `O_TRUNC` is ignored, and mode-on-create fails with
+`No data available`. `Store.Delete` already knew better and goes over the
+fuse-client HTTP API rather than `os.Remove`; the agent trusted the syscall.
+
+The failure mode that did *not* happen is the one worth designing against.
+CRIU appends to image files it finds, so a `pages-*.img` carried over from a
+previous attempt is indistinguishable from a good one once the MANIFEST
+commits on top of it. An EPERM that costs seventeen minutes is the loud
+version; a silently-corrupt 56 GB artifact that restores into a subtly wrong
+process is the quiet one, and nothing downstream would catch it.
+
+So the clear is now verified rather than attempted: unlink the entries one at
+a time, then read the directory back, and treat a non-empty result as a
+failure *before* the dump rather than after. It covers the whole artifact
+directory, not just `checkpoint/` — `dump.log` and `spec.dump` sit at the top
+level, the restore reads the container's mount table back out of them, and the
+old cleanup never touched them at all. **On a filesystem that does not
+implement POSIX faithfully, a return value is not evidence; a read-back is.**
+
+Two smaller decisions fell out of this:
+
+- **Digesting is opt-in and off.** The manifest walk originally hashed every
+  file, which would have re-read all 56 GB immediately after writing it — the
+  exact pass this path exists to remove. Sizes are recorded either way, and
+  both the prefetch verifier and the NVMe cache check fall back to size when
+  no digest is present. The kubelet path still digests, because it is
+  streaming the bytes through the expander anyway and the hash is free there.
+- **Routing degrades, never stalls.** The agent advertises `agent-checkpoint`
+  in `podsnapshot.io/capabilities`; the manager falls back to the kubelet
+  path, with the reason in the snapshot's status, when the node's agent is too
+  old to claim it or when the artifact is a tar. A cluster mid-upgrade keeps
+  working, and a snapshot never waits on an agent that will not act.
+
+Two things about the dump only became visible once the agent owned it, and
+both are properties of the operation rather than bugs in a particular
+implementation.
+
+**A dump is not idempotent, and the state machine has to know it.**
+`runc checkpoint` takes the container with it: after a successful dump there
+is no process left to dump again. That makes the ordinary controller reflex —
+fail, requeue, retry — actively wrong at exactly one point, between CRIU
+finishing and the status write landing. The manager writes the same object's
+status while the dump runs, so losing that write to a conflict is the normal
+case, not the exceptional one; and the retry that follows re-enters a dump
+whose container is already gone. The first real run showed it precisely: a
+47-second dump, a complete artifact on disk, and a snapshot that then spun in
+`Checkpointing` forever reporting a missing sandbox. The completion now
+re-reads on conflict, and a reconcile that finds a committed MANIFEST
+finishes the bookkeeping rather than dumping again. The kubelet path never
+had to think about this, because the tar it returns is a value — it can be
+re-requested, and the retry is harmless.
+
+**A mutable tag is not a version.** That bug took much longer to find than to
+fix, because every check said the cluster was current while the manager
+running in it was three commits old. The images are pinned to tags, the pull
+policy is `IfNotPresent`, and re-pushing a tag a node already has changes
+nothing: the rendered pod spec is byte-identical, no rollout happens, and the
+node goes on serving its cached layers. The stale manager did not know about
+`spec.checkpointer`, so its finalizer `Update` silently pruned the field, and
+the build ran the kubelet path while reporting itself as the agent one — a
+measurement attributed to the wrong code, which is the one failure this
+project can least afford. `hack/deploy.sh` now compares registry digests
+against what the kubelet actually pulled, and restarts the workloads after a
+build. This is the same class of failure as the CRIU marker drift in §6: the
+artifact that says what is installed is not the thing that is running, and
+only the running thing counts.
+
+### 3b. The storage tier is a variable, and it is the larger half
+
+§3 removed the tar. What it did not remove was the network filesystem
+underneath, and separating the two turns out to matter: they cost different
+amounts, on different sides, and only one of them is what §3 was about.
+
+The artifact root is now configurable — `--artifact-root` on the manager,
+`manager.artifactRoot` in the chart — and it selects the tier rather than just
+the path. `fuse:///snapshots` is the distributed mount, restorable from any
+node. `file:///mnt/fuse-nvme0n1/ps-artifacts` is the node's own NVMe, mounted
+into the agent at the same path it has on the host (`agent.localArtifactRoot`)
+because `runc checkpoint` resolves `--image-path` in the host mount namespace
+while the agent reads the same files in its container. Both directions use it:
+the dump writes CRIU's images into it, and the restore reads them back out of
+it with no pre-warm, no promotion, and no pin — the bytes are already on the
+device `runc` will read them from.
+
+Four arms, same node (`aks-gpuckpt…00000g`), same 56 GB Qwen2.5-14B, same pod
+template, same patched CRIU 4.2.1 (`GitID 6c683e4`, verified installed before
+all three restores), no CRIU tuning annotations on any of them:
+
+| Arm | Storage | Dump path | Quiesce→ckpt | Checkpointing | Upload | **Snapshot** |
+|---|---|---|---|---|---|---|
+| A | fuse | kubelet+tar | — | — | — | **3364 s** |
+| B0 | fuse | agent direct | 220 s | 1205 s | none | **1425 s** |
+| C | NVMe | kubelet+tar | 209 s | 914 s | 156 s | **1279 s** |
+| B | NVMe | agent direct | 231 s | 66 s | none | **297 s** |
+
+Restores, all with the page cache dropped before the clock starts:
+
+| Arm | Pre-warm | CRIU done | **Serving** | nvme read / write |
+|---|---|---|---|---|
+| A | 153 s | 339 s | **344 s** | 103.4 / 48.0 GB |
+| C | 3 s | 40 s | **43 s** | 56.4 / 0.0 GB |
+| B | 2 s | 37 s | **42 s** | 56.5 / 0.0 GB |
+
+All three served the same correct completion (` Paris. The capital of Spain is
+Madrid…`), which is the pass condition — a phase is not.
+
+**On the restore, the tar contributes nothing and the storage is everything.**
+B and C are the same within noise, because by restore time they *are* the same
+thing: a ~56 GB directory of CRIU images (636 files for B, 640 for C, the
+difference being kubelet's own bookkeeping files rather than anything CRIU
+reads). Whether a tar existed an hour
+ago on the write side leaves no trace on the read side. What separates them
+from A is 8.0×, and the I/O columns say why — A reads 103.4 GB to restore a
+56 GB artifact and writes 48.0 GB doing it, which is pre-warm promoting the
+artifact into the NVMe tier and then reading it back. B and C read 56.5 GB and
+write nothing: amplification exactly 1.0.
+
+**On the dump, both matter and they compound.** The tar costs 982 s (C vs B),
+the network filesystem costs 1128 s (B0 vs B), and A→B is 11.3× overall.
+
+**The untar is the small half of the tar.** From CRIU's own `dump.log` —
+arm C `(121.17445) Dumping finished successfully`, arm B `(67.702426)` — arm
+C's 914 s Checkpointing phase is 121 s of CRIU and roughly 793 s of tar
+*creation*: `sda` writes hold ~250 MB/s from t=231 s to t=1123 s, 201.2 GB.
+The expand that follows is only 156 s (nvme 52.3 GB at 335 MB/s, and `sda`
+read of **0.0 GB** — the tar it is expanding is served entirely from page
+cache). So of the archive's cost, ~81% is writing it and ~16% is reading it
+back. Removing the untar was worth 156 s; removing the tar was worth 793 s.
+
+CRIU itself is also slower in arm C (121 s vs 68 s) for a reason that has
+nothing to do with CRIU: the kubelet path makes it write to `/var/lib/kubelet`
+on the OS disk, while the agent path points it at the NVMe. Same binary, same
+flags, different device.
+
+**What it costs.** A `file://` artifact exists on exactly one node, so every
+restore of it has to be pinned there (`spec.nodeName`). That makes the NVMe
+tier a per-node warm pool, not a way to ship a snapshot between machines — the
+right default is still `fuse:///snapshots`, and the tier is a per-deployment
+or per-snapshot choice rather than a replacement.
+
+**And a boundary that comes with it.** A `file://` URI on a CRD is a raw host
+path handed to a privileged agent that runs `runc` in the host mount
+namespace, which without confinement makes `artifactURI: file:///etc` a
+request to clear and repopulate `/etc` as root. When `agent.localArtifactRoot`
+is set it is the only place the agent will read or write a `file://` artifact
+(`artifact.CheckLocalRoot`), and it is also the only host path the DaemonSet
+mounts writable. `fuse://` URIs are unaffected — they are relative to the
+mount by construction and `Parse` already rejects traversal.
+
+**Defaults follow the measurement.** `spec.checkpointer` now defaults to
+`agent` and `spec.artifactFormat` to `dir`, on PodSnapshot and SnapshotBuild
+alike. The two have to move together: an agent default over a tar default
+routes every snapshot into the kubelet fallback and quietly measures the old
+path, so a test asserts the shipped CRDs carry both
+(`api/v1alpha1/crd_defaults_test.go` — the marker comment is a wish, the
+generated YAML is the fact). The fallback in `agentCheckpoints()` is what
+makes the flip safe mid-upgrade: a tar artifact or a node that does not
+advertise `agent-checkpoint` degrades to the kubelet path with the reason in
+the snapshot's status.
+
+---
+
+## 4. Workstream 2 — quiesce/resume hooks
+
+**Payoff: fixes the io_uring dump failure, and drops KV cache from the image.**
+
+This is the single highest-leverage change to *correctness*, not just speed.
+Today we dump a live serving process, which means we dump whatever it happens to
+be holding: io_uring rings (CRIU cannot dump them), a listening frontend socket
+with live peers, NCCL/RDMA registrations, and a KV cache full of nothing useful.
+
+### Presence-file protocol
+
+Exactly Dynamo's design. An entrypoint shim wraps the engine:
+
+1. Initialize the engine — load weights, warm kernels, capture CUDA graphs.
+2. Release KV physical memory: `llm.sleep(level=1)` (vLLM) or
+   `torch_memory_saver` region release (SGLang).
+3. `touch /snapshot/ready-for-checkpoint`.
+4. Block polling for `/snapshot/restore-complete`.
+5. — *checkpoint happens here, asynchronously, while the process sits in the
+   poll loop* —
+6. On restore, CRIU resumes execution at the exact instruction inside the poll
+   loop. The file is now present.
+7. `wake_up()` — KV physical pages re-mapped into the reserved VA range.
+8. *Only now* start the HTTP frontend and the distributed runtime.
+
+### Why this fixes io_uring
+
+Step 8 is the lever. Everything un-dumpable — the frontend's io_uring-backed
+event loop, uvloop's rings, NCCL communicators, RDMA registrations, TCP
+listeners — is created *after* the quiesce point, so it does not exist in the
+image at all. It is constructed fresh on the resume side, on a node where it can
+actually be constructed correctly. This is the same reason Dynamo lists
+quiesce/resume as the prerequisite for their multi-GPU/multi-node work.
+
+### Why this shrinks the image
+
+At the quiesce point the KV cache has never served a request. vLLM/SGLang
+allocate it through the CUDA VMM API (`cuMemCreate` + `cuMemMap`), so the
+physical pages can be dropped with `cuMemUnmap` + `cuMemRelease` while the
+**virtual address reservation stays put** — which is what keeps the captured
+CUDA graphs valid across the restore. Dynamo measures 190 GiB → 6 GiB on a B200
+for Qwen3-0.6B; the ratio scales with how much of the GPU the KV cache was
+allowed to claim.
+
+`sleep(level=1)` is the supported, no-custom-code version of this. Note that it
+also offloads weights to host RAM — which for our purposes is roughly neutral,
+since `cuda-checkpoint` moves device memory to host during dump anyway. If we
+want to go below what `sleep()` gives us, the lower-level route is driving
+`cuMemUnmap`/`cuMemRelease` on the KV pool directly and keeping weights resident
+on the device for `cuda-checkpoint` to capture. That is an optimization, not the
+first cut.
+
+### Interface
+
+The shim is workload-side, so it must be a contract, not a code dependency:
+
+```yaml
+# on the pod being snapshotted
+metadata:
+  annotations:
+    podsnapshot.io/quiesce: "presence-file"
+    podsnapshot.io/quiesce-dir: "/snapshot"        # default
+    podsnapshot.io/quiesce-timeout: "600s"
+```
+
+- Manager waits for `<dir>/ready-for-checkpoint` (polled via the agent, which
+  can already see container filesystems) before issuing the checkpoint, instead
+  of waiting on the readiness probe.
+- Agent creates `<dir>/restore-complete` inside the restored container's rootfs
+  immediately **before** `runc restore` returns control — the file must be
+  visible the moment the poll loop next spins.
+- `<dir>` must be a writable `emptyDir`; it is captured in the image, so the
+  agent writes into the restored container's view of it.
+
+We ship a reference shim (`hack/snapshot-shim.py`) covering vLLM, and document
+the protocol for anything else. Workloads without the annotation take the v1
+path unchanged.
+
+### What shipped
+
+`PodSnapshot` gains a `Quiescing` phase between `Pending` and
+`Checkpointing`. The manager resolves the contract off the pod's annotations
+and sets the deadline; the node agent polls for the presence file and hands
+the snapshot back to the manager when it appears. The agent reads the
+rendezvous directory through the container init's mount namespace
+(`/proc/<pid>/root/...`) — an `emptyDir` is a mount *inside* the container and
+is not visible under its bundle rootfs, which is the one thing about this that
+is not obvious.
+
+On restore the agent writes the resume file through the *keeper* container's
+mount namespace: the keeper mounts the same `emptyDir` the restored workload
+will, and the spec rewriter has already remapped that volume onto the new pod.
+The contract is also recorded in the artifact MANIFEST, so a quiesced
+checkpoint is self-describing and a `PodRestore` does not have to repeat the
+annotations.
+
+`llm.sleep(level=1)` measured on an A100 80GB, vLLM 0.9.2:
+
+| Model | Device memory before | After | Freed |
+|---|---|---|---|
+| Qwen2.5-1.5B-Instruct | 48.6 GiB | 0.98 GiB | 47.6 GiB |
+| Qwen2.5-14B-Instruct | 72.5 GiB | 1.31 GiB | 71.2 GiB |
+
+The ratio tracks how much of the GPU the KV cache was allowed to claim, as
+Dynamo's does. Note what it does *not* do: `sleep(level=1)` offloads weights
+to host RAM rather than dropping them, so they move from the device side of
+the image to the host side rather than leaving it. That is why the artifacts
+below are still roughly weights-sized — and why §7 is the thing that would
+actually shrink them.
+
+---
+
+## 5. Workstream 3 — snapshots as build artifacts
+
+**Payoff: makes quiesce usable at all, and removes the checkpoint timeout
+pressure.**
+
+Quiesce-then-checkpoint is destructive: a replica that has released its KV cache
+and parked in a poll loop is not serving. So it cannot be a live serving pod.
+
+The fix is to stop thinking of a snapshot as "a picture of this pod" and start
+thinking of it as "a build output for this revision":
+
+- **One artifact per `(image, model, GPU SKU, driver, CRIU version)`**, built by
+  a one-shot Job at revision-publish time, on a node matching that SKU.
+- Every 0→1 scale-up restores that same image. N restores, one build.
+- The artifact is immutable and content-addressed; the tuple above is exactly
+  the environment-matching table already in
+  [prerequisites.md](prerequisites.md#restore-environment-matching), so it
+  doubles as the compatibility key we check before scheduling a restore.
+
+### New CRD: `SnapshotBuild`
+
+```go
+type SnapshotBuildSpec struct {
+    // PodTemplate for the build pod — the real workload plus the shim.
+    PodTemplate corev1.PodTemplateSpec
+
+    // Revision identifies the artifact; also the directory name under the
+    // image root. Immutable.
+    Revision string
+
+    // Compatibility is the environment tuple restores are matched against.
+    // Filled in from the build node if unset.
+    Compatibility *CompatibilityKey   // gpuModel, driverVersion, criuVersion, imageDigest
+
+    // ArtifactURI defaults to fuse:///snapshots/builds/<revision>/
+    ArtifactURI string
+}
+```
+
+`PodRestore` gains `spec.buildRef` alongside `artifactURI` and `snapshotRef`.
+The restore controller refuses to schedule onto a node whose
+`podsnapshot.io/prereqs` compatibility tuple does not match the build's —
+today that mismatch is a runtime failure deep inside `runc restore`.
+
+### What shipped
+
+`SnapshotBuild` runs a bare Pod rather than a Job: the checkpoint is taken of
+one specific running container, and a Job's restart semantics only get in the
+way of a pod that is deliberately parked in a poll loop and never exits. The
+build drives an ordinary `PodSnapshot` against that pod, so the quiesce wait
+is the same code path as everywhere else, and deletes the pod once the
+artifact exists.
+
+The compatibility tuple is published by the agent as the node annotation
+`podsnapshot.io/compat` plus a label `podsnapshot.io/compat-hash` — annotations
+cannot be selected on, and the GPU model contains spaces so it cannot be a
+label value. A `PodRestore` with `buildRef` copies the build's tuple into its
+status, and `BuildPlaceholderPod` adds the hash to the pod's `nodeSelector`.
+The scheduler then never places the pod somewhere the artifact cannot restore;
+a pinned `spec.nodeName`, which bypasses the scheduler, is checked directly
+and fails with a specific message instead.
+
+### Consequences
+
+- The `runtimeRequestTimeout: 10m` problem disappears: the checkpoint no longer
+  runs inside a kubelet API call on a serving pod's critical path. It runs in a
+  Job that can take as long as it takes.
+- `PodSnapshot` (checkpoint a live pod) stays, for debugging and for
+  non-quiescible workloads. It is no longer the primary path.
+- Autoscaler integration becomes trivial: a scale-up controller creates a
+  `PodRestore` pointing at the current revision's build. Whatever swaps the
+  workload container for a keeper and annotates the pod with the artifact
+  reference now points at a build-time URI rather than a per-pod tar — the
+  mechanism in `internal/controller/placeholder_pod.go` is unchanged.
+
+---
+
+## 6. Workstream 4 — restore-side I/O parallelism
+
+**Payoff: the 2.8×–7.9× in the table above. Only reachable after workstream 1.**
+
+Dynamo's numbers come from a patched CRIU that is **not upstream yet**. Two
+routes, and they are not exclusive:
+
+### 6a. `criu-image-streamer` (no patches, available today)
+
+`criu restore --stream` reads the image through multi-pipe parallel streams and
+skips the filesystem round-trip. It attacks the same bottleneck the AIO patch
+does — storage bandwidth left on the floor by a one-read-at-a-time restore —
+without a CRIU fork to maintain. This is the default we should ship.
+
+Requires image-directory artifacts (workstream 1) and a `runc restore` build
+that forwards the flag; verify against the node's runc before enabling, and fall
+back silently if absent.
+
+### 6b. Forked CRIU (only if 6a is not enough)
+
+Two changes, both in CRIU's restore read path:
+
+- **`criu/pagemap.c`** — replace the sequential `read_local_page`/`preadv` loop
+  with an `io_submit`/`io_getevents` sliding window (build the `iocb` job list
+  up front, keep ~128 reads in flight, backfill on completion). Use `O_DIRECT`
+  when the backing filesystem supports it, to avoid a page-cache copy on a
+  one-pass streaming read; fall back to buffered I/O with sequential readahead
+  on NFS.
+- **`criu/shmem.c`** — enumerate unique shmem/memfd objects first, then restore
+  them from a thread pool instead of the serial create → resize → map → read →
+  next loop. This is the path that matters for us specifically: vLLM and SGLang
+  park GPU allocations in pinned CPU shadow buffers that appear to CRIU as
+  memfds, so on a GPU checkpoint this *is* most of the image.
+
+**Track upstream before writing any of this.** NVIDIA says both are pending
+merge; a rebase onto CRIU v4.3+ may hand us the whole thing for free, and a
+private fork means owning driver/plugin compatibility for every node image.
+Concretely: check the CRIU tree at the start of this workstream, and only fork
+if the patches are still unmerged *and* 6a measured short.
+
+### What shipped
+
+The upstream check came back the wrong way. The AIO work **is** merged
+(checkpoint-restore/criu#3022 and #3066) but there is no release carrying it:
+the newest tag is still v4.2.1, which is exactly what the node images run. So
+the choice was not fork-vs-upstream, it was fork-vs-wait. We forked.
+
+The fork is a real fork, published at
+[github.com/nickaggarwal/criu](https://github.com/nickaggarwal/criu), branch
+`pod-snapshotter/v4.2.1-restore-parallelism`. It branches off the upstream
+`v4.2.1` tag (commit `9539417`) and carries six commits, each a reviewable,
+rebasable change on its own:
+
+| Commit | Mirrored patch | What it changes |
+|---|---|---|
+| `be64855` | `0001-make-shared-restore-state-thread-safe.patch` | `criu/bfd.c`, `criu/log.c` — locks the two shared statics the pools reach |
+| `1398bff` | `0002-pagemap-native-aio-async-page-reads.patch` | `criu/pagemap.c` — the async read path gets an `io_submit`/`io_getevents` sliding window |
+| `53e7e72` | `0003-shmem-parallel-restore.patch` | `criu/shmem.c`, `criu/mem.c` — a thread pool that creates, sizes and fills shmem objects concurrently |
+| `2090e7f` | `0004-memfd-parallel-inode-restore.patch` | `criu/memfd.c` — the same pool shape for memfd inodes |
+| `4377264` | `0005-shmem-read-memfd-and-shmem-pages-asynchronously.patch` | `criu/shmem.c` — passes `PR_ASYNC`, which is what finally puts memfd and shmem bytes on the AIO path at all (§6d) |
+| `6c683e4` | `0006-pagemap-bound-how-far-one-async-read-coalesces.patch` | `criu/pagemap.c` — caps one queued read at 1 MiB so an object does not collapse into a single submission |
+
+`add24ee` between them is `POD-SNAPSHOTTER.md`, which describes the branch to
+anyone who finds the fork without this repo.
+
+Note the ordering of the discovery, because it is the useful part: `1398bff`
+was written first and was dead code on this workload for its entire life.
+`4377264` is three lines of real change and is what makes it run. A patch
+that is merged and shipped is not a patch that executes.
+
+The same six changes are mirrored into `hack/criu/patches/*.patch` so the
+series stays readable from this repo without cloning anything, and so it can
+be re-cut against a newer upstream base. The mirror is kept identical to the
+published commits — same files, same hunk counts.
+
+[Dockerfile.criu](../Dockerfile.criu) builds from the fork, pinned to a
+**commit** rather than the branch tip: what shipped to a node has to be
+reconstructible later, and a moving branch would make the image tag ambiguous.
+It then asserts that `Makefile.versions` still reads exactly `4.2.1` before
+building, so a future rebase onto a different upstream base fails at build
+time rather than shipping a binary whose CRIU image format silently disagrees
+with the node's CUDA plugin.
+
+**The CUDA plugin is deliberately not replaced.** The fork is based on the
+exact CRIU version the node already runs, so the plugin ABI is unchanged and
+the patched binary loads the node's existing
+`/usr/lib/criu/cuda_plugin.so`. The GPU-critical piece — the one whose
+interaction with the driver was validated the hard way — stays byte-identical.
+A freshly built plugin ships alongside and is only laid down on a node that
+has none.
+
+Installation goes to `/usr/local/sbin`, which precedes `/usr/sbin` on the
+default PATH, so runc picks up the patched binary without the distro package
+being touched. Uninstalling is `rm`. The installer
+([hack/criu/install.sh](../hack/criu/install.sh), run by an opt-in DaemonSet
+gated on `criu.enabled`) refuses to leave a binary behind that the host cannot
+execute: it runs `criu --version` under `chroot` and rolls back on failure,
+because a missing shared library would otherwise surface as a failed restore
+minutes later on a different code path.
+
+### Per-restore tuning, not per-node
+
+All three patches read their settings from the environment, and
+`runc restore` is given that environment per restore
+([internal/restore/runc.go](../internal/restore/runc.go)):
+
+| Annotation | Env | Meaning |
+|---|---|---|
+| `podsnapshot.io/criu-aio-depth` | `CRIU_AIO_DEPTH` | reads in flight; `0`/`1` = stock serial `preadv` loop |
+| `podsnapshot.io/criu-shmem-threads` | `CRIU_SHMEM_RESTORE_THREADS` | shmem/memfd objects restored concurrently; `1` = stock serial loop. Unset = `min(nproc, 8)`, hard cap 32. Since each worker's reads are serial, this *is* the effective queue depth — see §6d |
+| `podsnapshot.io/criu-image-io-mode` | `CRIU_IMAGE_IO_MODE` | `writeback` (default) or `direct` for `O_DIRECT`. Also the only per-process way to get a cold-cache measurement |
+| `podsnapshot.io/criu-aio-chunk` | `CRIU_AIO_CHUNK` | bytes one queued async read may grow to before splitting; `0` = unbounded. Default 1 MiB. Ignored before `v4.2.1-ps5` |
+
+That shape was chosen for one reason: **A/B on the same binary.** Setting
+depth `0` and threads `1` makes both patches inert, so a regression can be
+attributed to the patches rather than to the rebuild, without reinstalling
+anything on the node. It also means a stock CRIU can be handed the same
+annotations and will simply ignore them, which is why the agent sets them
+unconditionally rather than probing for the fork first.
+
+### What the pools got wrong the first time
+
+The first build of the pools (`v4.2.1-ps3`) failed **every** restore it was
+enabled for, and the failure is worth recording because the fix is not local
+to the patch — it is a property of where CRIU's restore runs.
+
+```
+148: Error (criu/util.c:1014): Unable to change [10]/ ownership to (0, 0): Bad file descriptor
+148: Error (criu/memfd.c:471): Can't set permissions ... of memfd:/dev/zero: Bad file descriptor
+148: Error (criu/mem.c:1475): `- Can't open vma
+```
+
+`[10]` is the tell: `cr_fchpermat()` prints its `dirfd`, and 10 was a
+descriptor the pool had opened in CRIU's **main process** during
+`prepare_memfd_inodes()`. But `memfd_open_inode_nocache()` runs inside the
+**forked tasks**, which have already rebuilt their fd tables
+(`setup_newborn_fds` → `close_old_fds`). By the time the fd number was read it
+named nothing, or some unrelated file. Passing an fd *number* through shared
+memory only works while everyone still shares an fd *table*.
+
+The memfd pass now publishes through `fdstore_add()` — the mechanism CRIU
+already uses for exactly this boundary, a datagram socket every forked task
+inherits. `memfd_open_inode()` already prefers `fdstore_id` when set, so a
+prepared inode needs no new lookup path; it simply arrives already cached.
+
+**The shmem pass keeps a plain descriptor, and that is correct, not an
+oversight.** `shmem_restore_parallel()` is called from `open_vmas()` — already
+inside the task that will consume the fd — so it never crosses a fork. The
+asymmetry between the two passes *is* the bug, so each side now states which
+one it is and why.
+
+Reading the rest of the shared state for the same class of mistake turned up
+two races that had not fired yet, either of which would have corrupted a
+restore in a much harder-to-attribute way than a bad fd:
+
+- `criu/bfd.c` keeps a free list of read buffers that every worker reaches via
+  `open_page_read → open_image_at → bfdopenr → buf_get`. Two workers could
+  take the same buffer, or race the refill.
+- `criu/log.c` formats every `pr_*` call into one shared static buffer.
+
+Both are now locked (patch 0001). The early-outs in `vprint_on_level()` stay
+*outside* the lock, so a filtered-out debug line still costs nothing — the
+pools make `pr_debug` a hot path in a way it was not before.
+
+The general lesson for anything else added to this fork: CRIU's restore
+crosses a fork boundary partway through, and a patch that adds concurrency
+before that point cannot hand anything fd-shaped to the far side except
+through the fdstore.
+
+### What the async patch may not do
+
+`process_async_reads_aio()` deliberately declines the AIO path when
+`opts.auto_dedup` is on — dedup rewrites the image as it reads, and the
+sliding window would have several reads outstanding against a file that is
+being punched underneath them.
+
+Making shmem and memfd page reads `PR_ASYNC` — so the pool and the AIO window
+compose — was tried once before and reverted: merging adjacent async read jobs
+produced a single read spanning past the end of an object's pages image,
+`AIO read returned 0 at 268435456, 1 iovs left`, then `BUG at
+criu/pagemap.c:963`. That failure was the unbounded coalescing in
+`pagemap_enqueue_iovec()`, which `6c683e4` now caps, and the two commits in
+§6d land the same idea successfully — 205 of 208 page images are memfds, so
+this is where nearly all the bytes are. The revert stands as the reason the
+cap exists, not as a claim that the paths must stay disjoint.
+
+For a workload whose memory is mostly private anonymous VMAs the split would
+be the other way round, and `criu/mem.c`'s list is deliberately left
+uncapped: it is rendered into `task_restore_args` and replayed by the restorer
+blob, where each job costs memory and no batching happens.
+
+### 6c. The transport ceiling, and how it came down
+
+Halving CRIU restore exposed what was underneath it. 452 s end-to-end for a
+52 GiB artifact is ~0.25 GB/s sustained, on *both* phases. PCIe on this node
+would move that in about three seconds. So the patched CRIU was no longer the
+constraint — getting the bytes to it was — and three things were paying for
+that:
+
+1. **The bytes moved twice.** Pre-warm copied the artifact from the fuse mount
+   onto node-local storage, then CRIU read that copy. Directory artifacts
+   exist precisely so this copy is unnecessary (`PrefetchOpts.StageDir`
+   empty = restore in place); the copy was a hand-applied
+   `--stage-image-local=true` on the live DaemonSet, not the chart default.
+
+2. **Prefetch ran at the wrong concurrency.** Measured on a warm client, read
+   throughput peaks at 4 concurrent files (~1.3 GB/s) and *falls* on either
+   side: 542 MB/s at 2, 642 MB/s at 8. The live setting was 2 — chosen not
+   because it was fast but because 8 had OOMKilled the fuse client, so the
+   workaround for a memory bug became a throughput ceiling.
+
+3. **The client idles near its limit.** `client-fmjpg` sat at 14.98 GiB of a
+   16 GiB limit (`memory.peak` 16.03 GiB — already over), of which 6.5 GiB is
+   unreclaimable anon. It does not OOM because readers allocate much; it OOMs
+   because a burst has ~1 GiB to land in. Raising parallelism without fixing
+   that just moves the failure.
+
+**What `/proc/diskstats` said.** Sampling sectors-read per device across a
+restore is what actually located the problem, and it was not where any of the
+three guesses pointed. During a staging restore the node read **266 MB/s from
+`sda`** — the 256 GB OS disk — and **0 B/s from `nvme0n1`**, the 894 GB local
+NVMe. The staging copy was writing to and reading back from the wrong device
+entirely. Dropping it moved the reads onto `nvme0n1` and cut end-to-end from
+452 s to 253 s.
+
+**The mount itself is the remaining ~7×.** With staging gone, measuring the
+same bytes two ways: through the FUSE mount, 500-690 MB/s; straight off
+`nvme0n1`, 2.6 GB/s single-stream `O_DIRECT` and 4519 MiB/s at four streams.
+fuse-client already promotes everything it serves onto a node-local cache tier
+laid out as a faithful 1:1 mirror of the artifact prefix (verified: 632 files
+on both sides, matching sizes, no `.nvme-stream` temp files). So the bytes are
+*already on the device* — reading them back through the userspace filesystem
+that put them there is pure tax.
+
+`NVMeCache` (`internal/artifact/nvmecache.go`) skips it. When the tier holds
+every file the manifest lists at the size the manifest says, `runc restore`
+gets `--image-path` pointed at the cache directory and the mount is out of the
+read path. Pre-warm gets the same check: if the bytes are resident there is
+nothing to warm.
+
+| | pre-warm | CRIU restore | total to Ready |
+|---|---|---|---|
+| staging on, P=2 | 225 s | 225 s | 452 s |
+| staging on, P=4 | 220 s | 224 s | 446 s |
+| staging off, P=4 | 104 s | 147 s | 253 s |
+| **NVMe bypass** | **2 s** | **35 s** | **40 s** |
+
+Every row was verified by generation, not by readiness probe:
+`"The capital of France is"` → `" Paris. The capital of Spain is Madrid."`
+
+Two things about that table are worth stating plainly. The 11× end-to-end is
+almost entirely transport, not CRIU: the patched binary is identical across
+the last three rows. And the manifest check is what makes the bypass safe — a
+partial mirror declines and falls back to the mount, a size that disagrees
+with the manifest is an error rather than a silently wrong restore.
+
+**The AIO A/B, and why it measured nothing.** The `criu-aio-depth` A/B came
+back flat. The first reason is page cache. The node has 226 GB of RAM and the artifact is
+52 GiB, so once one restore has read it, every later restore is served from
+memory. `node_disk_read_bytes_total` on the restore node, at 15 s resolution
+across all four runs:
+
+| run | `criu-aio-depth` | wall | read from `nvme0n1` |
+|---|---|---|---|
+| 1 | 128 (default) | 35 s | **44.0 GB** |
+| 2 | 0 | 23 s | 0.0 GB |
+| 3 | 128 | 22 s | 0.0 GB |
+| 4 | 128 | 23 s | 0.0 GB |
+
+Runs 2-4 touched the device zero times. A read-path patch cannot be
+benchmarked against reads that never reach a device, so the 22 s-vs-23 s
+comparison is a null result on those grounds alone.
+
+It turns out there is a second and more decisive reason, found by reading the
+source rather than the numbers: the AIO patch is not on the path these bytes
+take at all. §6d has it. Evicting the cache between runs would have produced
+the same null result, for the better reason.
+
+**Run 1 is the one honest storage measurement**, and it is only three-quarters
+honest: 44.0 GB of the 56.4 GB came off `nvme0n1` and the remaining 12.4 GB
+was already cached from the pre-warm probe. It sustained 1.26 GB/s averaged
+over the whole 35 s with a 1.465 GB/s peak — which is well under the 2.6 GB/s
+single-stream and 4.5 GB/s four-stream figures the raw device benchmark gave,
+so even the storage-bound run was not storage-limited. That is consistent with
+what the phase breakdown below shows: the read path is not where the time is.
+
+**And `restore.log` says the read path is no longer the majority of it.**
+CRIU's own clock on that run, with the memfd pool confirmed active
+(`Restoring 205 memfd inodes on 8 threads`):
+
+| Phase | Wall | Share |
+|---|---|---|
+| CRIU proper — images read, memory mapped, tasks built | 8.9 s | 42% |
+| `cuda_plugin` resuming devices on the GPU worker | 12.4 s | 58% |
+| **total** | **21.3 s** | |
+
+That 12.4 s is a single gap in the log between `cuda_plugin: resuming devices`
+and the next line: one `cuda-checkpoint` call, no I/O of ours in it at all. It
+reproduces — a second run gave 8.7 s / 12.4 s / 21.4 s against the first run's
+8.9 s / 12.4 s / 21.3 s. It is the largest single item left in a restore, it
+is inside NVIDIA's plugin rather than in CRIU or in us, and neither the CRIU
+fork nor any transport work touches it.
+
+So the read path is now 8.9 s of a 40 s end-to-end — and the ordering of what
+to attack next changes accordingly. More AIO depth, `--stream`, faster
+devices: all of them divide into the 42%, and the resume half sets a floor
+they cannot cross. §7's weight decoupling is the one item on the list that
+plausibly moves the GPU side too, by shrinking what has to be resumed rather
+than by reading it faster.
+
+(One caveat on that split: it comes from a cache-warm run, the only kind with
+a `restore.log` still on the node when the timings were pulled. The 12.4 s is
+not I/O-bound, so on the storage-bound 35 s run it stays put and the CRIU
+half grows to ~22.6 s — 65% read path, 35% GPU resume. The read path's share
+across the two regimes is therefore 42-65%, and the GPU resume is 35-58%. The
+cheaper the storage gets, the more the GPU half dominates.)
+
+### 6d. Why AIO measured nothing, and the two commits that fix it
+
+Re-reading the CRIU source rather than the benchmark numbers settled the AIO
+question, and it settles it against the patch. The A/B was never going to
+show anything, and page cache is only the second reason.
+
+**The AIO patch is unreachable on 98% of the bytes.** `do_restore_shmem_content()`
+— the function behind both `restore_shmem_content()` and
+`restore_memfd_shmem_content()`, i.e. every shmem and every memfd — issues its
+reads as:
+
+```c
+pr.read_pages(&pr, vaddr, nr_pages, addr + vaddr, 0);   /* flags = 0 */
+```
+
+Flags `0`. `maybe_read_page_local()` gates its async branch on
+`(flags & (PR_ASYNC | PR_ASAP)) == PR_ASYNC`, so a zero-flag read falls
+straight through to `read_local_page()` — a blocking `pread` loop. Nothing is
+ever appended to `pr->async`, and `process_async_reads_aio()` returns at its
+first check, `if (!nr_jobs)`.
+
+The only caller in the tree that passes `PR_ASYNC` is `criu/mem.c:1250`, the
+private-anonymous task-memory path. On this checkpoint that is **3 of 208 page
+images**; the other 205 are memfds holding cuda-checkpoint's parked device
+memory — essentially the whole 52 GiB.
+
+So `criu-aio-depth: 128` vs `0` measured 22 s vs 23 s because on the bytes
+that matter the code under test does not execute. That is a stronger
+statement than the page-cache one: a cold-cache re-run would have produced the
+same null result, for this reason instead.
+
+**What the pools actually bought.** Patch 0004's 8 workers each run their own
+`do_restore_shmem_content()`, each doing serial blocking `pread`s. Effective
+queue depth is therefore 8, not 8×128. The measurement agrees precisely: run
+1 read 44.0 GB in 35 s = 1.26 GB/s, about 157 MB/s per thread, against a
+device that does 2.6 GB/s on one `O_DIRECT` stream and 4.5 GB/s on four. Eight
+threads at 157 MB/s each is what a queue depth of 8 against ~130 us NVMe
+service time looks like.
+
+**The restore is submission-limited, not storage-limited.** Both the peak
+(1.465 GB/s) and the average sit far below what the device gave a synthetic
+reader, and the gap is entirely accounted for by how few reads are in flight.
+
+**What was done about it.** Two more commits on the fork, and one knob that
+needed no code at all:
+
+1. **`4377264` — pass `PR_ASYNC`.** Three lines of real change in
+   `do_restore_shmem_content()`, plus an explicit drain before the mapping
+   goes away. This is what puts memfd and shmem bytes on the async path for
+   the first time; `1398bff`, the AIO patch itself, needed no modification —
+   it had simply never been reachable. Two paths stay unaffected by design:
+   `opts.auto_dedup` still routes to `process_async_reads_serial()` and
+   punches its holes exactly as before, and `pr->io_complete` is set only by
+   `uffd.c`, which does not reach this function.
+
+2. **`6c683e4` — bound the coalescing.** Necessary, and not obvious until the
+   first fix was written. `pagemap_enqueue_iovec()` extends the job in
+   progress for every read that continues it, with no upper bound. A memfd is
+   a contiguous ascending run of offsets into a single mmap, so *every* page
+   extends the same iovec and the entire multi-gigabyte object becomes exactly
+   one job — one submission, queue depth one. `PR_ASYNC` on its own would have
+   changed nothing measurable. The cap is 1 MiB, applied to `pr->async` only:
+   `criu/mem.c`'s list is rendered into `task_restore_args` and replayed by
+   the restorer blob, where each job costs memory and no batching happens, so
+   splitting there would be all cost. `CRIU_AIO_CHUNK` overrides it; `0`
+   restores unbounded coalescing.
+
+3. **Raise the pool.** `CRIU_SHMEM_RESTORE_THREADS` defaults to
+   `min(nproc, 8)` and is capped at 32. The node has 24 cores. Independent of
+   the two commits, and worth measuring on its own — it is the control that
+   separates "more threads" from "deeper queues per thread".
+
+`O_DIRECT` also becomes correct on this path, which it was not before.
+`CRIU_IMAGE_IO_MODE=direct` is off by default because most reads cannot be
+aligned — but `pages-%u.img` is declared `RAW_IMAGE_MAGIC`
+(`criu/include/magic.h:40`), so `do_open_image()` skips `img_check_magic()`
+and the file carries **no header**: every page offset is an exact multiple of
+`PAGE_SIZE`, and the destination is an mmap'd memfd. `piov_is_aligned()`
+should now pass for essentially every memfd job. That matters for a second
+reason beyond throughput — it is a per-process way to get a cold-cache
+measurement, where `drop_caches` and a `POSIX_FADV_DONTNEED` sweep are
+node-wide side effects on a shared GPU node and were correctly refused.
+
+**Measured, 2026-08-22.** `v4.2.1-ps5` on both A100 nodes, Qwen2.5-14B, five
+cold runs — `drop_caches` on every GPU node before each, and every run
+confirmed cold by reading 56.4 GB off `nvme0n1` (a warm run reads zero). The
+number compared is the CRIU-proper phase: start to the first
+`cuda_plugin: resuming devices`.
+
+| depth | threads | CRIU-proper | GPU resume | O_DIRECT | nvme read |
+|-------|---------|-------------|-----------|----------|-----------|
+| 1 | 24 | 23.9 s | 12.5 s | — (serial) | 56.4 GB |
+| 1 | 8 | 21.4 s | 12.5 s | — (serial) | 56.4 GB |
+| 16 | 8 | **19.4 s** | 12.5 s | 1.00 | 56.4 GB |
+| 128 | 8 | **19.4 s** | 12.5 s | 1.00 | 56.4 GB |
+| 128 | 24 | **19.1 s** | 12.5 s | 1.00 | 56.4 GB |
+
+The depth knob is connected, which is the one thing CF-10 existed to decide.
+At a fixed 8 threads, depth 1 → 16 moves the read path 21.4 s → 19.4 s; at a
+fixed 24 threads, depth 1 → 128 moves it 23.9 s → 19.1 s. Before these two
+commits that comparison was flat by construction, because the code under test
+never ran. `O_DIRECT` took **12575 of 12575 submissions** — the alignment
+argument above holds exactly, not approximately.
+
+**But the model was wrong about the size of the win.** The prediction was
+8.9 s toward ~3 s. The read path went 21.4 s → 19.4 s: about 2 s, not 18.
+Three things the arithmetic missed, in the order they matter:
+
+- **Depth saturates at 16.** 16 and 128 are indistinguishable (19.4 s both).
+  Whatever the constraint is, four extra doublings of queue depth do not
+  touch it, so it is not submission depth past that point. CF-11 below rules
+  out the obvious suspect: it is not the chunk cap starving the queue either.
+- **Threads stop helping, then start hurting.** At depth 1, going 8 → 24
+  threads made it *slower* (21.4 s → 23.9 s) — 24 serial streams contending
+  where 8 already sufficed. At depth 128 the same change is worth 0.3 s,
+  inside run-to-run noise. Neither knob has anything left to give.
+- **The read path is not 21.4 s of reading.** 56.4 GB in 19.4 s is 2.9 GB/s,
+  already above the 2.6 GB/s single-stream figure and past half the 4.5 GB/s
+  four-stream one. The remainder is CRIU's own per-object work — 205 memfds
+  created, mapped, filled, unmapped — which no amount of queue depth
+  addresses. The device is no longer the limit; the arrival rate of work to
+  give it is.
+
+**The chunk cap is what makes depth mean anything.** CF-11, same protocol,
+same five-run discipline, fixed at depth 128 / 8 threads, sweeping
+`CRIU_AIO_CHUNK`:
+
+| chunk | CRIU-proper | GPU resume | O_DIRECT | nvme read |
+|-------|-------------|-----------|----------|-----------|
+| `0` (unbounded) | 22.0 s | 12.6 s | 1.00 | 56.4 GB |
+| 4 MiB | 21.7 s | 12.5 s | 1.00 | 56.4 GB |
+| 1 MiB (default) | **19.3 s** | 12.5 s | 1.00 | 56.4 GB |
+| 256 KiB | **19.1 s** | 12.5 s | 1.00 | 56.4 GB |
+
+`0` is the control, and it lands where `6c683e4` predicted: with coalescing
+unbounded, `pagemap_enqueue_iovec()` merges each memfd into essentially one
+giant iovec, the queue never holds more than a couple of jobs, and a depth of
+128 buys nothing — 22.0 s, back within noise of the depth-1 run's 21.4 s. The
+depth knob and the chunk cap are one mechanism, not two: without the cap there
+is nothing for the depth to be deep *with*.
+
+It also closes the open question about CF-10's saturation. 256 KiB and 1 MiB
+tie within run-to-run noise (19.1 vs 19.3 s), so chunk size is not the thing
+holding depth back past 16 — smaller chunks mean more jobs in flight and it
+did not help. That leaves the third bullet above as the explanation: CRIU's
+own per-object work, not the I/O queue. 4 MiB regressing to 21.7 s is the same
+effect from the other side, one doubling short of unbounded.
+
+So the submission-depth model was right about the mechanism and wrong about
+the headroom. It was worth doing — a 2 s read-path win is real and the
+`O_DIRECT` result retires a standing question — but the honest summary is that
+the read path is now close to done, and §7 owns everything that is left.
+
+Note what this cannot change: the end-to-end 40 s. The 35 s CRIU restore is
+12.4 s of `cuda_plugin` plus ~22.6 s of reading, and only the second number
+moves. Best case takes 40 s to roughly 22 s. Measured: 39 s wall, of which
+19.4 s is CRIU-proper and 12.5 s is GPU resume — and the 12.5 s did not vary
+by a tenth of a second across five configurations, which is the cleanest
+confirmation available that read-path tuning cannot reach it. At that point the read path is a
+fifth of a restore whose GPU half is fixed, and §7 is the only lever left that
+touches the other four fifths — which is the same conclusion §6c reached, from
+the other direction.
+
+### 6e. The control: stock CRIU on the finished transport
+
+Every restore number above this line was taken on the fork, which makes them
+measurements of *our stack* rather than of the patches. The transport work
+underneath — deleting the staging copy, bypassing the mount, prefetch at 4 —
+moved more time than the patches did, and it moved it for both binaries. So
+"the fork is worth 225 s" was an attribution, not a result.
+
+Run 2026-08-25 on `aks-gpuckpt-13588264-vmss00000g`: the same
+`qwen2.5-14b-instruct-kubenvme` artifact, restored twice, `drop_caches` before
+each arm, reverting between them via `criu.uninstall=true` so the node falls
+back to its distro package — which on these hosts is CRIU **4.2.1**, the exact
+upstream base the fork is built from. Nothing else changed.
+
+| | CRIU proper | wall to serving | nvme0n1 read | effective |
+|---|---|---|---|---|
+| patched (fork `6c683e4`) | **35.9 s** | 43 s | 56.4 GB | 1.31 GB/s |
+| stock CRIU 4.2.1 | 72.6 s | 79 s | 56.4 GB | 0.71 GB/s |
+| | **2.02×** | 1.84× | identical | |
+
+**The wall clock and CRIU's clock agree, which is the check that matters.**
+CRIU's own log accounts for 36.7 s of a 36 s wall-clock delta. Everything
+outside `restore.log` — image pull, sandbox setup, prewarm, the engine
+re-taking its KV cache — is identical across the arms by construction, so had
+the wall delta exceeded CRIU's, the difference would have been harness noise
+rather than a property of the binary. It did not.
+
+**One phase moved, and it is the phase the patches are about.** From the logs,
+the memfd inode restore:
+
+| | memfd phase | rest of restore |
+|---|---|---|
+| patched | 205 inodes on 8 threads, **0.003 s** wide | 16.0 s |
+| stock | 205 inodes, one at a time, **56.8 s** wide | 15.6 s |
+
+The tail after the last inode is 16.0 s vs 15.6 s — the same work, within
+noise, as it should be: those patches do not touch it. The entire 36.7 s
+difference is one serial loop becoming eight parallel ones. This is a cleaner
+attribution than we expected; there is no second effect hiding in the total.
+
+**Read bandwidth is the same story from the device's side.** Both arms read
+exactly 56.4 GB off `nvme0n1` — the patches do not read less, they read the
+same bytes while the device is kept busy. Stock CRIU issues one read, waits,
+issues the next; the disk idles between them. At 0.71 GB/s the stock arm is
+leaving most of an NVMe drive unused.
+
+**What this revises.** The §8 estimate credited the fork with 225 s of the
+637 s removed (35%) and transport with 412 s (65%). The controlled figure is
+36.7 s on a restore that now takes 43 s end-to-end. Both are true of different
+baselines: 225 s was measured when a serial memfd loop ran against a slow
+transport, so removing the serialization removed slow reads; 36.7 s is what
+the same change is worth once the transport is fast. That is the honest
+statement of it — **the patches are worth 2× on the finished stack, and were
+worth more before the transport was fixed because there was more to waste.**
+The earlier note that the error direction flattered the patches was right in
+sign: 35% was too generous for the stack as it now stands.
+
+---
+
+### Against the blog
+
+The blog's table is *CRIU restore only*, so the honest comparison is against
+our CRIU-proper number, not against end-to-end:
+
+| | image | CRIU restore | GB/s |
+|---|---|---|---|
+| Dynamo, Qwen3-0.6B | 6.2 GiB | 2.4 s | 2.77 |
+| Dynamo, Qwen3-8B | 26 GiB | 4.7 s | 5.94 |
+| Dynamo, gpt-oss-120b | 129 GiB | 15 s | 9.23 |
+| **ours, Qwen2.5-14B** | **52.5 GiB** | **8.8 s** | **6.41** |
+
+6.41 GB/s lands between their 8B and 120b rows, on a different model, a
+different GPU (A100 vs B200) and an artifact that is roughly 2× the weights
+because `sleep(level=1)` offloads to host RAM instead of dropping. On the
+metric the blog actually publishes, the read path is there.
+
+Two honest asterisks. That 8.8 s is the cache-warm run, so it is a
+memory-bandwidth figure rather than a storage one — the blog does not say
+which theirs is either. And their end-to-end story includes GMS, which we have
+not built: their "under 5 s ready" for gpt-oss-120b is weights restored over a
+separate channel in parallel, not a faster CRIU. Our end-to-end is 40 s, and
+the gap between 8.8 s and 40 s is the 12.4 s of `cuda_plugin` plus pod
+scheduling and container setup around it — which is where the remaining work
+is, and none of it is CRIU's read path.
+
+Note also that the artifact is roughly 2× the model weights: vLLM's
+`sleep(level=1)` offloads weights to host RAM rather than dropping them, so
+they are captured in the image instead of being re-read from the weight
+store. §7 is the structural answer to that half.
+
+Item (3) above is untouched and still real: fuse-client's per-file range
+budgets mean N concurrent readers reserve N × (1 GiB chunk cache + 512 MiB
+prefetch), which is why P=8 OOMKilled it. The bypass routes around that rather
+than fixing it, and the fix belongs in that repo.
+
+---
+
+## 7. Later — weight decoupling
+
+Dynamo's GMS splits model weights out of the CRIU image so the two restore in
+parallel over independent channels (GPUDirect Storage, peer-GPU RDMA/NVLink,
+striped NVMe). Their split, from the blog:
+
+| Model | Single CRIU image | Core process | Weights |
+|---|---|---|---|
+| Qwen3-0.6B | 6.2 GiB | 4.3 GiB | 1.2 GiB |
+| Qwen3-8B | 26 GiB | 4.8 GiB | 15 GiB |
+| gpt-oss-120b | 129 GiB | 6.7 GiB | 74 GiB |
+
+Note the core process is nearly constant while the weights dominate — which is
+the whole argument for splitting them.
+
+Not for this cycle: it needs a CUDA driver patch that is not shipped, and the
+core-process artifact being roughly constant means workstreams 1–4 capture most
+of the available win first. Worth noting that fuse-cache's tiering is a decent
+fit for the weight channel when we do get there — weights are the *shared*,
+identical-across-revisions part of the artifact, which is exactly what a
+distributed cache is good at.
+
+---
+
+## 8. Rollout
+
+| Phase | Contents | State |
+|---|---|---|
+| 1 | Image directories end-to-end (§3) | **done** |
+| 2 | Quiesce/resume + reference shim (§4) | **done** |
+| 3 | `SnapshotBuild` + build-time artifacts (§5) | **done** |
+| 4 | `--stream` restore, measured (§6a) | not started — `criu-image-streamer` is not on the node images, and the restore is not currently CRIU-read-bound (see below) |
+| 5 | Fork CRIU only if §4 measured short (§6b) | **done** — [nickaggarwal/criu](https://github.com/nickaggarwal/criu), branch `pod-snapshotter/v4.2.1-restore-parallelism` |
+| 6 | Put the memfd bytes on the AIO path (§6d) | **done** — fork commits `4377264`+`6c683e4`, image `v4.2.1-ps5`, live on both GPU nodes. CF-8/9/10/11 measured 2026-08-22: read path 21.4 s → 19.4 s cold, `O_DIRECT` 12575/12575, and the unbounded-chunk control gives the win back (22.0 s). Smaller than predicted; §6d says why |
+| 7 | Selectable storage tier, agent dump by default (§3b) | **done** — `manager.artifactRoot` / `agent.localArtifactRoot`, `checkpointer: agent` + `artifactFormat: dir` as CRD defaults. Four-arm measurement 2026-08-24: snapshot 3364 s → 297 s (11.3×), restore 344 s → 42 s (8.0×). Deployed as manager `v0.4.0-artifactroot` / agent `v0.6.0-artifactroot`; `hack/deploy.sh` verifies clean |
+| — | Stock-CRIU control for §6 (`hack/measure-criu-control.sh`) | **done** — run 2026-08-25 on `…vmss00000g`. Same artifact, same transport, cold both arms: CRIU-proper 35.9 s patched vs 72.6 s stock, **2.02×**. §6e |
+
+### Benchmark table to fill in
+
+Every phase lands with this row measured on the A100 pool, end-to-end (CR
+created → placeholder pod Ready), not CRIU-restore-only:
+
+| Phase | Artifact size | Prefetch | Untar | CRIU restore | Resume | Total |
+|---|---|---|---|---|---|---|
+| v1 baseline | | | | | n/a | |
+| +§3 dirs | | | *gone* | | n/a | |
+| +§4 quiesce | | | — | | | |
+| +§6a stream | | | — | | | |
+| +§6b fork, patches inert | 52 GiB | 231 s | *gone* | 445 s | — | 677 s |
+| +§6b fork, shmem pool ×8 | 52 GiB | 225 s | *gone* | 225 s | — | 452 s |
+| +no staging copy | 52 GiB | 104 s | *gone* | 147 s | — | 253 s |
+| +NVMe bypass | 52 GiB | **2 s** | *gone* | 35 s | — | 40 s |
+| +§6d memfd on AIO, cold | 52 GiB | **2 s** | *gone* | **31.9 s** | — | **39 s** |
+
+**677 s → 39 s, 17×**, on the same 52 GiB artifact and the same node, with the
+restored engine verified by generation at every step.
+
+The last row is the only one measured on a cold page cache — `drop_caches` on
+every GPU node first, 56.4 GB confirmed read off `nvme0n1`. It is therefore
+*not* strictly comparable to the 35 s above it, which was warm and
+uninstrumented; the ps5 read path beats it while also paying for real device
+reads. Within that row the split is 19.4 s CRIU-proper and 12.5 s GPU resume,
+and the 12.5 s held to a tenth of a second across all five tuning
+configurations in §6d. Of the 637 s removed,
+the CRIU fork accounts for 225 s (35%) and transport for 412 s (65%) —
+199 s from deleting the staging copy and 213 s from bypassing the mount. The
+fork was the thing we set out to build; the larger half turned out to be two
+configuration mistakes underneath it, which is worth remembering the next time
+a slow restore looks like it needs a patch.
+
+The "patches inert" row is the control, not a separate build: it is the same
+`v4.2.1-ps4` binary run with `criu-aio-depth: 0` and `criu-shmem-threads: 1`,
+which is what makes the last two rows comparable at all. The pool row is the
+same binary again with `criu-shmem-threads: 8` and AIO still off — CRIU
+restore halves (−49%), end-to-end drops a third (−33%), and the restored
+engine answers correctly (`"The capital of France is"` → `" Paris."`).
+
+The first two rows read the artifact through a fuse-client that was, at the
+time, pinned to `--prefetch-parallelism=2` and staging a node-local copy. The
+last two are where those minutes went — see §6c.
+
+`docs/testplan-gpu.md` gains the matching cases: directory-artifact restore,
+quiesce-point checkpoint of a vLLM pod, resume-side wake_up correctness (KV
+re-mapped, CUDA graphs still valid, first token correct), and build-artifact
+restore onto a node that never ran the build.
+
+---
+
+## 9. Risks
+
+- **The shim is workload-side.** It is a contract we cannot enforce, and a
+  wrong implementation fails at checkpoint time with an unhelpful CRIU error.
+  Mitigation: the manager validates the presence file appears within
+  `quiesce-timeout` and reports a specific condition, rather than letting the
+  checkpoint fail opaquely.
+- **`wake_up()` correctness is not covered by "the pod went Ready".** A
+  readiness probe passes with a corrupt KV mapping. The GPU test plan needs an
+  actual generation-correctness check after restore, compared against the same
+  prompt on a cold-started replica.
+- **Directory artifacts have no atomic commit.** A tar was atomic by rename;
+  a tree is not. Hence the MANIFEST-written-last rule in §3 — restores must
+  treat a prefix without a complete MANIFEST as absent, not as partial.
+- **Forking CRIU means owning node images.** §6b is deliberately last and
+  deliberately conditional.
+
+
+---
+
+## 10. What the workload had to give up
+
+§4 says the shim is "a contract we cannot enforce". Running it against a real
+vLLM engine is what showed how much that contract actually contains. Five
+things had to change before an engine was both dumpable and restorable, and
+only the first is specific to vLLM:
+
+1. **NVML holds its own `/dev/nvidiactl`.** `cuda-checkpoint` hands back the
+   descriptors the CUDA *runtime* owns; NVML's is not one of them, so it is
+   still open when CRIU walks the process:
+   `Can't dump file 9 of that type [20666] (chr 195:255)`. Any library that
+   calls `nvmlInit` without a matching `nvmlShutdown` — PyTorch's device-count
+   probe does — leaves one behind.
+
+2. **`fork` spreads the problem.** vLLM's V1 async path always runs EngineCore
+   in its own process and defaults to forking it, so the worker inherits the
+   frontend's nvidiactl fd. In the child that descriptor belongs to no library
+   at all, so `cuda-checkpoint` does not release it either. vLLM already forces
+   `spawn` when the parent has initialized CUDA; NVML alone does not count,
+   which is the gap.
+
+3. **Anything bound to the pod IP.** `Can't bind inet socket back: Cannot
+   assign requested address`. The engine's ZMQ endpoints and the
+   `torch.distributed` TCPStore are created during engine init — before the
+   quiesce point — so deferring the HTTP frontend does not help. They have to
+   be on loopback, which exists identically in every pod. Same for outbound
+   connections: vLLM's usage reporting keeps a TLS session open to a host on
+   the public internet, and nothing can bring that back elsewhere.
+
+4. **Deleted-but-mapped files on `/dev/shm`.** glibc's `sem_open` creates a
+   temp file, mmaps it, links it to the caller's name and unlinks the temp —
+   so every POSIX semaphore is permanently mapped from a deleted path, and any
+   Python `multiprocessing` primitive produces one. CRIU cannot ghost a
+   *mapped* deleted file that still has a link, so it demands `link-remap`;
+   and `link-remap` hard-links the inode into `/dev/shm` during the dump,
+   drops the link when the dump ends, and expects it back at restore, which a
+   fresh pod's tmpfs cannot provide. The way out is to drop the last link
+   before the dump: `nlink` hits zero and CRIU writes a ghost file, content
+   and all, into the image.
+
+5. **`/dev/shm` itself is not in the image.** It is a pod-scoped external
+   mount, so the agent captures it as `shm-diff.tar` alongside
+   `rootfs-diff.tar` and lays it back down over the restored pod's tmpfs.
+
+The generalizable shape: the quiesce point buys you control over what is
+*created* after it, and nothing at all over what engine initialization already
+did. Everything in the list above exists by the time weights are loaded. A
+future protocol version could plausibly check for these before declaring
+ready — scan `/proc/self/maps` and `/proc/net/tcp` for the known-bad shapes and
+refuse to write `ready-for-checkpoint` — rather than letting the checkpoint
+fail minutes later with a CRIU error nobody can read.
+
+The io_uring wall §4 predicted did not appear at the quiesce point, for the
+reason §4 gives: uvicorn is never started before the dump, so its event loop
+is not in the image. The shim also pins uvicorn to the `asyncio` loop rather
+than uvloop, so that a *restored* process is still dumpable.
+
+## 11. Storage behavior that shaped the design
+
+Three things about the fuse-client mount, all measured, all of which changed
+the §3 implementation:
+
+- **`rename` copies without unlinking the source.** Every artifact tar on the
+  cluster had a full-size `.tar.part` sitting beside it — silently doubling
+  the storage cost of every snapshot taken since v1 shipped. This is why the
+  plan's per-file `.part` + rename was dropped for directory artifacts (the
+  MANIFEST is the commit marker, so per-file atomicity buys nothing) and why
+  `RenamePublish` explicitly removes the source after the one rename that
+  remains.
+
+- **`O_TRUNC` is ignored.** Re-uploading a revision left every file that had
+  shrunk carrying the previous upload's tail, and pre-warm then read a longer
+  image than the manifest described. The agent now unlinks before every
+  overwrite. The manifest's per-file sizes are what caught this — a tar
+  artifact would have carried the corruption into `runc restore`.
+
+- **A lost write comes back as zeros, not as an error.** Three separate dumps
+  of the same build died at publish on
+  `checkpoint/files.img does not start with the CRIU image magic (got
+  0x00000000, want 0x19435654): it is 45454 bytes on disk` — the same file, at
+  the same size, all three times. The store had accepted the write, reported
+  success, and served back a correctly-sized run of zeros. No size check can
+  see this, which is why `verifyImageMagic` exists and why it checks a
+  content invariant instead of a length. It did its job — the failure landed
+  seconds after the dump rather than 200 s into a restore — but it could not
+  make the store keep the bytes. §3b's `file://` tier is the response: the
+  fastest way to stop losing writes to a layer is to take the layer out of the
+  path.
+
+Also worth recording, though they did not change the design: `rmdir` on a
+non-empty directory returns 0 without unlinking anything (which makes
+`os.RemoveAll` report success while leaving the whole tree in place — see
+`clearArtifactDir`), and setting a mode at create time fails.
+
+None of this is a bug report against fuse-cache so much as a reminder that an
+artifact store is not a POSIX filesystem just because it is mounted like one.

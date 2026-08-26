@@ -29,7 +29,7 @@ spec:
       {{- end }}
       containers:
         - name: agent
-          image: "{{ .Values.agent.image.repository }}:{{ .Values.agent.image.tag }}"
+          image: "{{ include "pod-snapshotter.image" (dict "img" .Values.agent.image "root" $) }}"
           imagePullPolicy: {{ .Values.agent.image.pullPolicy }}
           args:
             - --fuse-mount={{ .Values.agent.fuseMount }}
@@ -39,6 +39,11 @@ spec:
             - --fuse-api-endpoint={{ .Values.agent.fuseAPIEndpoint }}
             - --fuse-agent-socket={{ .Values.agent.fuseAgentSocket }}
             - --host-root=/host
+            - --stage-image-local={{ .Values.agent.stageImageLocal }}
+            - --prefetch-parallelism={{ .Values.agent.prefetchParallelism }}
+            - --nvme-cache-root={{ .Values.agent.nvmeCacheRoot }}
+            - --local-artifact-root={{ .Values.agent.localArtifactRoot }}
+            - --digest-artifacts={{ .Values.agent.digestArtifacts }}
           env:
             - name: NODE_NAME
               valueFrom:
@@ -53,6 +58,18 @@ spec:
             - name: fuse-mount
               mountPath: {{ .Values.agent.fuseMount }}
               mountPropagation: HostToContainer
+            {{- with .Values.agent.localArtifactRoot }}
+            # Node-local artifact tier, for file:// artifacts. This has to be
+            # mounted at the SAME path it has on the host, not under /host:
+            # `runc checkpoint` runs through nsenter in the host mount
+            # namespace, so the --image-path the agent computes is resolved by
+            # the host, while the agent's own reads of the same artifact are
+            # resolved in the container. One path, or they are two different
+            # directories that happen to share a name.
+            - name: local-artifacts
+              mountPath: {{ . }}
+              mountPropagation: HostToContainer
+            {{- end }}
             # Parent dir: covers workRoot (restores/) AND node-local file://
             # artifacts (artifacts/) so both survive agent pod restarts.
             - name: state-root
@@ -75,6 +92,10 @@ spec:
           hostPath: {path: {{ .Values.agent.checkpointsDir }}, type: DirectoryOrCreate}
         - name: fuse-mount
           hostPath: {path: {{ .Values.agent.fuseMount }}, type: DirectoryOrCreate}
+        {{- with .Values.agent.localArtifactRoot }}
+        - name: local-artifacts
+          hostPath: {path: {{ . }}, type: DirectoryOrCreate}
+        {{- end }}
         - name: state-root
           hostPath: {path: {{ dir .Values.agent.workRoot }}, type: DirectoryOrCreate}
         - name: runtime-dir

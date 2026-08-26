@@ -65,11 +65,13 @@ status.artifact = {uri, size, sha256}             runc restore --image-path chec
                                                   netns → readiness probe turns Ready
 ```
 
-Two CRDs:
+Three CRDs:
 
-- **PodSnapshot** — point at a running pod+container; produces a tar artifact.
-- **PodRestore** — point at a tar artifact URI (or a PodSnapshot); produces a
-  running pod resuming from the checkpoint.
+- **PodSnapshot** — point at a running pod+container; produces an artifact.
+- **PodRestore** — point at an artifact URI (or a PodSnapshot, or a
+  SnapshotBuild); produces a running pod resuming from the checkpoint.
+- **SnapshotBuild** — point at a pod template; runs it once, checkpoints it at
+  its quiesce point, and produces one reusable artifact per revision.
 
 Two binaries (fuse-client conventions: `cmd/<binary>`, `internal/<domain>`):
 
@@ -113,12 +115,77 @@ cuda-checkpoint, driver ≥ 570, runc config, feature gates).
 ## Artifact URIs
 
 ```
-fuse:///snapshots/<ns>/<name>/<ctr>.tar   → /mnt/fuse/... on every node (default)
-file:///abs/path.tar                      → node-local path (testing)
+<root>/<ns>/<name>/<ctr>/      → a PodSnapshot's image directory (trailing slash)
+<root>/<ns>/<name>/<ctr>.tar   → the same, as a single tar object (v1 layout)
+<root>/builds/<revision>/      → a SnapshotBuild output
 ```
+
+`<root>` is the manager's `--artifact-root` (chart value
+`manager.artifactRoot`), and it is where the storage tier is chosen:
+
+| Root | Where the bytes live | Restorable from |
+|---|---|---|
+| `fuse:///snapshots` (default) | the fuse-client distributed mount | any node |
+| `file:///mnt/fuse-nvme0n1/ps-artifacts` | the node's own NVMe | that node only |
+
+A spec that sets `artifactURI` itself ignores the root entirely, so the two
+tiers can be mixed per snapshot.
+
+A trailing slash makes it a directory artifact: CRIU's images as per-file
+objects, committed by a `MANIFEST` written last. A prefix without a complete
+MANIFEST reads as absent, never as partial — that rule is what replaces the
+atomic rename a tar got for free.
 
 Anything that can produce a CRI checkpoint tar can be restored — point
 `spec.artifactURI` at it.
+
+## Where the dump is written, and by whom
+
+`spec.checkpointer` picks the writer, and it defaults to `agent`:
+
+- **`agent`** — the node agent runs `runc checkpoint` itself and CRIU writes
+  its images straight into the artifact directory. One pass over the bytes.
+- **`kubelet`** — POST to the kubelet checkpoint API, which drives CRIU into a
+  tar; the agent then expands that tar into the same directory. Three passes,
+  most of them on whichever disk holds `/var/lib/kubelet`.
+
+The agent path needs `artifactFormat: dir` (there is no tar to hand back) and
+a node whose agent advertises `agent-checkpoint`. When either is missing the
+manager falls back to the kubelet path and says so in the snapshot's status —
+which is what makes `agent` safe as the default on a cluster mid-upgrade.
+
+Measured on an A100 node, Qwen2.5-14B, 56 GB of CRIU images, both directions
+cold (`drop_caches` before the clock):
+
+| Dump path | Storage | Snapshot | Restore → serving |
+|---|---|---|---|
+| kubelet + tar | fuse mount | 3364 s | 344 s |
+| agent direct | fuse mount | 1425 s | — |
+| kubelet + tar | node NVMe | 1279 s | 43 s |
+| **agent direct** | **node NVMe** | **297 s** | **42 s** |
+
+The two axes do different work. On the **dump**, both matter and compound:
+the tar costs ~950 s (of which ~793 s is writing the archive and 156 s is
+expanding it again) and the network filesystem costs ~1130 s. On the
+**restore**, the tar contributes nothing — by then both artifacts are the same
+632-file directory — and the storage tier is the entire 8× difference.
+[docs/design-v2.md](docs/design-v2.md) has the full decomposition.
+
+To put both sides on the node's NVMe:
+
+```yaml
+manager:
+  artifactRoot: file:///mnt/fuse-nvme0n1/ps-artifacts
+agent:
+  localArtifactRoot: /mnt/fuse-nvme0n1/ps-artifacts   # same path, mounted from the host
+```
+
+`agent.localArtifactRoot` is also a confinement boundary: a `file://` URI is a
+raw host path handed to a privileged agent, so when it is set the agent
+refuses to read or write a `file://` artifact anywhere else. It has to be
+mounted at the same path in the agent as on the host — `runc checkpoint` runs
+through `nsenter` in the host mount namespace, so `--image-path` is resolved
+there while the agent reads the same files in its own container.
 
 ## Node prerequisites (summary)
 
@@ -133,10 +200,16 @@ mounted at `/mnt/fuse`.
 
 ## fuse-client integration
 
-- **Upload**: the agent streams the kubelet tar to the FUSE mount
-  (atomic `.part` + rename); fuse-client's write-through persists it to cloud.
-- **Pre-warm**: before restore, the agent sequentially reads the tar through
-  the mount — fuse-client promotes every miss to local NVMe (peers → cloud).
+All three steps below are `fuse://` only. A `file://` artifact skips every one
+of them by construction — there is no mount to write through, no tier to
+promote into, and nothing that could evict bytes already on the node's own
+disk.
+
+- **Upload**: the agent writes into the FUSE mount — CRIU's images directly on
+  the agent path, the kubelet's tar expanded on the kubelet path;
+  fuse-client's write-through persists it to cloud.
+- **Pre-warm**: before restore, the agent reads the artifact through the
+  mount — fuse-client promotes every miss to local NVMe (peers → cloud).
 - **Pin**: the agent creates a pinned session over the fuse-client agent
   socket (`/var/run/fuse-client/agent.sock`) so the artifact can't be evicted
   mid-restore; unpinned at teardown.
@@ -153,12 +226,78 @@ make vet test
 make helm-template        # render the chart
 ```
 
-Tests cover the kubelet client (fake kubelet server), URI parsing, checkpoint
-tar unpacking (incl. path-traversal rejection), OCI spec rewriting (namespace
-joins, kubelet path remaps, NVIDIA device propagation), atomic upload, and
-placeholder pod construction. GPU-dependent behavior (cuda-checkpoint, CRIU
+Tests cover the kubelet client (fake kubelet server), URI parsing (object and
+directory forms), checkpoint tar unpacking and directory `Open` (incl.
+path-traversal rejection), artifact expansion / MANIFEST commit / parallel
+pre-warm, `/dev/shm` capture and replay, OCI spec rewriting (namespace joins,
+kubelet path remaps, NVIDIA device propagation), atomic upload, quiesce
+contract resolution, compatibility matching, and placeholder/build pod
+construction. GPU-dependent behavior (cuda-checkpoint, CRIU
 CUDA plugin, real restores) needs a GPU node — see
 [docs/testplan-gpu.md](docs/testplan-gpu.md).
+
+## v2: quiesced builds and image directories
+
+[docs/design-v2.md](docs/design-v2.md) tracks the alignment with NVIDIA's
+[Dynamo Snapshot](https://developer.nvidia.com/blog/nvidia-dynamo-snapshot-fast-startup-for-inference-workloads-on-kubernetes/),
+which solves the same problem with a materially different set of trade-offs.
+Three of the four workstreams are implemented and verified on A100:
+
+1. **Image directories instead of tars** (`artifactFormat: dir`) —
+   `runc restore --image-path <dir>` already wants a directory; the tar
+   existed only because the kubelet checkpoint API returns one. The agent
+   expands it once at upload time and commits the tree with a MANIFEST
+   written last, so no restore ever untars, pre-warm fans out across files
+   instead of streaming one, and per-file digests catch a corrupt upload
+   before CRIU sees it.
+2. **Quiesce/resume hooks** — a workload annotated
+   `podsnapshot.io/quiesce: presence-file` is checkpointed at a safe point of
+   its own choosing: after engine init, before anything is listening. io_uring
+   rings, NCCL communicators and TCP listeners are then never in the image at
+   all, and `sleep(level=1)` releases the KV cache's physical pages first —
+   **measured 72.5 GiB → 1.31 GiB of device memory for Qwen2.5-14B on an
+   A100.** [hack/snapshot-shim.py](hack/snapshot-shim.py) is the reference
+   implementation for vLLM.
+3. **Snapshots as build artifacts** (`SnapshotBuild`) — one artifact per
+   revision, built once by a one-shot pod and restored by every scale-up.
+   Quiescing is destructive, so it cannot run on a serving replica. The build
+   records the GPU/driver/CRIU tuple it ran on, and a `PodRestore` with
+   `spec.buildRef` is confined to nodes that match — an incompatible node is
+   rejected by the scheduler instead of by `runc restore`.
+
+Measured on an A100 80GB (driver 580, CRIU 4.2.1, vLLM 0.9.2):
+
+| Model | Cold start | Artifact | Restore → Ready |
+|---|---|---|---|
+| Qwen2.5-1.5B-Instruct | ~90 s | 6.7 GiB, 396 files | **73 s** |
+| Qwen2.5-14B-Instruct | 179 s | 52.5 GiB, 640 files | **395 s** |
+
+Both restores served greedy output identical to a cold-started replica. The
+untar is gone — the restore work directory holds only the rewritten OCI
+config and CRIU's log dir, no copy of the images.
+
+**The 14B restore is slower than its cold start, and the artifact is why.**
+`sleep(level=1)` releases the KV cache but offloads weights to host RAM
+rather than dropping them, so a model with 27.5 GiB of weights produces a
+52.5 GiB artifact — twice the bytes a cold start moves, to skip 70 s of
+compile and graph capture. So the next workstream is **weight decoupling**
+(§7), not restore-side I/O parallelism (§6): the restore is bandwidth-bound
+on artifact size, not on CRIU's read path.
+[design-v2.md §8](docs/design-v2.md#the-uncomfortable-number) has the
+phase-by-phase breakdown and the caveats on that baseline.
+
+```bash
+kubectl create configmap snapshot-shim \
+  --from-file=snapshot-shim.py=hack/snapshot-shim.py
+kubectl apply -f config/samples/snapshotbuild_vllm.yaml   # build the revision
+kubectl apply -f config/samples/podrestore_build.yaml     # restore it, N times
+```
+
+Checkpointing a real engine turns out to demand a fair amount of the
+workload — an NVML descriptor, a forked worker, sockets bound to the pod IP,
+a deleted-but-mapped POSIX semaphore. All of it is enumerated in
+[docs/prerequisites.md](docs/prerequisites.md#what-must-not-be-in-the-image),
+and all of it is handled by the reference shim.
 
 ## Known limitations (v1)
 
@@ -173,3 +312,11 @@ CUDA plugin, real restores) needs a GPU node — see
   container). The placeholder pod's readiness probe is the health signal.
 - Restore requires an identical environment: same image, same GPU model,
   same driver/CRIU versions (the standard CRIU/cuda-checkpoint constraint).
+  With `spec.buildRef` this is now a scheduling constraint; with a bare
+  `artifactURI` it is still discovered inside `runc restore`.
+- Checkpointing a *live* serving process dumps whatever it holds, including
+  resources CRIU cannot dump. Use the quiesce protocol for anything real.
+- Weights stay inside the artifact, so it is roughly model-sized however
+  little device memory is live at the dump — see v2 §7.
+- Single node, single GPU. A multi-node engine would need its distributed
+  runtime rebuilt on the resume side, which the shim does not do.

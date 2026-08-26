@@ -1,0 +1,55 @@
+{{- if .Values.criu.enabled }}
+# Installs pod-snapshotter's patched CRIU on each checkpoint node.
+#
+# The fork is upstream v4.2.1 -- the version these nodes already run -- plus
+# the restore read-path patches in hack/criu/patches. It goes into
+# /usr/local/sbin, which precedes /usr/sbin on the default PATH, so runc picks
+# it up without the distro package being touched; set criu.enabled=false (or
+# criu.uninstall=true) and the node falls straight back to the packaged CRIU.
+#
+# Opt-in on purpose: it replaces the binary that every checkpoint and restore
+# on the node goes through.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: pod-snapshotter-criu
+  namespace: {{ .Values.namespace }}
+  labels:
+    app: pod-snapshotter-criu
+spec:
+  selector:
+    matchLabels:
+      app: pod-snapshotter-criu
+  template:
+    metadata:
+      labels:
+        app: pod-snapshotter-criu
+    spec:
+      hostPID: true
+      nodeSelector: {{- toYaml .Values.agent.nodeSelector | nindent 8 }}
+      tolerations: {{- toYaml .Values.agent.tolerations | nindent 8 }}
+      containers:
+        - name: install
+          image: "{{ include "pod-snapshotter.image" (dict "img" .Values.criu.image "root" $) }}"
+          imagePullPolicy: {{ .Values.criu.image.pullPolicy }}
+          env:
+            - name: HOST_ROOT
+              value: /host
+            - name: CRIU_BUILD_VERSION
+              value: "{{ .Values.criu.image.tag }}"
+            - name: UNINSTALL
+              value: "{{ .Values.criu.uninstall }}"
+          securityContext:
+            privileged: true
+          volumeMounts:
+            - name: host-root
+              mountPath: /host
+          resources:
+            requests: {cpu: 10m, memory: 32Mi}
+            limits: {memory: 256Mi}
+      volumes:
+        - name: host-root
+          hostPath:
+            path: /
+            type: Directory
+{{- end }}

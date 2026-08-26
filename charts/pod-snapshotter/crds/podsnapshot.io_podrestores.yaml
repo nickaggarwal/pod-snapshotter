@@ -59,9 +59,28 @@ spec:
             properties:
               artifactURI:
                 description: |-
-                  ArtifactURI points at the checkpoint tar (fuse:// or file:// scheme).
-                  Exactly one of ArtifactURI or SnapshotRef must be set.
+                  ArtifactURI points at the checkpoint (fuse:// or file:// scheme); a
+                  trailing slash means an image-directory artifact. Exactly one of
+                  ArtifactURI, SnapshotRef or BuildRef must be set.
                 type: string
+              buildRef:
+                description: |-
+                  BuildRef names a completed SnapshotBuild in the same namespace. Its
+                  artifact is used, and its compatibility tuple constrains placement:
+                  the placeholder pod is confined to nodes whose environment matches,
+                  instead of discovering the mismatch inside `runc restore`.
+                properties:
+                  name:
+                    default: ""
+                    description: |-
+                      Name of the referent.
+                      This field is effectively required, but due to backwards compatibility is
+                      allowed to be empty. Instances of this type with an empty value here are
+                      almost certainly wrong.
+                      More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                    type: string
+                type: object
+                x-kubernetes-map-type: atomic
               container:
                 description: |-
                   Container in the template that receives the restored workload.
@@ -91,13 +110,32 @@ spec:
                 properties:
                   metadata:
                     description: |-
-                      Standard object's metadata.
-                      More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#metadata
+                      EmbeddedObjectMeta is the part of ObjectMeta that is meaningful on a pod
+                      template embedded in a CRD.
+
+                      corev1.PodTemplateSpec cannot be used directly: controller-gen renders its
+                      ObjectMeta as a bare `type: object` with no properties, and the API server
+                      then rejects every field inside it. That would make the quiesce
+                      annotations — which the whole §4 contract is carried by — impossible to
+                      set on a template.
+                    properties:
+                      annotations:
+                        additionalProperties:
+                          type: string
+                        description: |-
+                          Annotations applied to the created pod. This is where the quiesce
+                          contract lives (podsnapshot.io/quiesce and friends).
+                        type: object
+                      labels:
+                        additionalProperties:
+                          type: string
+                        description: |-
+                          Labels applied to the created pod, on top of the ones pod-snapshotter
+                          sets itself.
+                        type: object
                     type: object
                   spec:
-                    description: |-
-                      Specification of the desired behavior of the pod.
-                      More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#spec-and-status
+                    description: PodSpec is a description of a pod.
                     properties:
                       activeDeadlineSeconds:
                         description: |-
@@ -7981,6 +8019,8 @@ spec:
                     required:
                     - containers
                     type: object
+                required:
+                - spec
                 type: object
               prewarm:
                 default: true
@@ -8021,6 +8061,26 @@ spec:
                 description: ArtifactURI actually used (resolved from SnapshotRef
                   if given).
                 type: string
+              compatibility:
+                description: |-
+                  Compatibility is the environment tuple the artifact was built against,
+                  when it came from a SnapshotBuild.
+                properties:
+                  criuVersion:
+                    description: CRIUVersion, e.g. "4.2.1".
+                    type: string
+                  driverVersion:
+                    description: DriverVersion as reported by nvidia-smi, e.g. "580.159.04".
+                    type: string
+                  gpuModel:
+                    description: |-
+                      GPUModel as reported by nvidia-smi, e.g. "NVIDIA A100 80GB PCIe".
+                      Empty on CPU-only builds.
+                    type: string
+                  imageDigest:
+                    description: ImageDigest of the checkpointed container's image.
+                    type: string
+                type: object
               conditions:
                 items:
                   description: Condition contains details for one aspect of the current

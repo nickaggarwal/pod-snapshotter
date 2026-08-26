@@ -26,6 +26,116 @@ AKS `Standard_NC24ads_A100_v4` node with the prerequisites installed).
 | GR-6 | Restore with `podsnapshot.io/tcp-close: "true"` | restore succeeds with established sockets closed |
 | GR-7 | GPU device missing in restore spec vs node | fails fast with "GPU device nodes missing" |
 | GR-8 | Agent restart mid-Running | checkAlive resumes against existing runc state; no duplicate restore |
+| GR-9 | NVMe bypass, tier complete | agent logs `restoring from the node NVMe cache tier` **and** `skipping pre-warm`; `--image-path` points under `--nvme-cache-root`, not the mount; restore succeeds and generation matches |
+| GR-10 | NVMe bypass, tier partial (delete one image file) | declines silently and pre-warms through the mount; restore still succeeds |
+| GR-11 | NVMe bypass, file size disagrees with the manifest | declines with a logged error naming the file; restore falls back to the mount rather than restoring wrong bytes |
+| GR-12 | `--nvme-cache-root` unset | no bypass attempted; behavior identical to GR-1 |
+
+## QB — quiesce & build artifacts (v2)
+
+Covers [design-v2.md](design-v2.md) §3–§5. Needs the reference shim on the
+pod: `kubectl create configmap snapshot-shim
+--from-file=snapshot-shim.py=hack/snapshot-shim.py`.
+
+| ID | Scenario | Pass criteria |
+|----|----------|---------------|
+| QB-1 | `SnapshotBuild` of a vLLM pod behind the shim | phase Quiescing → Snapshotting → Completed; `status.quiesce.readyAt` set; build pod deleted afterwards |
+| QB-2 | Directory artifact layout | prefix holds `checkpoint/`, `spec.dump`, MANIFEST (plus `shm-diff.tar` when the container left anything in `/dev/shm`); no `.part` files left behind |
+| QB-3 | MANIFEST is the commit marker | delete the MANIFEST → a restore reports the artifact as absent and retries, never as partial |
+| QB-4 | Restore from `buildRef`, no untar | pod Ready; the agent's work dir holds only `bundle/` and `criu-work/` — no copy of the images |
+| QB-5 | **Generation correctness after `wake_up()`** | same prompt at `temperature: 0` gives byte-identical output to a cold-started replica. A readiness probe passes with a corrupt KV mapping; this is the check that does not |
+| QB-6 | Shim never reports ready | PodSnapshot fails with `QuiesceTimeout` naming the container and the annotation, not an opaque CRIU error |
+| QB-7 | Restore onto a node with a different driver/CRIU | placeholder pod stays Pending (compat-hash selector), or fails with "node X cannot restore this artifact: …" — never a `runc restore` failure |
+| QB-8 | Re-upload the same revision after the artifact shrinks | every file matches its manifest size (the mount ignores `O_TRUNC`; the agent unlinks first) |
+| QB-9 | Parallel pre-warm | `status.prewarmBytes` equals the manifest total; wall time below the single-stream tar path for the same bytes |
+| QB-10 | Build pod name collision with a terminating pod | new build waits for the stale pod instead of adopting it (dumping an already-checkpointed container fails inside containerd) |
+
+## CF — patched CRIU (v2 §6b)
+
+Only meaningful with `criu.enabled=true`. Every case runs against the same
+installed binary — the tuning annotations are what varies — so a failure can
+be attributed to the patches rather than to the rebuild.
+
+| ID | Scenario | Pass criteria |
+|----|----------|---------------|
+| CF-1 | Installer on a node that cannot run the binary | DaemonSet fails, `/usr/local/sbin/criu` is removed, `criu --version` on the host still answers from the distro package |
+| CF-2 | `criu.uninstall=true` | marker and binary gone; the next restore succeeds on the packaged CRIU |
+| CF-3 | Patches inert (`criu-aio-depth: 0`, `criu-shmem-threads: 1`) | restore succeeds and the workload serves — this is the control for CF-4 and the first thing to run after any rebase |
+| CF-4 | Pools on (`criu-shmem-threads: 8`) | restore succeeds; `restore.log` shows `Restoring N memfd inodes on M threads`; time to the first `cuda_plugin: resuming devices` line below CF-3 |
+| CF-5 | AIO on (`criu-aio-depth: 128`) | restore succeeds; no `AIO read returned 0` and no `BUG at criu/pagemap.c`. Not a throughput case — see below |
+| CF-6 | Pools + AIO together | restore succeeds and serves; generation matches QB-5 |
+| CF-8 | Pool raised to `criu-shmem-threads: 24` | restore succeeds and serves; `Restoring N memfd inodes on 24 threads`. **Do not expect it to be faster** — measured 2026-08-22, 24 threads is worth 0.3 s at depth 128 (noise) and *costs* 2.5 s at depth 1, where 24 serial streams contend where 8 sufficed. The pass criterion is that it still restores correctly, and that the thread count in the log matches what was asked for |
+| CF-9 | `criu-image-io-mode: direct` on `v4.2.1-ps5` | restore succeeds and serves; `restore.log` shows `AIO: N of M submissions used O_DIRECT` with N/M near 1; `nvme0n1` reads roughly equal artifact size even on a warm node. **Measured 2026-08-22: 12575/12575 = 1.000 across 206 calls — every submission took O_DIRECT, so the alignment argument holds in practice** |
+| CF-10 | AIO depth sweep on `v4.2.1-ps5` with `direct` | `criu-aio-depth` 1 / 16 / 128 at fixed `criu-shmem-threads: 8`: CRIU-proper phase must *fall* with depth. Flat here means the §6d submission-depth model is wrong. **Passed 2026-08-22: 21.4 s → 19.4 s → 19.4 s.** Depth saturates by 16 — do not read the 16-vs-128 tie as a failure |
+| CF-11 | `criu-aio-chunk` sweep at fixed depth 128 / threads 8 | 256 KiB / 1 MiB / 4 MiB / `0`. `0` is the real control: unbounded coalescing is the pre-`6c683e4` behavior and should collapse each memfd to a single submission, undoing the CF-10 win regardless of depth. Needs agent `v0.4.3-aiochunk` or later — earlier agents drop the annotation silently, which looks identical to the knob doing nothing. **Passed 2026-08-22: `0` → 22.0 s, 4 MiB → 21.7 s, 1 MiB → 19.3 s, 256 KiB → 19.1 s.** The control lands where predicted: unbounded gives back the whole CF-10 win, so chunking is what makes depth mean anything. 256 KiB and 1 MiB tie within noise, which rules out chunk size as the explanation for CF-10's saturation at depth 16 |
+| CF-7 | Stock CRIU given the annotations | ignored, restore unaffected — the agent sets them unconditionally and must not require the fork |
+
+**Compare the CRIU-proper phase, not the CRIU wall.** On the 14B artifact,
+`cuda_plugin` resuming devices on the GPU worker takes 12.4 s of a 21.3 s CRIU
+restore, and none of the read-path tuning touches it — a patch that halved the
+read path would move total CRIU wall by well under a third. The number to
+compare across CF-3/4/5/6 is the log timestamp of the first
+`cuda_plugin: resuming devices` line, which is where CRIU's own work ends.
+
+**CF-9 is how to get a cold-cache number without a node-wide side effect.**
+`CRIU_IMAGE_IO_MODE=direct` bypasses the page cache for CRIU's own reads only,
+so it isolates the storage path without `drop_caches` or a
+`POSIX_FADV_DONTNEED` sweep touching every other workload on a shared GPU
+node. It only became viable once the memfd bytes moved onto the async path:
+`pages-%u.img` has no header, so those reads are page-aligned and
+`piov_is_aligned()` accepts them. Check the `AIO: N of M submissions used
+O_DIRECT` line before trusting the timing — a low N means most jobs fell back
+to buffered reads and the run is warm again.
+
+**On `v4.2.1-ps4` and earlier, CF-5 is a safety case, not a performance one.** `criu-aio-depth` cannot
+currently change the wall clock on a GPU checkpoint, because the memfd and
+shmem restore paths call `read_pages()` with flags `0` and never reach the
+async code — see [design-v2.md §6d](design-v2.md). Run CF-5 to prove the AIO
+path stays harmless when enabled (it is still live for task-anonymous memory,
+3 of 208 images here), and do not read a timing conclusion out of it. On
+`v4.2.1-ps5` and later the memfd path does pass `PR_ASYNC`, so CF-5 becomes a
+performance case — and CF-10 is the sweep that proves the depth knob is
+connected to anything.
+
+**Any case that does claim a throughput number needs a cold page cache.** The
+A100 nodes have 226 GB of RAM and the 14B artifact is 52 GiB, so a second
+restore of the same artifact reads entirely from page cache — measured: zero
+sectors read from either `sda` or `nvme0n1` across a whole restore. That
+applies to CF-4, CF-6 and CF-8. On this dev cluster the reliable way to get a
+cold run is `sync; echo 3 > /proc/sys/vm/drop_caches` on every GPU node from
+the privileged `pod-snapshotter-criu` pod, before each run and on every node
+rather than just the intended one — the restore is scheduled after the drop.
+Confirm it took by reading `MemAvailable` back (it returns to ~202 of 216 GB),
+and confirm the run was genuinely cold from `/proc/diskstats`: a cold 14B
+restore reads **56.4 GB** off `nvme0n1`, a warm one reads zero. Do not rely on
+`criu-image-io-mode: direct` alone for this — it bypasses the cache for CRIU's
+own reads but not for pre-warm, and it is a per-process measure, not eviction.
+`node_disk_read_bytes_total` in Prometheus is the retroactive fallback: it is
+scraped at 15 s resolution on every node continuously, so it can answer this
+about a run you forgot to instrument.
+
+**Read the log from `criu-work/`, and read it before tearing the run down.**
+The CRIU log is at
+`/var/lib/pod-snapshotter/restores/<uid>/criu-work/restore.log`; the agent
+deletes that whole directory when the PodRestore goes away. A sweep that
+deletes run N before parsing it gets nothing back but wall clock, which on
+this workload is dominated by scheduling and pre-warm and cannot resolve the
+read path at all.
+
+**`drop_caches` evicts the container image too.** The first restore after a
+drop re-pulls `vllm/vllm-openai` and spends a minute or two in
+`ContainerCreating` before CRIU is even invoked. That lands in wall clock and
+not in the CRIU-proper phase, which is one more reason to compare the latter;
+budget for it when a sweep looks stalled on its first run.
+
+**Check `Restoring N memfd inodes on M threads` before believing a config
+applied.** It echoes the effective thread count, so a tuning annotation that
+never reached CRIU shows up as the default 8 rather than as a null result.
+
+CF-3 exists because of a real regression: the first pool build failed every
+restore with `Bad file descriptor` from `cr_fchpermat`, and having the inert
+control on the same binary is what proved the rebuild innocent and pointed at
+the patches. See [design-v2.md §6b](design-v2.md).
 
 ## IR — integration & resilience
 
@@ -36,9 +146,20 @@ AKS `Standard_NC24ads_A100_v4` node with the prerequisites installed).
 | IR-3 | Artifact sha256 spot-check | sha256 of /mnt/fuse tar matches status.artifact.sha256 |
 | IR-4 | Node reboot with stale runc state | agent GC path: PodRestore fails cleanly; no orphaned cgroups |
 
-## Timing table to fill in
+## Measured
 
-| Model | Cold start | Snapshot | Restore (warm NVMe) | Restore (cloud) |
-|-------|-----------|----------|---------------------|-----------------|
-| Qwen2.5-0.5B | | | | |
-| Llama-3-8B | | | | |
+A100 80GB PCIe, driver 580.159.04, CRIU 4.2.1, containerd 2.3.2,
+vLLM 0.9.2 behind `hack/snapshot-shim.py`, weights on the fuse-cache mount.
+Cold start is container start → engine ready. See
+[design-v2.md §8](design-v2.md#8-rollout) for the phase-by-phase breakdown.
+
+| Model | Device memory at dump | Artifact | Cold start | Build (start→artifact) | Restore → Ready |
+|-------|----------------------|----------|-----------|-----------------------|-----------------|
+| Qwen2.5-1.5B-Instruct | 0.98 GiB (from 48.6) | 6.7 GiB, 396 files | ~90 s | ~11 min | **73 s** |
+| Qwen2.5-14B-Instruct | 1.31 GiB (from 72.5) | 52.5 GiB, 640 files | 179 s | 34 min | **395 s** |
+
+The 14B restore is slower than its cold start, and
+[design-v2.md §8](design-v2.md#the-uncomfortable-number) explains why: the
+artifact is 2× the weights, because `sleep(level=1)` offloads them to host
+RAM rather than dropping them. Weight decoupling, not restore-side I/O
+parallelism, is what closes that.

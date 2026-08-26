@@ -1,0 +1,5 @@
+t	phase	message
+0	Preparing 	waiting for stale placeholder pod restore-kubenvme-restored to terminate
+3	Restoring 0/1	pre-warm complete; restoring
+40	Running 0/1	
+43	Running 1/1	

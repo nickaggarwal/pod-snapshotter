@@ -33,10 +33,24 @@ import (
 //
 // GPU checks are skipped (not failed) on nodes without /dev/nvidiactl so the
 // system remains usable for CPU-only checkpoint trials.
+//
+// It also publishes the agent's optional capabilities (podsnapshot.io/
+// capabilities) and the node's restore-compatibility tuple (GPU model, driver
+// version, CRIU version) as the podsnapshot.io/compat annotation plus a
+// podsnapshot.io/compat-hash label. A restore built against one tuple is
+// confined to nodes carrying the same hash, so an incompatible placement is
+// rejected by the scheduler instead of by CRIU (docs/design-v2.md §5).
 type PrereqChecker struct {
 	Client    client.Client
 	NodeName  string
 	FuseMount string
+	// LocalArtifactRoot is the node-local artifact tier (--local-artifact-root).
+	// Checked for the same reason the fuse mount is: it is a hostPath the
+	// DaemonSet is supposed to have mounted, and if the mount is missing the
+	// agent writes a dump into its own container filesystem instead -- which
+	// looks like a successful checkpoint right up until the restore, on the
+	// host, cannot find a single image file.
+	LocalArtifactRoot string
 	// HostRoot is where the host filesystem is visible (e.g. /host), used for
 	// file checks; command checks go through nsenter.
 	HostRoot string
@@ -44,10 +58,17 @@ type PrereqChecker struct {
 	Interval time.Duration
 	// SkipHostChecks disables nsenter-based checks (tests / non-Linux dev).
 	SkipHostChecks bool
+	// Capabilities are the optional behaviours this agent implements,
+	// published as podsnapshot.io/capabilities. Set by cmd/agent from what it
+	// actually wired up, not hardcoded here: an agent built with the
+	// checkpoint reconciler but started without a CRI socket cannot honor
+	// checkpointer: agent, and must not claim it can.
+	Capabilities []string
 }
 
 var (
-	criuVersionRe = regexp.MustCompile(`Version:\s*(\d+)\.(\d+)`)
+	criuVersionRe     = regexp.MustCompile(`Version:\s*(\d+)\.(\d+)`)
+	criuFullVersionRe = regexp.MustCompile(`Version:\s*(\d+(?:\.\d+)*)`)
 	// nvidia-container-runtime config: mode = "cdi" in the
 	// [nvidia-container-runtime] section (nvidia-ctk config --set writes it
 	// with this exact shape).
@@ -90,7 +111,14 @@ func (p *PrereqChecker) checkAndPublish(ctx context.Context) {
 	if len(failures) > 0 {
 		value = strings.Join(failures, ",")
 	}
-	if node.Annotations[snapv1.PrereqsAnnotation] == value {
+	key := p.compatibility(ctx)
+	compat, hash := key.NodeCompatibility(), key.NodeHash()
+	caps := strings.Join(p.Capabilities, ",")
+
+	if node.Annotations[snapv1.PrereqsAnnotation] == value &&
+		node.Annotations[snapv1.CompatibilityAnnotation] == compat &&
+		node.Annotations[snapv1.CapabilitiesAnnotation] == caps &&
+		node.Labels[snapv1.CompatibilityHashLabel] == hash {
 		return
 	}
 	patch := client.MergeFrom(node.DeepCopy())
@@ -98,11 +126,54 @@ func (p *PrereqChecker) checkAndPublish(ctx context.Context) {
 		node.Annotations = map[string]string{}
 	}
 	node.Annotations[snapv1.PrereqsAnnotation] = value
+	node.Annotations[snapv1.CompatibilityAnnotation] = compat
+	// Capabilities say what this build of the agent can be asked to do. The
+	// manager reads it to decide whether checkpointer: agent is honorable on
+	// this node, which is the only way a rolling upgrade can route work to
+	// the new agents without stranding snapshots on the old ones.
+	if caps == "" {
+		delete(node.Annotations, snapv1.CapabilitiesAnnotation)
+	} else {
+		node.Annotations[snapv1.CapabilitiesAnnotation] = caps
+	}
+	if hash != "" {
+		if node.Labels == nil {
+			node.Labels = map[string]string{}
+		}
+		node.Labels[snapv1.CompatibilityHashLabel] = hash
+	}
 	if err := p.Client.Patch(ctx, &node, patch); err != nil {
 		logger.Error(err, "patching node annotation")
 		return
 	}
-	logger.Info("published prereq status", "value", value)
+	logger.Info("published prereq status", "value", value, "compat", compat)
+}
+
+// compatibility reads the environment tuple a restore must match. Fields it
+// cannot determine stay empty, and an empty field never blocks a match.
+func (p *PrereqChecker) compatibility(ctx context.Context) *snapv1.CompatibilityKey {
+	var k snapv1.CompatibilityKey
+	if p.SkipHostChecks {
+		return &k
+	}
+	if out, err := p.hostCommand(ctx, "criu", "--version"); err == nil {
+		k.CRIUVersion = parseCriuVersionString(out)
+	}
+	if p.hostFileExists("/dev/nvidiactl") {
+		if out, err := p.hostCommand(ctx, "nvidia-smi", "--query-gpu=name,driver_version", "--format=csv,noheader"); err == nil {
+			name, driver, ok := strings.Cut(strings.TrimSpace(firstLine(out)), ",")
+			if ok {
+				k.GPUModel = strings.TrimSpace(name)
+				k.DriverVersion = strings.TrimSpace(driver)
+			}
+		}
+	}
+	return &k
+}
+
+func firstLine(s string) string {
+	line, _, _ := strings.Cut(s, "\n")
+	return line
 }
 
 // run returns the list of failing check names.
@@ -120,6 +191,18 @@ func (p *PrereqChecker) run(ctx context.Context, node *corev1.Node) []string {
 	if p.FuseMount != "" {
 		if fi, err := os.Stat(p.FuseMount); err != nil || !fi.IsDir() {
 			failures = append(failures, "fuse-mount-missing")
+		}
+	}
+
+	// Node-local artifact tier visible to the agent, and visible at the same
+	// path on the host -- the two are separate facts. runc resolves
+	// --image-path in the host mount namespace, so a directory that exists
+	// only inside this container is not a place a dump can go.
+	if p.LocalArtifactRoot != "" {
+		if fi, err := os.Stat(p.LocalArtifactRoot); err != nil || !fi.IsDir() {
+			failures = append(failures, "local-artifact-root-missing")
+		} else if !p.SkipHostChecks && !p.hostDirExists(p.LocalArtifactRoot) {
+			failures = append(failures, "local-artifact-root-not-on-host")
 		}
 	}
 
@@ -214,6 +297,26 @@ func (p *PrereqChecker) hostPath(path string) string {
 func (p *PrereqChecker) hostFileExists(path string) bool {
 	_, err := os.Stat(p.hostPath(path))
 	return err == nil
+}
+
+// hostDirExists asks whether path is a directory in the *host's* namespace,
+// which for a hostPath mount is a different question from whether it exists
+// here: a mount that failed to propagate leaves an empty directory in this
+// container and nothing at all on the node.
+func (p *PrereqChecker) hostDirExists(path string) bool {
+	fi, err := os.Stat(p.hostPath(path))
+	return err == nil && fi.IsDir()
+}
+
+// parseCriuVersionString returns the full version CRIU printed ("4.2.1"),
+// which is the granularity image compatibility actually depends on — unlike
+// parseCriuVersion, which only needs major.minor for the prereq threshold.
+func parseCriuVersionString(out string) string {
+	m := criuFullVersionRe.FindStringSubmatch(out)
+	if len(m) != 2 {
+		return ""
+	}
+	return m[1]
 }
 
 func parseCriuVersion(out string) (major, minor int, ok bool) {

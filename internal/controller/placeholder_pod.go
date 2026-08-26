@@ -41,7 +41,7 @@ func BuildPlaceholderPod(restore *snapv1.PodRestore, podName string) (*corev1.Po
 		return nil, err
 	}
 
-	tmpl := restore.Spec.PodTemplate.DeepCopy()
+	tmpl := restore.Spec.PodTemplate.ToPodTemplateSpec()
 	pod := &corev1.Pod{
 		ObjectMeta: tmpl.ObjectMeta,
 		Spec:       tmpl.Spec,
@@ -76,6 +76,17 @@ func BuildPlaceholderPod(restore *snapv1.PodRestore, podName string) (*corev1.Po
 		for k, v := range restore.Spec.NodeSelector {
 			pod.Spec.NodeSelector[k] = v
 		}
+	}
+	// Confine the pod to nodes whose environment matches the one the artifact
+	// was built against. CRIU/cuda-checkpoint restores demand an identical
+	// GPU model, driver and CRIU; letting the scheduler learn that from a
+	// label beats letting `runc restore` discover it after the GPU has
+	// already been handed out (docs/design-v2.md §5).
+	if hash := restore.Status.Compatibility.NodeHash(); hash != "" {
+		if pod.Spec.NodeSelector == nil {
+			pod.Spec.NodeSelector = map[string]string{}
+		}
+		pod.Spec.NodeSelector[snapv1.CompatibilityHashLabel] = hash
 	}
 	// The restored workload is not managed by the kubelet; never let the
 	// kubelet restart the keeper out from under it.

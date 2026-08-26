@@ -54,6 +54,24 @@ manager refuses to checkpoint pods on nodes not marked `ok`.
   handles deleted-but-open files (common with `/dev/shm` usage). The agent
   checks for both lines but never writes host config.
 
+  **`link-remap` lets the dump succeed but cannot make the restore succeed**
+  for a deleted file on pod-scoped tmpfs. CRIU hard-links the inode to
+  `/dev/shm/link_remap.<n>` during the dump, drops that link when the dump
+  finishes, and expects it back at restore time — which it never is, because
+  a restored pod gets an empty tmpfs:
+
+  ```
+  Error (criu/files-reg.c:2258): Can't link dev/shm/link_remap.337 ->
+  dev/shm/sem.l0JKK0: No such file or directory
+  ```
+
+  Removing `link-remap` does not help either; CRIU then refuses the dump
+  outright (`Can't create link remap for /dev/shm/sem.XXXXXX. Use link-remap
+  option.`) because it cannot ghost a *mapped* deleted file that still has a
+  link. The workload has to drop the last link itself, which takes `nlink`
+  to zero and puts CRIU on the ghost-file path — see
+  [Workload requirements](#workload-requirements).
+
 ## 3. CRIU
 
 > The Helm chart installs CRIU for you: the `nodeSetup` DaemonSet (enabled by
@@ -72,6 +90,30 @@ manager refuses to checkpoint pods on nodes not marked `ok`.
 - CPU-only nodes: CRIU ≥ 3.16 suffices (containerd's floor); the agent's
   prereq checker applies the matching threshold per node.
 - `criu check` should pass on the host.
+
+### Optional: the patched CRIU
+
+`criu.enabled=true` adds a second, opt-in DaemonSet that installs
+pod-snapshotter's CRIU fork — upstream v4.2.1 plus the restore read-path
+patches in `hack/criu/patches` (see [design-v2.md §6b](design-v2.md)). It
+lands in `/usr/local/sbin`, which precedes `/usr/sbin` on the default PATH, so
+runc picks it up while the distro package stays where it is; `criu.uninstall=true`
+removes it and the node falls straight back.
+
+It is off by default because it replaces the binary every checkpoint and
+restore on that node goes through. Nothing else in the chart depends on it:
+the tuning annotations below are ignored by a stock CRIU, so a cluster can run
+with it enabled on some nodes and not others.
+
+| Annotation on a PodRestore | Effect |
+|---|---|
+| `podsnapshot.io/criu-aio-depth` | AIO reads in flight; `0`/`1` = stock serial loop |
+| `podsnapshot.io/criu-shmem-threads` | shmem/memfd objects restored at once; `1` = stock serial loop |
+| `podsnapshot.io/criu-image-io-mode` | `writeback` (default) or `direct` |
+
+Setting the first two to their off values makes the patches inert without
+reinstalling anything, which is the supported way to check whether a restore
+problem is the fork's fault.
 
 ## 4. NVIDIA
 
@@ -107,12 +149,36 @@ manager refuses to checkpoint pods on nodes not marked `ok`.
   tars buffer 4 MB chunks in flight on both the write (cloud persist)
   and read (range-read) paths; an OOM-kill tears down the FUSE mount on
   that node (verified: 4 Gi and 8 Gi limits both OOMed on 3 GB tars;
-  16 Gi held).
+  16 Gi held). Directory artifacts help here too: the largest object in
+  flight is one CRIU image file rather than the whole checkpoint.
+- Two behaviors of the mount that pod-snapshotter works around, both
+  measured on the cluster — worth knowing if you write to it yourself:
+  `rename` copies without unlinking the source (every artifact tar had a
+  full-size `.tar.part` beside it until `RenamePublish` started cleaning
+  up), and `O_TRUNC` is ignored (re-uploading a revision left files that
+  had shrunk carrying the previous upload's tail, so the agent unlinks
+  before every overwrite).
 - Its HTTP API reachable (default `127.0.0.1:8081` on each node via
   hostNetwork, and a `fuse-client` Service for the manager).
 - Optional but recommended: the fuse-client agent socket
   (`/var/run/fuse-client/agent.sock`, flag `-enable-agent-server`) for
   artifact pinning. Without it restores still work — just unpinned.
+- Optional and worth it: point `agent.nvmeCacheRoot` at the client's
+  node-local cache tier (default `/mnt/fuse-nvme0n1/fuse-cache`) so restores
+  read the CRIU images straight off the device instead of back through the
+  FUSE mount. The client already promotes everything it serves onto that tier
+  as a 1:1 mirror of the artifact prefix, and reading it back through
+  userspace costs about 7× — 500-690 MB/s through the mount against 2.6 GB/s
+  single-stream and 4.5 GB/s at four streams on the raw device. Measured
+  end-to-end on the 14B artifact: 253 s → **40 s**.
+
+  Two things to get right. It is a **host** path, not a path inside the agent
+  container: the agent execs runc through `nsenter -t 1 -m`, so runc resolves
+  `--image-path` against the host's mount namespace. And the bypass only
+  engages when the tier holds every file the artifact's MANIFEST lists at the
+  size it lists — a partial mirror declines and falls back to the mount, and a
+  size that disagrees is an error rather than a silently wrong restore. Leave
+  it unset to disable.
 
 ## Workload requirements
 
@@ -128,6 +194,59 @@ spec:
     appArmorProfile:
       type: Unconfined
 ```
+
+`SnapshotBuild` sets this on the build pod for you.
+
+### What must not be in the image
+
+A process is dumpable only if nothing it holds is un-dumpable, and
+restorable only if nothing it holds is bound to the pod it was dumped from.
+Every item below was hit checkpointing vLLM 0.9.2 on an A100; the reference
+shim ([hack/snapshot-shim.py](../hack/snapshot-shim.py)) handles all of them,
+and any other workload has to handle them too.
+
+| Must not be in the image | Why | How the shim handles it |
+|---|---|---|
+| An NVML handle on `/dev/nvidiactl` | `cuda-checkpoint` releases the descriptors the CUDA *runtime* owns. NVML's is not one, so it survives into the dump: `Can't dump file 9 of that type [20666] (chr 195:255)` | unwinds `nvmlInit`'s refcount in every process, frontend and engine worker |
+| Descriptors inherited across `fork` | A forked engine worker inherits the frontend's nvidiactl fd. It then belongs to no library in the child, so `cuda-checkpoint` does not release it either. vLLM only forces `spawn` when the parent has initialized CUDA — NVML alone does not count | `VLLM_WORKER_MULTIPROC_METHOD=spawn` |
+| A socket bound to the pod IP | The restored pod has a different IP: `Can't bind inet socket back: Cannot assign requested address`. vLLM's engine ZMQ endpoints and the `torch.distributed` TCPStore are both created during engine init, so they are in the image however late the frontend starts | `VLLM_HOST_IP=127.0.0.1`, `GLOO_SOCKET_IFNAME=lo` — loopback exists identically in every pod |
+| An established connection to anything outside the pod | Nothing can bring it back on another node. vLLM's usage reporting holds one open to the public internet | `VLLM_NO_USAGE_STATS=1`, `DO_NOT_TRACK=1` |
+| A deleted-but-mapped file on `/dev/shm` with a surviving link | glibc's `sem_open` leaves every POSIX semaphore mapped from a deleted path, so any Python `multiprocessing` primitive produces one. See the `link-remap` note in §2 | unlinks the surviving names, taking `nlink` to zero so CRIU writes a ghost file instead |
+| io_uring rings, NCCL communicators, TCP listeners | CRIU cannot dump an io_uring ring at all, and the rest are bound to the node | created only *after* the resume point, so they are never in the image |
+
+The last row is the whole reason for the quiesce protocol — see
+[design-v2.md §4](design-v2.md#4-workstream-2--quiesceresume-hooks).
+
+### Quiesce/resume contract
+
+A workload opts in by annotating the pod:
+
+```yaml
+metadata:
+  annotations:
+    podsnapshot.io/quiesce: "presence-file"
+    podsnapshot.io/quiesce-dir: "/snapshot"      # default
+    podsnapshot.io/quiesce-timeout: "900s"       # default 10m
+```
+
+The rendezvous directory must be a writable volume (an `emptyDir`) mounted
+into the container: it is captured in the image, and the agent writes into
+the *restored* pod's copy of it.
+
+The workload then:
+
+1. initializes — weights loaded, kernels warm, CUDA graphs captured;
+2. releases what it can afford to lose (`llm.sleep(level=1)` for vLLM);
+3. creates `<quiesce-dir>/ready-for-checkpoint`;
+4. blocks polling for `<quiesce-dir>/restore-complete` — **the checkpoint
+   happens here**, while the process sits in the loop;
+5. on restore, finds the file already present, reacquires what it released
+   (`wake_up()`), and only *then* opens its listening sockets.
+
+The manager waits for step 3 (phase `Quiescing`) instead of the readiness
+probe, and fails with `QuiesceTimeout` if it never comes. The agent writes
+the resume file immediately before `runc restore` returns, so the poll loop
+sees it the first time it spins.
 
 ## Restore environment matching
 
@@ -163,3 +282,9 @@ peer/cloud tiers.
 | `nvidia-driver-lt-570` | upgrade the driver |
 | `criu-runc-conf-missing` / `runc-conf-no-*` | write `/etc/criu/runc.conf` (see §2) |
 | `fuse-mount-missing` | fix the fuse-client DaemonSet / mount path |
+
+The agent also publishes the node's restore-compatibility tuple as
+`podsnapshot.io/compat` (`gpu=…;driver=…;criu=…`) plus a label
+`podsnapshot.io/compat-hash`. A `PodRestore` with `spec.buildRef` confines
+its placeholder pod to nodes carrying the build's hash, so a mismatched node
+is rejected by the scheduler rather than by `runc restore`.

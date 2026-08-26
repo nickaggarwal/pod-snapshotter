@@ -6,7 +6,13 @@ metadata:
 spec:
   podName: vllm-demo
   container: vllm
-  # Defaults to fuse:///snapshots/default/vllm-demo-snap/vllm.tar
+  # Pinned to the v1 path on purpose: this sample is the tar walkthrough in
+  # docs/demo.md, and the cluster defaults have since moved to agent+dir. Left
+  # unset it would take the fast path and stop matching the page. Everything
+  # real should use the SnapshotBuild sample instead.
+  checkpointer: kubelet
+  artifactFormat: tar
+  # Defaults to <artifact-root>/default/vllm-demo-snap/vllm.tar
   # artifactURI: fuse:///snapshots/default/vllm-demo-snap/vllm.tar
   deletionPolicy: Retain
   # VRAM copy + CRIU dump for a small model; raise for big models.

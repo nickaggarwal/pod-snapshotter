@@ -1,0 +1,1285 @@
+<title>Snapshot and Restore, Measured</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wght@500;600;700;800&family=Newsreader:opsz,wght@6..72,300;6..72,400;6..72,500&family=IBM+Plex+Mono:wght@400;500;600&display=swap">
+
+<style>
+:root {
+  --ground:      #EEF1F5;
+  --surface:     #FFFFFF;
+  --surface-alt: #E4E9EF;
+  --ink:         #10161F;
+  --ink-soft:    #4A5566;
+  --ink-faint:   #78838F;
+  --rule:        #D3DAE3;
+  --rule-strong: #B6C0CC;
+  --measured:    #C23D00;
+  --measured-bg: #FBEBE2;
+  --predicted:   #4E7284;
+  --predicted-bg:#E3ECF0;
+  --shadow:      0 1px 2px rgba(16,22,31,.06), 0 8px 24px -16px rgba(16,22,31,.24);
+
+  --f-display: "Archivo", "Helvetica Neue", Arial, sans-serif;
+  --f-body:    "Newsreader", Georgia, "Times New Roman", serif;
+  --f-mono:    "IBM Plex Mono", ui-monospace, "SF Mono", Menlo, monospace;
+
+  --measure: 68ch;
+  --step--1: clamp(.78rem, .76rem + .1vw, .84rem);
+  --step-0:  clamp(1.06rem, 1.02rem + .18vw, 1.19rem);
+  --step-1:  clamp(1.3rem, 1.22rem + .35vw, 1.55rem);
+  --step-2:  clamp(1.6rem, 1.44rem + .7vw, 2.15rem);
+  --step-3:  clamp(2.1rem, 1.7rem + 1.7vw, 3.4rem);
+  --step-4:  clamp(2.9rem, 2.0rem + 4.2vw, 6.2rem);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --ground:      #0C1016;
+    --surface:     #141A23;
+    --surface-alt: #1B222D;
+    --ink:         #E4E9F0;
+    --ink-soft:    #A3AEBC;
+    --ink-faint:   #77828F;
+    --rule:        #263140;
+    --rule-strong: #38455A;
+    --measured:    #FF7A45;
+    --measured-bg: #2A1810;
+    --predicted:   #8AB0C2;
+    --predicted-bg:#151F26;
+    --shadow:      0 1px 2px rgba(0,0,0,.4), 0 8px 24px -16px rgba(0,0,0,.7);
+  }
+}
+:root[data-theme="dark"] {
+  --ground:      #0C1016;
+  --surface:     #141A23;
+  --surface-alt: #1B222D;
+  --ink:         #E4E9F0;
+  --ink-soft:    #A3AEBC;
+  --ink-faint:   #77828F;
+  --rule:        #263140;
+  --rule-strong: #38455A;
+  --measured:    #FF7A45;
+  --measured-bg: #2A1810;
+  --predicted:   #8AB0C2;
+  --predicted-bg:#151F26;
+  --shadow:      0 1px 2px rgba(0,0,0,.4), 0 8px 24px -16px rgba(0,0,0,.7);
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--ground);
+  color: var(--ink);
+  font-family: var(--f-body);
+  font-size: var(--step-0);
+  line-height: 1.62;
+  -webkit-font-smoothing: antialiased;
+}
+
+.wrap { max-width: 1180px; margin: 0 auto; padding: 0 clamp(1.1rem, 4vw, 3rem); }
+.col  { max-width: var(--measure); }
+
+/* ---------- masthead ---------- */
+
+.masthead {
+  border-bottom: 1px solid var(--rule);
+  padding: clamp(2.2rem, 6vw, 4.5rem) 0 clamp(2rem, 5vw, 3.4rem);
+}
+.eyebrow {
+  font-family: var(--f-mono);
+  font-size: var(--step--1);
+  font-weight: 500;
+  letter-spacing: .13em;
+  text-transform: uppercase;
+  color: var(--ink-faint);
+  margin: 0 0 1.6rem;
+  display: flex;
+  flex-wrap: wrap;
+  gap: .55rem 1.1rem;
+}
+.eyebrow span::before { content: "/ "; color: var(--rule-strong); }
+.eyebrow span:first-child::before { content: none; }
+
+h1 {
+  font-family: var(--f-display);
+  font-weight: 800;
+  font-size: var(--step-3);
+  line-height: 1.02;
+  letter-spacing: -.028em;
+  text-wrap: balance;
+  margin: 0 0 1.5rem;
+  max-width: 20ch;
+}
+.standfirst {
+  font-size: var(--step-1);
+  line-height: 1.45;
+  font-weight: 300;
+  color: var(--ink-soft);
+  max-width: 56ch;
+  margin: 0;
+}
+.standfirst strong { color: var(--ink); font-weight: 500; }
+
+/* ---------- headline figure ---------- */
+
+.bignum {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: clamp(1rem, 4vw, 3.5rem);
+  margin: clamp(2.4rem, 6vw, 4rem) 0 0;
+}
+.bignum-item { display: flex; flex-direction: column; gap: .3rem; }
+.bignum-val {
+  font-family: var(--f-display);
+  font-weight: 800;
+  font-size: var(--step-4);
+  line-height: .85;
+  letter-spacing: -.045em;
+  font-variant-numeric: tabular-nums;
+}
+.bignum-item.before .bignum-val { color: var(--ink-faint); }
+.bignum-item.after  .bignum-val { color: var(--measured); }
+.bignum-lab {
+  font-family: var(--f-mono);
+  font-size: var(--step--1);
+  letter-spacing: .1em;
+  text-transform: uppercase;
+  color: var(--ink-faint);
+  line-height: 1.5;  /* these labels wrap to a second line carrying the figures */
+}
+/* the two multiplier items are the same rank; the seconds figure is the payoff */
+.bignum-item:not(.after) .bignum-val { color: var(--ink); }
+.bignum-arrow {
+  font-family: var(--f-display);
+  font-size: clamp(1.6rem, 4vw, 2.8rem);
+  color: var(--rule-strong);
+  line-height: 1;
+  padding-bottom: .35em;
+}
+
+/* ---------- body typography ---------- */
+
+section { padding: clamp(2.6rem, 6vw, 4.4rem) 0; border-bottom: 1px solid var(--rule); }
+section:last-of-type { border-bottom: 0; }
+
+h2 {
+  font-family: var(--f-display);
+  font-weight: 700;
+  font-size: var(--step-2);
+  line-height: 1.1;
+  letter-spacing: -.02em;
+  text-wrap: balance;
+  margin: 0 0 1.4rem;
+  max-width: 26ch;
+}
+h3 {
+  font-family: var(--f-display);
+  font-weight: 600;
+  font-size: var(--step-1);
+  line-height: 1.2;
+  letter-spacing: -.012em;
+  text-wrap: balance;
+  margin: 2.6rem 0 .9rem;
+}
+p { margin: 0 0 1.15rem; }
+p:last-child { margin-bottom: 0; }
+
+a { color: var(--measured); text-decoration-thickness: 1px; text-underline-offset: 2px; }
+a:focus-visible, .stage:focus-visible { outline: 2px solid var(--measured); outline-offset: 3px; border-radius: 2px; }
+
+strong { font-weight: 500; color: var(--ink); }
+em { font-style: italic; }
+
+code {
+  font-family: var(--f-mono);
+  font-size: .855em;
+  background: var(--surface-alt);
+  padding: .12em .34em;
+  border-radius: 3px;
+  color: var(--ink);
+}
+
+ul, ol { margin: 0 0 1.15rem; padding-left: 1.3rem; }
+li { margin-bottom: .5rem; }
+li::marker { color: var(--ink-faint); }
+
+/* stage number rides the section head, and the sequence is real: each benchmark
+   row depends on the one before it. Stages 01-02 are the snapshot half and
+   03-04 the restore half, which is why the numbering runs across both parts
+   rather than restarting -- the four are one chain, not two lists of two. */
+.stage-head { display: flex; gap: 1.1rem; align-items: baseline; margin-bottom: 1.4rem; }
+.stage-num {
+  font-family: var(--f-mono);
+  font-weight: 600;
+  font-size: var(--step--1);
+  letter-spacing: .08em;
+  color: var(--measured);
+  background: var(--measured-bg);
+  padding: .3em .6em;
+  border-radius: 3px;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+.stage-head h2 { margin: 0; }
+
+/* ---------- waterfall ---------- */
+
+.waterfall { margin: 2rem 0 0; display: flex; flex-direction: column; gap: .1rem; }
+.wf-row {
+  display: grid;
+  grid-template-columns: minmax(9rem, 15rem) 1fr minmax(4.5rem, auto);
+  gap: clamp(.6rem, 2vw, 1.4rem);
+  align-items: center;
+  padding: .62rem 0;
+  border-bottom: 1px solid var(--rule);
+}
+.wf-row:last-child { border-bottom: 0; }
+.wf-lab {
+  font-family: var(--f-mono);
+  font-size: var(--step--1);
+  color: var(--ink-soft);
+  line-height: 1.3;
+}
+.wf-track { position: relative; height: 1.45rem; background: var(--surface-alt); border-radius: 2px; overflow: hidden; }
+.wf-bar {
+  position: absolute; inset: 0 auto 0 0;
+  background: var(--predicted);
+  border-radius: 2px;
+  width: var(--w);
+  transform-origin: left center;
+  transform: scaleX(var(--scale, 1));
+  transition: transform 1.1s cubic-bezier(.22,.61,.36,1);
+}
+.wf-row.final .wf-bar { background: var(--measured); }
+.wf-val {
+  font-family: var(--f-mono);
+  font-weight: 600;
+  font-size: var(--step--1);
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+  color: var(--ink);
+}
+.wf-row.final .wf-val { color: var(--measured); }
+.waterfall:not(.in) .wf-bar { --scale: 0; }
+
+@media (prefers-reduced-motion: reduce) {
+  .wf-bar { transition: none; }
+  .waterfall:not(.in) .wf-bar { --scale: 1; }
+}
+
+/* ---------- tables ---------- */
+
+.tablewrap {
+  overflow-x: auto;
+  margin: 1.7rem 0;
+  border: 1px solid var(--rule);
+  border-radius: 4px;
+  background: var(--surface);
+  box-shadow: var(--shadow);
+}
+table { border-collapse: collapse; width: 100%; font-family: var(--f-mono); font-size: var(--step--1); }
+caption {
+  caption-side: top;
+  text-align: left;
+  font-family: var(--f-mono);
+  font-size: var(--step--1);
+  letter-spacing: .06em;
+  text-transform: uppercase;
+  color: var(--ink-faint);
+  padding: .85rem 1rem .1rem;
+}
+th, td { padding: .58rem 1rem; text-align: left; border-bottom: 1px solid var(--rule); white-space: nowrap; }
+thead th {
+  font-weight: 600;
+  font-size: .82em;
+  letter-spacing: .07em;
+  text-transform: uppercase;
+  color: var(--ink-faint);
+  border-bottom: 1px solid var(--rule-strong);
+}
+tbody tr:last-child td { border-bottom: 0; }
+td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+tr.hi td { background: var(--measured-bg); color: var(--measured); font-weight: 600; }
+tr.hi td:first-child { color: var(--measured); }
+td.dim { color: var(--ink-faint); }
+
+/* ---------- part dividers ----------
+   The four stages are two pairs, and which pair a change belongs to is the
+   thing readers most often get wrong about this work: a tar removed on the
+   write side is not a tar removed on the read side. The divider makes the
+   halves structural rather than something the prose has to keep asserting. */
+
+.part {
+  padding: clamp(2.4rem, 6vw, 4rem) 0 clamp(1.4rem, 3vw, 2rem);
+  border-bottom: 1px solid var(--rule);
+}
+.part-lab {
+  font-family: var(--f-mono);
+  font-size: var(--step--1);
+  font-weight: 600;
+  letter-spacing: .14em;
+  text-transform: uppercase;
+  color: var(--measured);
+  margin: 0 0 .8rem;
+}
+.part h2 {
+  font-size: var(--step-3);
+  font-weight: 800;
+  letter-spacing: -.028em;
+  margin: 0 0 1rem;
+  max-width: 18ch;
+}
+.part p { color: var(--ink-soft); max-width: var(--measure); }
+.part-num {
+  font-family: var(--f-mono);
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+  color: var(--ink);
+}
+
+/* ---------- callouts ---------- */
+
+.note {
+  border-left: 2px solid var(--rule-strong);
+  padding: .1rem 0 .1rem 1.3rem;
+  margin: 1.7rem 0;
+  color: var(--ink-soft);
+}
+.note .note-lab {
+  display: block;
+  font-family: var(--f-mono);
+  font-size: var(--step--1);
+  letter-spacing: .1em;
+  text-transform: uppercase;
+  color: var(--ink-faint);
+  margin-bottom: .45rem;
+}
+.note.wrong { border-left-color: var(--measured); }
+.note.wrong .note-lab { color: var(--measured); }
+
+pre {
+  font-family: var(--f-mono);
+  font-size: var(--step--1);
+  line-height: 1.65;
+  background: var(--surface);
+  border: 1px solid var(--rule);
+  border-radius: 4px;
+  padding: 1rem 1.1rem;
+  overflow-x: auto;
+  margin: 1.5rem 0;
+  color: var(--ink);
+}
+pre code { background: none; padding: 0; font-size: 1em; }
+.cmt { color: var(--ink-faint); }
+
+/* predicted-vs-measured pair */
+.pvm { display: grid; grid-template-columns: repeat(auto-fit, minmax(13rem, 1fr)); gap: 1rem; margin: 1.8rem 0; }
+.pvm-card { border: 1px solid var(--rule); border-radius: 4px; padding: 1.1rem 1.2rem; background: var(--surface); }
+.pvm-card .k {
+  font-family: var(--f-mono); font-size: var(--step--1); letter-spacing: .1em;
+  text-transform: uppercase; margin-bottom: .55rem;
+}
+.pvm-card.p .k { color: var(--predicted); }
+.pvm-card.m .k { color: var(--measured); }
+.pvm-card .v {
+  font-family: var(--f-display); font-weight: 700; font-size: var(--step-1);
+  letter-spacing: -.018em; font-variant-numeric: tabular-nums; line-height: 1.1;
+}
+.pvm-card.p .v { color: var(--predicted); }
+.pvm-card.m .v { color: var(--measured); }
+.pvm-card .d { font-size: .93em; color: var(--ink-soft); margin-top: .4rem; line-height: 1.45; }
+
+/* checklist */
+.check { list-style: none; padding: 0; margin: 1.5rem 0 0; }
+.check li {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: .9rem;
+  padding: .85rem 0;
+  border-bottom: 1px solid var(--rule);
+  margin: 0;
+}
+.check li:last-child { border-bottom: 0; }
+.check .n {
+  font-family: var(--f-mono); font-size: var(--step--1); font-weight: 600;
+  color: var(--ink-faint); padding-top: .22em;
+}
+.check .t strong { display: block; font-family: var(--f-display); font-weight: 600; margin-bottom: .12rem; }
+.check .t span { color: var(--ink-soft); font-size: .95em; }
+
+footer {
+  border-top: 1px solid var(--rule);
+  padding: 2.4rem 0 4rem;
+  font-family: var(--f-mono);
+  font-size: var(--step--1);
+  color: var(--ink-faint);
+  line-height: 1.7;
+}
+</style>
+
+<header class="masthead">
+  <div class="wrap">
+    <p class="eyebrow">
+      <span>Performance teardown</span>
+      <span>Qwen2.5-14B · A100 80GB</span>
+      <span>CRIU 4.2.1</span>
+    </p>
+    <h1>How we cut GPU cold start from 11 minutes to 39 seconds</h1>
+    <p class="standfirst">
+      A snapshot of a 56&nbsp;GB vLLM engine used to take <strong>56 minutes</strong> to
+      publish and <strong>677 seconds</strong> to restore. It now takes <strong>5
+      minutes</strong> and <strong>39 seconds</strong>. Most of that came from
+      configuration mistakes, not from the kernel patches we set out to write — and the
+      patches themselves delivered about a ninth of what we predicted.
+    </p>
+
+    <div class="bignum">
+      <div class="bignum-item">
+        <div class="bignum-val" style="font-size:var(--step-2)">11.3×</div>
+        <div class="bignum-lab">Part one · snapshot<br>3364 s → 297 s</div>
+      </div>
+      <div class="bignum-item">
+        <div class="bignum-val" style="font-size:var(--step-2)">17×</div>
+        <div class="bignum-lab">Part two · restore<br>677 s → 39 s</div>
+      </div>
+      <div class="bignum-item after">
+        <div class="bignum-val">39<span style="font-size:.4em;letter-spacing:0"> s</span></div>
+        <div class="bignum-lab">Cold cache · verified by generation</div>
+      </div>
+    </div>
+  </div>
+</header>
+
+<main class="wrap">
+
+<section>
+  <div class="col">
+    <h2>What "cold start" means here, precisely</h2>
+    <p>
+      Snapshot-and-restore promises a large language model server that skips
+      initialization: instead of loading weights, compiling kernels and capturing
+      CUDA graphs on every scale-up, you restore a process image of a server that
+      already did all of that. The promise is real. The delivery is an I/O problem
+      wearing a GPU costume.
+    </p>
+    <p>
+      Every number on this page is <strong>end-to-end</strong>: from the moment the
+      restore request is created to the moment the pod reports Ready — pod scheduling,
+      artifact transport, <code>runc restore</code>, and GPU resume, all of it. Not
+      "CRIU restore only", which is the flattering subset. Where we quote the CRIU
+      phase alone, it is labelled.
+    </p>
+    <p>
+      Every row was verified by generation, not by readiness probe. A pod that answers
+      its health check but produces garbage tokens has not been restored, it has been
+      resurrected badly. The prompt was <code>"The capital of France is"</code> and the
+      answer had to be Paris.
+    </p>
+  </div>
+
+  <div class="col">
+    <h3>The two halves, before anything is explained</h3>
+    <p>
+      The work divides into making the artifact and reading it back, and the two have
+      almost nothing in common — different bottlenecks, different fixes, and one change
+      that helps enormously on one side and not at all on the other. Restore first,
+      because it is where we started and where the forecast broke:
+    </p>
+  </div>
+
+  <div class="waterfall" id="wf" aria-label="End-to-end restore time by stage">
+    <div class="wf-row">
+      <div class="wf-lab">Baseline<br><span style="color:var(--ink-faint)">patches inert</span></div>
+      <div class="wf-track"><div class="wf-bar" style="--w:100%"></div></div>
+      <div class="wf-val">677 s</div>
+    </div>
+    <div class="wf-row">
+      <div class="wf-lab">+ parallel CRIU restore<br><span style="color:var(--ink-faint)">shmem pool ×8</span></div>
+      <div class="wf-track"><div class="wf-bar" style="--w:66.8%"></div></div>
+      <div class="wf-val">452 s</div>
+    </div>
+    <div class="wf-row">
+      <div class="wf-lab">+ no staging copy<br><span style="color:var(--ink-faint)">config fix</span></div>
+      <div class="wf-track"><div class="wf-bar" style="--w:37.4%"></div></div>
+      <div class="wf-val">253 s</div>
+    </div>
+    <div class="wf-row">
+      <div class="wf-lab">+ NVMe bypass<br><span style="color:var(--ink-faint)">skip the FUSE mount</span></div>
+      <div class="wf-track"><div class="wf-bar" style="--w:5.9%"></div></div>
+      <div class="wf-val">40 s</div>
+    </div>
+    <div class="wf-row final">
+      <div class="wf-lab">+ async page reads<br><span style="color:var(--ink-faint)">cold page cache</span></div>
+      <div class="wf-track"><div class="wf-bar" style="--w:5.8%"></div></div>
+      <div class="wf-val">39 s</div>
+    </div>
+  </div>
+
+  <div class="col">
+    <div class="note">
+      <span class="note-lab">Read the last row carefully</span>
+      It is the only one measured on a <em>cold</em> page cache. The 40&nbsp;s above it
+      was warm and uninstrumented, so the two are not strictly comparable — the final
+      build beats it while also paying for 56.4&nbsp;GB of real device reads. Being able
+      to say that is worth more than a rounder number.
+    </div>
+  </div>
+
+  <div class="col">
+    <p>
+      And the snapshot side, which we measured much later and which turned out to be the
+      larger of the two in absolute seconds — an hour per artifact rather than eleven
+      minutes per restore:
+    </p>
+  </div>
+
+  <div class="waterfall" aria-label="Time to publish one artifact, by configuration">
+    <div class="wf-row">
+      <div class="wf-lab">FUSE mount · kubelet + tar<br><span style="color:var(--ink-faint)">where v1 shipped</span></div>
+      <div class="wf-track"><div class="wf-bar" style="--w:100%"></div></div>
+      <div class="wf-val">3364 s</div>
+    </div>
+    <div class="wf-row">
+      <div class="wf-lab">node NVMe · kubelet + tar<br><span style="color:var(--ink-faint)">right disk, still tarred</span></div>
+      <div class="wf-track"><div class="wf-bar" style="--w:38.0%"></div></div>
+      <div class="wf-val">1279 s</div>
+    </div>
+    <div class="wf-row">
+      <div class="wf-lab">FUSE mount · agent direct<br><span style="color:var(--ink-faint)">no tar, wrong disk</span></div>
+      <div class="wf-track"><div class="wf-bar" style="--w:42.4%"></div></div>
+      <div class="wf-val">1425 s</div>
+    </div>
+    <div class="wf-row final">
+      <div class="wf-lab">node NVMe · agent direct<br><span style="color:var(--ink-faint)">both</span></div>
+      <div class="wf-track"><div class="wf-bar" style="--w:8.8%"></div></div>
+      <div class="wf-val">297 s</div>
+    </div>
+  </div>
+</section>
+
+<section class="part">
+  <div class="col">
+    <p class="part-lab">Part one · faster snapshot</p>
+    <h2>Making the artifact</h2>
+    <p>
+      Two stages, and neither one is about CRIU being slow. The first is about
+      checkpointing a process that is holding things a checkpoint cannot hold; the
+      second is about writing the result once instead of four times, onto a disk chosen
+      on purpose. Together: <span class="part-num">3364 s → 297 s</span>.
+    </p>
+  </div>
+</section>
+
+<section>
+  <div class="col">
+    <div class="stage-head">
+      <span class="stage-num">01</span>
+      <h2>Snapshot the right moment, not the current moment</h2>
+    </div>
+    <p>
+      Before any of the speed work: we were checkpointing a <em>live serving process</em>,
+      which means checkpointing whatever it happened to be holding. An io_uring ring
+      CRIU cannot dump. A listening socket with live peers. NCCL registrations. And a KV
+      cache full of nothing useful.
+    </p>
+    <p>
+      The fix is a quiesce protocol, and it is a correctness change that happens to
+      also be a size change. An entrypoint shim initializes the engine, releases KV
+      physical memory, touches <code>/snapshot/ready-for-checkpoint</code>, then blocks
+      in a poll loop. The checkpoint happens while it sits there. On restore, execution
+      resumes at the exact instruction inside that loop, the rendezvous file is now
+      present, KV pages are remapped, and <em>only then</em> does the HTTP frontend start.
+    </p>
+    <p>
+      That ordering is the whole trick. Everything un-dumpable — the event loop, the
+      TCP listener, the distributed runtime — is created <em>after</em> the quiesce
+      point, so it never exists in the image. It gets built fresh on the restore side,
+      on a node where it can be built correctly.
+    </p>
+
+    <div class="tablewrap">
+      <table>
+        <caption>Device memory released by vLLM <code>sleep(level=1)</code> — A100 80GB, vLLM 0.9.2</caption>
+        <thead>
+          <tr><th>Model</th><th class="num">Before</th><th class="num">After</th><th class="num">Freed</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>Qwen2.5-1.5B-Instruct</td><td class="num">48.6 GiB</td><td class="num">0.98 GiB</td><td class="num">47.6 GiB</td></tr>
+          <tr><td>Qwen2.5-14B-Instruct</td><td class="num">72.5 GiB</td><td class="num">1.31 GiB</td><td class="num">71.2 GiB</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3>Five things a real engine did that broke the dump</h3>
+    <p>
+      The quiesce point buys control over what is created after it, and nothing at all
+      over what engine initialization already did. All five of these existed by the time
+      weights finished loading:
+    </p>
+    <ul>
+      <li><strong>NVML keeps its own <code>/dev/nvidiactl</code> handle.</strong>
+        <code>cuda-checkpoint</code> returns the descriptors the CUDA <em>runtime</em>
+        owns; NVML's is not one of them. Any library calling <code>nvmlInit</code>
+        without a matching shutdown — PyTorch's device-count probe does — leaves one
+        behind, and CRIU refuses the dump.</li>
+      <li><strong><code>fork</code> spreads it.</strong> vLLM runs EngineCore in its own
+        process and defaults to forking, so the worker inherits the parent's nvidiactl
+        descriptor. In the child it belongs to no library, so nothing releases it.</li>
+      <li><strong>Anything bound to the pod IP.</strong> ZMQ endpoints and the
+        <code>torch.distributed</code> TCPStore are created during engine init, before
+        the quiesce point, so deferring the frontend does not help. They must be on
+        loopback, which exists identically in every pod.</li>
+      <li><strong>Deleted-but-mapped files on <code>/dev/shm</code>.</strong> glibc's
+        <code>sem_open</code> leaves every POSIX semaphore mapped from an unlinked path.
+        CRIU demands <code>link-remap</code>, which needs a link back at restore that a
+        fresh pod's tmpfs cannot provide. Drop the last link before the dump and CRIU
+        writes a ghost file instead, contents and all.</li>
+      <li><strong><code>/dev/shm</code> is not in the image at all.</strong> It is a
+        pod-scoped external mount, captured separately and laid back down over the
+        restored pod's tmpfs.</li>
+    </ul>
+  </div>
+</section>
+
+<section>
+  <div class="col">
+    <div class="stage-head">
+      <span class="stage-num">02</span>
+      <h2>Write the artifact once, not four times</h2>
+    </div>
+    <p>
+      <code>runc restore --image-path</code> takes a directory. We were handing it one —
+      after materializing it from a tar, because the kubelet checkpoint API returns a
+      tar. So every restore paid an untar of the full artifact before CRIU read a single
+      byte.
+    </p>
+    <p>
+      Writing CRIU images straight to a directory and syncing the <em>directory</em>
+      deletes that step outright, and it is the precondition for everything downstream:
+      per-file objects are what make parallel prefetch possible at all. A manifest
+      written last acts as the commit marker, so a reader that ignores an uncommitted
+      prefix never sees a torn tree.
+    </p>
+    <p>
+      That is the read side. The write side is where the tar costs the most, and it is
+      easy to miss because the number never appears in a restore trace. The kubelet
+      checkpoint API has no directory mode, so publishing one artifact writes its bytes
+      three times: CRIU writes the images, the kubelet reads them back and writes the
+      archive, and the agent reads the archive back and expands it into the layout a
+      restore can actually use.
+    </p>
+    <p>
+      We measured it as a controlled A/B — same node, same model, same afternoon, with
+      the only variable being who runs the dump. <code>/proc/diskstats</code> sampled
+      every five seconds across the whole build:
+    </p>
+    <table>
+      <caption>Disk I/O to produce one 56.4&nbsp;GB Qwen2.5-14B checkpoint — A100 node, same host for both runs</caption>
+      <thead>
+        <tr><th>Device</th><th class="num">kubelet + tar</th><th class="num">agent direct</th></tr>
+      </thead>
+      <tbody>
+        <tr><td><code>nvme0n1</code> read</td><td class="num">24.2 GB</td><td class="num">0.0 GB</td></tr>
+        <tr><td><code>nvme0n1</code> written</td><td class="num">59.1 GB</td><td class="num">56.5 GB</td></tr>
+        <tr><td><code>sda</code> read</td><td class="num">9.0 GB</td><td class="num">0.0 GB</td></tr>
+        <tr><td><code>sda</code> written</td><td class="num">257.9 GB</td><td class="num">0.2 GB</td></tr>
+      </tbody>
+    </table>
+    <p>
+      The OS disk is the headline: <strong>257.9&nbsp;GB down to 0.2&nbsp;GB</strong>.
+      That quarter-terabyte was the tar, staged on <code>/dev/root</code> because that is
+      where <code>/var/lib/kubelet</code> lives, then read back to be expanded. The build
+      was spending most of its I/O writing a temporary file to the slowest device on the
+      node, to produce an artifact bound for the NVMe tier all along.
+    </p>
+    <p>
+      The NVMe column is the cleaner half of the result. The five-second samples show
+      nothing written at all until the dump starts, then a smooth ramp to 56.5&nbsp;GB by
+      the time the manifest commits — against an artifact of 56,493,434,865 bytes in 636
+      files. That is a write amplification of <strong>exactly 1.0</strong>, which is the
+      floor: the bytes are written once, where they will be read from. The kubelet column
+      reaches its own NVMe figure only by pushing the difference onto the OS disk, four
+      times over.
+    </p>
+    <h3>Both variables at once, and they compound</h3>
+    <p>
+      The A/B above holds storage fixed and varies the dump path. But the storage tier is
+      a variable too, and the two had always shipped together, so we ran the full cross:
+      two dump paths × two storage tiers, four builds of the same 56&nbsp;GB model on the
+      same node, same afternoon. (We restored three of them as well, from a cold cache —
+      that half opens part two, because it does not say what we assumed it would.)
+    </p>
+
+    <div class="tablewrap">
+      <table>
+        <caption>Snapshot — time to a published artifact, same node, same 56 GB Qwen2.5-14B</caption>
+        <thead>
+          <tr><th>Storage</th><th>Dump path</th><th class="num">Quiesce&nbsp;→&nbsp;ckpt</th><th class="num">Checkpointing</th><th class="num">Publish</th><th class="num">Total</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>FUSE mount</td><td>kubelet + tar</td><td class="num dim">—</td><td class="num dim">—</td><td class="num dim">—</td><td class="num">3364 s</td></tr>
+          <tr><td>FUSE mount</td><td>agent direct</td><td class="num">220 s</td><td class="num">1205 s</td><td class="num">none</td><td class="num">1425 s</td></tr>
+          <tr><td>node NVMe</td><td>kubelet + tar</td><td class="num">209 s</td><td class="num">914 s</td><td class="num">156 s</td><td class="num">1279 s</td></tr>
+          <tr class="hi"><td>node NVMe</td><td>agent direct</td><td class="num">231 s</td><td class="num">66 s</td><td class="num">none</td><td class="num">297 s</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p>
+      <strong>On the snapshot, both matter, and they compound.</strong> Holding storage
+      fixed, the tar costs 982&nbsp;s. Holding the dump path fixed, the network
+      filesystem costs 1128&nbsp;s. Together they are the difference between 3364&nbsp;s
+      and 297&nbsp;s — <strong>11.3×</strong> on the same node, the same model, the same
+      afternoon.
+    </p>
+    <p>
+      And within the tar's 982&nbsp;s, the split is not where we would have guessed. CRIU
+      logs its own duration, so we can subtract it: the kubelet arm's 914&nbsp;s
+      Checkpointing phase contains 121&nbsp;s of actual CRIU and about
+      <strong>793&nbsp;s of writing the archive</strong> — <code>sda</code> holding
+      ~250&nbsp;MB/s for the better part of fifteen minutes, 201.2&nbsp;GB of it. The
+      expand that follows is only 156&nbsp;s, and it reads <em>0.0&nbsp;GB</em> from
+      <code>sda</code> because the tar it is expanding is still entirely in page cache.
+      So of the archive's total cost, roughly 81% is creating it and 16% is reading it
+      back. We had spent our attention on the untar. The untar was the cheap half.
+    </p>
+    <div class="note">
+      <span class="note-lab">One more thing that was not CRIU</span>
+      CRIU itself is slower in the kubelet arm — 121&nbsp;s against 68&nbsp;s — and it is
+      the same binary with the same flags in both. The kubelet checkpoint API writes to
+      <code>/var/lib/kubelet</code>, which is on the OS disk; the agent points
+      <code>--image-path</code> at the NVMe. A 1.8× difference in "CRIU time" that is
+      entirely a choice of device. If you take one thing from this section, take that
+      every number here was a property of where the bytes were going, not of the software
+      moving them.
+    </div>
+
+    <div class="note">
+      <span class="note-lab">One number that moved, and why</span>
+      An earlier run of the same build measured 83.8&nbsp;GB on that NVMe write row. The
+      difference is 27.3&nbsp;GB of weights the engine wrote on a node that had not seen
+      the model recently; on the run above they were already in page cache, so the load
+      phase touched no disk and the dump is isolated exactly. Both are honest about their
+      own run. We quote the isolated one because weight loading happens identically in
+      both arms and is not what this change touches — the same reason the restore numbers
+      further down are all taken with the page cache dropped first.
+    </div>
+    <div class="note">
+      <span class="note-lab">A trap worth naming</span>
+      Our artifact store is a FUSE mount, and on it <code>rename</code> copies without
+      unlinking the source. Every artifact on the cluster had a full-size
+      <code>.part</code> file beside it, silently doubling storage since v1 shipped.
+      Separately, <code>O_TRUNC</code> is ignored there — re-uploading a revision left
+      shrunken files carrying the previous tail. And <code>rmdir</code> on a non-empty
+      directory returns 0 without unlinking anything, which is enough to make Go's
+      <code>os.RemoveAll</code> report success over a tree it never touched: it tries a
+      plain <code>Remove</code> first and returns early when that "succeeds". We found
+      that one seventeen minutes into a 56&nbsp;GB dump, when CRIU refused to overwrite a
+      <code>descriptors.json</code> an hour older than the run.
+      <br><br>
+      The worst one is the quietest. Three separate dumps of the same build died at
+      publish on the same file, at the same size, every time:
+      <code>files.img does not start with the CRIU image magic (got 0x00000000)</code>.
+      The store had accepted that write, reported success, and served back a
+      correctly-sized run of zeros. No length check can see that, which is why we verify
+      a content invariant — the four-byte CRIU magic — on every image before publishing,
+      and why the fastest fix for losing writes to a layer turned out to be removing the
+      layer from the path.
+      An artifact store is not a POSIX filesystem just because it is mounted like one —
+      and on one that isn't, a return value is not evidence. Read it back.
+    </div>
+  </div>
+</section>
+
+<section class="part">
+  <div class="col">
+    <p class="part-lab">Part two · faster restore</p>
+    <h2>Reading it back</h2>
+    <p>
+      A published artifact is a different problem from a fast one. Nothing in part one
+      makes a restore quicker on its own — by the time we read it back, a tarred build
+      and a direct one are the same directory of images. What is left is getting
+      56&nbsp;GB off a disk and into a process: which disk, and how many reads at a
+      time. Together: <span class="part-num">677 s → 39 s</span>.
+    </p>
+  </div>
+</section>
+
+<section>
+  <div class="col">
+    <h2>First, the thing part one did not buy us</h2>
+    <p>
+      Removing the tar was worth 11.3× on the snapshot. The natural assumption — ours,
+      for weeks — is that it must be worth something on the restore too, since there is
+      no longer an untar in front of it. We restored three of the four builds from the
+      cross above, cold cache dropped before each clock starts, to find out.
+    </p>
+    <div class="tablewrap">
+      <table>
+        <caption>Restore — cold page cache, dropped before the clock starts, verified by generation</caption>
+        <thead>
+          <tr><th>Artifact came from</th><th class="num">Pre-warm</th><th class="num">CRIU done</th><th class="num">Serving</th><th class="num">nvme read / write</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>FUSE · kubelet + tar</td><td class="num">153 s</td><td class="num">339 s</td><td class="num">344 s</td><td class="num">103.4 / 48.0 GB</td></tr>
+          <tr><td>NVMe · kubelet + tar</td><td class="num">3 s</td><td class="num">40 s</td><td class="num">43 s</td><td class="num">56.4 / 0.0 GB</td></tr>
+          <tr class="hi"><td>NVMe · agent direct</td><td class="num">2 s</td><td class="num">37 s</td><td class="num">42 s</td><td class="num">56.5 / 0.0 GB</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p>
+      <strong>On the restore, the tar contributes nothing.</strong> 43&nbsp;s against
+      42&nbsp;s is noise. That is not a disappointing result, it is an obvious one in
+      hindsight: by restore time the two artifacts <em>are the same thing</em>. Both are
+      ~56&nbsp;GB of CRIU images sitting in a directory. Whether a tar existed an hour
+      earlier on the write side leaves no trace on the read side, because we untar at
+      publish, not at restore. What actually separates those rows from the first one is
+      the storage tier, and that is worth <strong>8.0×</strong>.
+    </p>
+    <div class="note">
+      <span class="note-lab">How this squares with the 677 s at the top</span>
+      It does not contradict it — it is a later slice through the same system. Every row
+      in this table runs the <em>finished</em> stack: patched CRIU, no staging copy,
+      prefetch at 4. So the 344&nbsp;s FUSE row is not the old baseline, it is what
+      today's restore costs when the artifact happens to live on the mount. The
+      677&nbsp;s number is the honest starting point of the whole project; the
+      344&nbsp;s number is the price of one remaining decision.
+    </div>
+    <p>
+      The I/O column says why in one line. The FUSE row reads
+      <strong>103.4&nbsp;GB to restore a 56&nbsp;GB artifact, and writes 48.0&nbsp;GB
+      doing it</strong> — pre-warm pulling the artifact down onto the local tier, then
+      reading it back off. The two NVMe rows read 56.5&nbsp;GB and write nothing:
+      amplification exactly 1.0, the same floor the write side hit.
+    </p>
+    <p>
+      So the two halves of this post divide differently than the work did. Part one's
+      changes are worth almost nothing here, and the two stages that follow — one a
+      config flag, one six kernel patches — are worth all of it.
+    </p>
+  </div>
+</section>
+
+<section>
+  <div class="col">
+    <div class="stage-head">
+      <span class="stage-num">03</span>
+      <h2>The bytes were going to the wrong disk</h2>
+    </div>
+    <p>
+      This is the part worth stealing, and it is the least glamorous. After halving CRIU
+      restore with real kernel work, we sat at 452&nbsp;s end-to-end for a 52&nbsp;GiB
+      artifact. That is roughly 0.25&nbsp;GB/s sustained. PCIe on this node moves that
+      in about three seconds.
+    </p>
+    <p>
+      So the patched CRIU was no longer the constraint — getting bytes to it was. We
+      had three hypotheses. Sampling <code>/proc/diskstats</code> per device across a
+      restore found the answer, and it was none of them:
+    </p>
+    <pre><code><span class="cmt"># sectors read, per device, during one staging restore</span>
+sda        266 MB/s    <span class="cmt">← the 256 GB OS disk</span>
+nvme0n1      0 B/s     <span class="cmt">← the 894 GB local NVMe</span></code></pre>
+    <p>
+      A pre-warm step was copying the artifact off the mount onto "node-local storage"
+      and CRIU was reading that copy back. The copy was landing on the OS disk. The fast
+      device was not being touched <em>at all</em>. Deleting the copy — one config flag —
+      moved reads onto the NVMe and took end-to-end from 452&nbsp;s to 253&nbsp;s.
+    </p>
+    <p>
+      Then the second half. With staging gone, we measured the same bytes two ways:
+      through the FUSE mount, 500–690&nbsp;MB/s; straight off <code>nvme0n1</code>,
+      2.6&nbsp;GB/s single-stream and 4.5&nbsp;GB/s at four streams. The client already
+      promotes everything it serves onto a node-local cache tier laid out as a 1:1
+      mirror of the artifact. The bytes were <em>already on the fast device</em>. Reading
+      them back through the userspace filesystem that put them there was pure tax.
+    </p>
+    <p>
+      When the manifest check confirms every file is resident at the stated size, we
+      point <code>--image-path</code> at the cache tier and the mount leaves the read
+      path. A partial mirror declines and falls back; a size that disagrees with the
+      manifest is an error rather than a silently wrong restore.
+    </p>
+
+    <div class="tablewrap">
+      <table>
+        <caption>Transport, measured — 52 GiB artifact, verified by generation each row</caption>
+        <thead>
+          <tr><th>Configuration</th><th class="num">Pre-warm</th><th class="num">CRIU restore</th><th class="num">Total to Ready</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>staging on, P=2</td><td class="num">225 s</td><td class="num">225 s</td><td class="num">452 s</td></tr>
+          <tr><td>staging on, P=4</td><td class="num">220 s</td><td class="num">224 s</td><td class="num">446 s</td></tr>
+          <tr><td>staging off, P=4</td><td class="num">104 s</td><td class="num">147 s</td><td class="num">253 s</td></tr>
+          <tr class="hi"><td>NVMe bypass</td><td class="num">2 s</td><td class="num">35 s</td><td class="num">40 s</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p>
+      There was a third finding in the same sweep. Prefetch concurrency was pinned at 2,
+      and read throughput actually peaks at 4 (~1.3&nbsp;GB/s), falling on both sides —
+      542&nbsp;MB/s at 2, 642&nbsp;MB/s at 8. The 2 had not been chosen for speed. It
+      was chosen because 8 had OOM-killed the client, so a workaround for a memory bug
+      had quietly become a throughput ceiling. Those are the most expensive constants in
+      any system: the ones that were right once.
+    </p>
+  </div>
+</section>
+
+<section>
+  <div class="col">
+    <div class="stage-head">
+      <span class="stage-num">04</span>
+      <h2>Six patches to CRIU's restore read path</h2>
+    </div>
+    <p>
+      Stock CRIU restores memory single-threaded and synchronously: read a page image,
+      map it, move to the next. For a 52&nbsp;GiB image on a device that wants deep
+      queues and many streams, that is the wrong shape of I/O. We forked CRIU 4.2.1 and
+      landed six commits.
+    </p>
+
+    <div class="tablewrap">
+      <table>
+        <caption>Fork branch, based directly on the v4.2.1 tag</caption>
+        <thead>
+          <tr><th>#</th><th>Commit</th><th>Touches</th></tr>
+        </thead>
+        <tbody>
+          <tr><td class="dim">0001</td><td>make shared restore state thread-safe</td><td class="dim">bfd.c, log.c</td></tr>
+          <tr><td class="dim">0002</td><td>read pages through native AIO</td><td class="dim">pagemap.c</td></tr>
+          <tr><td class="dim">0003</td><td>restore shmem segments in parallel</td><td class="dim">shmem.c, mem.c</td></tr>
+          <tr><td class="dim">0004</td><td>restore memfd inodes in parallel</td><td class="dim">memfd.c</td></tr>
+          <tr class="hi"><td>0005</td><td>read memfd and shmem pages asynchronously</td><td>shmem.c</td></tr>
+          <tr class="hi"><td>0006</td><td>bound how far one async read coalesces</td><td>pagemap.c</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p>
+      Patches 3 and 4 are the ones that halved CRIU restore, 445&nbsp;s to 225&nbsp;s.
+      Patches 5 and 6 are a late and slightly embarrassing fix: we had written a native
+      AIO path in patch 2, wired a queue-depth knob to it, and shipped it — and it was
+      dead code for the bytes that matter. The shmem restore call passed flags
+      <code>0</code>, so the async path was unreachable on <strong>205 of 208</strong>
+      page images. The depth knob had been connected to nothing the entire time. The A/B
+      test that "proved" AIO did not help had been comparing a build against itself.
+    </p>
+    <p>
+      Patch 6 is inseparable from patch 5. Without a cap, the pagemap layer coalesces
+      each memfd into one enormous read, the queue never holds more than a job or two,
+      and depth is meaningless. We proved that on hardware rather than asserting it, by
+      running the unbounded case as a control:
+    </p>
+
+    <div class="tablewrap">
+      <table>
+        <caption>Coalescing cap sweep — fixed depth 128, 8 threads, cold cache, CRIU phase only</caption>
+        <thead>
+          <tr><th>Chunk cap</th><th class="num">CRIU proper</th><th class="num">GPU resume</th><th class="num">O_DIRECT</th><th class="num">Device read</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>0 · unbounded</td><td class="num">22.0 s</td><td class="num">12.6 s</td><td class="num">1.00</td><td class="num">56.4 GB</td></tr>
+          <tr><td>4 MiB</td><td class="num">21.7 s</td><td class="num">12.5 s</td><td class="num">1.00</td><td class="num">56.4 GB</td></tr>
+          <tr class="hi"><td>1 MiB · default</td><td class="num">19.3 s</td><td class="num">12.5 s</td><td class="num">1.00</td><td class="num">56.4 GB</td></tr>
+          <tr class="hi"><td>256 KiB</td><td class="num">19.1 s</td><td class="num">12.5 s</td><td class="num">1.00</td><td class="num">56.4 GB</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p>
+      Unbounded gives the entire win back. Depth and the coalescing cap are one
+      mechanism, not two — without the cap there is nothing for the depth to be deep
+      <em>with</em>.
+    </p>
+  </div>
+</section>
+
+<section class="part">
+  <div class="col">
+    <p class="part-lab">Both halves · what it cost to learn</p>
+    <h2>What we got wrong</h2>
+    <p>
+      Four stages, two of them not what we predicted and one of them the opposite of what
+      we assumed. The rest of this page is the accounting: where the forecast broke, what
+      is left on the table, and the controls we should have run before quoting any of it.
+    </p>
+  </div>
+</section>
+
+<section>
+  <div class="col">
+    <h2>Where the prediction broke</h2>
+    <p>
+      We forecast that putting memfd bytes on the async path would take the read phase
+      from 8.9&nbsp;s to roughly 3&nbsp;s. Here is what it actually did, at a fixed 8
+      threads, cold, on the same node:
+    </p>
+
+    <div class="pvm">
+      <div class="pvm-card p">
+        <div class="k">Predicted</div>
+        <div class="v">8.9 s → ~3 s</div>
+        <div class="d">Queue depth divides the read phase by roughly the parallelism.</div>
+      </div>
+      <div class="pvm-card m">
+        <div class="k">Measured</div>
+        <div class="v">21.4 s → 19.4 s</div>
+        <div class="d">About 2 s of improvement. Roughly a ninth of the forecast.</div>
+      </div>
+    </div>
+
+    <p>Three things the arithmetic missed, in order of how much they mattered:</p>
+    <ul>
+      <li><strong>Depth saturates at 16.</strong> Depths 16 and 128 are
+        indistinguishable — 19.4&nbsp;s both. Four extra doublings of queue depth touch
+        nothing, so past 16 the constraint is not submission depth. The obvious suspect
+        was the coalescing cap starving the queue; the sweep above rules it out, since
+        256&nbsp;KiB and 1&nbsp;MiB tie.</li>
+      <li><strong>Threads stop helping, then start hurting.</strong> At depth 1, going
+        from 8 to 24 threads made it <em>slower</em>: 21.4&nbsp;s to 23.9&nbsp;s, 24
+        serial streams contending where 8 sufficed. At depth 128 the same change is
+        worth 0.3&nbsp;s, inside noise.</li>
+      <li><strong>The read path was never 21 seconds of reading.</strong> 56.4&nbsp;GB
+        in 19.4&nbsp;s is 2.9&nbsp;GB/s — already past the device's single-stream
+        figure. The remainder is CRIU's own per-object work across 205 memfds: create,
+        map, fill, unmap. The device stopped being the limit; the arrival rate of work
+        to give it became the limit.</li>
+    </ul>
+
+    <div class="note wrong">
+      <span class="note-lab">What the model got right and wrong</span>
+      The submission-depth theory was correct about the mechanism and wrong about the
+      headroom. It was still worth building — 2&nbsp;s is real and the
+      <code>O_DIRECT</code> result (12,575 of 12,575 submissions) retired a standing
+      question about alignment. But the honest summary is that the read path is close to
+      done, and we would have learned that a week earlier by measuring the device
+      ceiling before writing the patch.
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="col">
+    <h2>The floor we cannot reach from here</h2>
+    <p>
+      The best cold run is 39&nbsp;s, and it splits cleanly:
+      <strong>19.4&nbsp;s of CRIU</strong> and <strong>12.5&nbsp;s of GPU resume</strong>.
+      That second number is a single gap in the log between
+      <code>cuda_plugin: resuming devices</code> and the next line — one
+      <code>cuda-checkpoint</code> call, inside NVIDIA's plugin, with no I/O of ours in it.
+    </p>
+    <p>
+      It held to a tenth of a second across all nine tuning configurations we ran. Queue
+      depth, thread count, chunk size, direct I/O: none of them moved it by a
+      measurable amount. That is the cleanest possible evidence that read-path work
+      cannot reach it, and it is why we stopped.
+    </p>
+    <p>
+      What remains is structural. The artifact is roughly twice the model weights,
+      because <code>sleep(level=1)</code> offloads weights to host RAM rather than
+      dropping them — so they get captured in the image instead of being re-read from a
+      weight store. Splitting weights out to restore over an independent channel is the
+      one remaining change that plausibly moves the GPU half too, by shrinking what has
+      to be resumed rather than reading it faster.
+    </p>
+  </div>
+</section>
+
+<section>
+  <div class="col">
+    <h2>If you are doing this yourself</h2>
+    <p>
+      The generalizable lesson is not any particular patch. It is that we spent weeks on
+      kernel work worth at most 35% of the win — and, once we finally ran the control,
+      closer to 2× on a 17× total — while two configuration flags worth the larger share
+      sat undiagnosed, and only found them by instrumenting per-device throughput. In
+      order of expected value:
+    </p>
+
+    <ol class="check">
+      <li><span class="n">01</span><span class="t"><strong>Measure per-device, not per-process.</strong>
+        <span><code>/proc/diskstats</code> sampled across a restore is what found the
+        wrong-disk bug. Aggregate throughput would never have shown it — the bytes were
+        moving, just to the wrong place.</span></span></li>
+      <li><span class="n">02</span><span class="t"><strong>Find the device ceiling before optimizing toward it.</strong>
+        <span>Our patch targeted a read path already running at 2.9 GB/s against a
+        2.6 GB/s single-stream device. Knowing that first would have reordered the work.</span></span></li>
+      <li><span class="n">03</span><span class="t"><strong>Drop the page cache, or you are benchmarking memcpy.</strong>
+        <span>These nodes hold 216 GB of RAM and the artifact is 52 GiB. Our first AIO
+        A/B was a null result because runs 2 through 4 read <em>zero bytes</em> from any
+        device. Confirm cold with a device counter, not with intent.</span></span></li>
+      <li><span class="n">04</span><span class="t"><strong>Run the disabled case as a control.</strong>
+        <span>The unbounded-coalescing run is what proved patch 6 is load-bearing. A
+        knob with no control is a knob you are guessing about — as we did for a month
+        with a depth setting wired to dead code.</span></span></li>
+      <li><span class="n">05</span><span class="t"><strong>Verify correctness every row.</strong>
+        <span>A restore that is fast and wrong is worse than one that is slow. Generate
+        tokens and read them; do not trust the readiness probe.</span></span></li>
+      <li><span class="n">06</span><span class="t"><strong>Audit constants that were right once.</strong>
+        <span>Prefetch was pinned at 2 to dodge an OOM. The OOM was real. The ceiling
+        outlived the reason, and nobody re-derived it.</span></span></li>
+      <li><span class="n">07</span><span class="t"><strong>Change one variable, even when two arrived together.</strong>
+        <span>"Skip the tar" and "write to NVMe" shipped in the same change, so for weeks
+        we had one number and two explanations for it. Running the full cross took an
+        afternoon and inverted the answer: on the restore side the tar is worth 1.0× and
+        the storage tier is worth 8.0×. We had been crediting the wrong one.</span></span></li>
+      <li><span class="n">08</span><span class="t"><strong>Run the control before you publish the attribution.</strong>
+        <span>We shipped a forked CRIU and quoted what it was worth for weeks without ever
+        having restored the same artifact on the stock binary. When we finally did it took
+        four minutes, and it moved the number by more than half. If your optimization is a
+        drop-in replacement for something, the unpatched arm is the cheapest measurement
+        available to you — and the one you are least likely to run, because by then you
+        already believe the answer.</span></span></li>
+    </ol>
+  </div>
+</section>
+
+<section>
+  <div class="col">
+    <h2>Honest comparison</h2>
+    <p>
+      NVIDIA's Dynamo Snapshot work publishes CRIU-restore-only figures, so that is the
+      metric to compare against — not our end-to-end:
+    </p>
+
+    <div class="tablewrap">
+      <table>
+        <caption>CRIU restore phase only, across hardware and models</caption>
+        <thead>
+          <tr><th>System</th><th class="num">Image</th><th class="num">CRIU restore</th><th class="num">GB/s</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>Dynamo · Qwen3-0.6B · B200</td><td class="num">6.2 GiB</td><td class="num">2.4 s</td><td class="num">2.77</td></tr>
+          <tr><td>Dynamo · Qwen3-8B · B200</td><td class="num">26 GiB</td><td class="num">4.7 s</td><td class="num">5.94</td></tr>
+          <tr><td>Dynamo · gpt-oss-120b · B200</td><td class="num">129 GiB</td><td class="num">15 s</td><td class="num">9.23</td></tr>
+          <tr class="hi"><td>Ours · Qwen2.5-14B · A100</td><td class="num">52.5 GiB</td><td class="num">8.8 s</td><td class="num">6.41</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p>
+      6.41&nbsp;GB/s lands between their 8B and 120b rows, on a different model, an
+      older GPU, and an artifact roughly twice the weight size. Two asterisks we will
+      not bury: that 8.8&nbsp;s is a cache-warm run, so it is a memory-bandwidth figure
+      rather than a storage one — and their end-to-end story includes a weight-streaming
+      channel we have not built. On the metric they publish, the read path is there. On
+      end-to-end, they are still ahead, and we know exactly which component accounts for
+      it.
+    </p>
+    <h3>The control we owed</h3>
+    <p>
+      Every restore figure above was measured on our patched CRIU, which made "the fork is
+      worth 225&nbsp;s" an attribution rather than a result. The transport work underneath
+      moved more time than the patches did, and it moved it for both binaries. So we ran
+      the arm that separates them: the same artifact, the same node, the same transport,
+      cold both times, with the patched binary swapped out for the host's distro package
+      in between — which on these machines is CRIU&nbsp;4.2.1, the exact upstream base our
+      fork is built from.
+    </p>
+
+    <div class="tablewrap">
+      <table>
+        <caption>Same 56 GB artifact restored twice, cold page cache, only the CRIU binary differs</caption>
+        <thead>
+          <tr><th>CRIU</th><th class="num">CRIU proper</th><th class="num">Wall to serving</th><th class="num">Read from NVMe</th><th class="num">Effective</th></tr>
+        </thead>
+        <tbody>
+          <tr class="hi"><td>patched (our fork)</td><td class="num">35.9 s</td><td class="num">43 s</td><td class="num">56.4 GB</td><td class="num">1.31 GB/s</td></tr>
+          <tr><td>stock 4.2.1</td><td class="num">72.6 s</td><td class="num">79 s</td><td class="num">56.4 GB</td><td class="num">0.71 GB/s</td></tr>
+          <tr><td><strong>difference</strong></td><td class="num"><strong>2.02×</strong></td><td class="num">1.84×</td><td class="num dim">identical</td><td class="num">1.84×</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p>
+      <strong>The two clocks agree, which is the check that matters.</strong> CRIU's own log
+      accounts for 36.7&nbsp;s of a 36&nbsp;s wall-clock gap. Everything outside that log —
+      image pull, sandbox setup, prefetch, the engine re-taking its KV cache — is identical
+      across the two arms by construction. Had the wall gap been larger than CRIU's, the
+      excess would have been noise in our harness rather than a property of the binary.
+      It was not.
+    </p>
+
+    <p>
+      <strong>And exactly one phase moved.</strong> The logs are specific about which: both
+      arms restore 205 memfd inodes, and the patched binary spreads them over eight threads
+      while stock does them one at a time.
+    </p>
+
+    <div class="tablewrap">
+      <table>
+        <caption>Where the 36.7 s lives</caption>
+        <thead>
+          <tr><th>CRIU</th><th>memfd inode restore</th><th class="num">Phase width</th><th class="num">Everything after it</th></tr>
+        </thead>
+        <tbody>
+          <tr class="hi"><td>patched</td><td>205 inodes, 8 threads</td><td class="num">0.003 s</td><td class="num">16.0 s</td></tr>
+          <tr><td>stock</td><td>205 inodes, serial</td><td class="num">56.8 s</td><td class="num">15.6 s</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p>
+      The tail after the last inode is 16.0&nbsp;s against 15.6&nbsp;s — the same work within
+      noise, as it should be, because those patches do not touch it. The whole difference is
+      one serial loop becoming eight parallel ones. We expected to spend a paragraph
+      untangling several overlapping effects and there was only ever one.
+    </p>
+
+    <p>
+      The device tells the same story from the other side. Both arms read exactly
+      56.4&nbsp;GB off the NVMe drive: the patches do not read <em>less</em>, they read the
+      same bytes while keeping the disk busy. Stock CRIU issues a read, waits for it, issues
+      the next; at 0.71&nbsp;GB/s most of an NVMe drive sits idle waiting to be asked.
+    </p>
+
+    <div class="note">
+      <span class="note-lab">What this revises</span>
+      Earlier on this page we credited the fork with 225&nbsp;s of the 637&nbsp;s removed —
+      35%, against 65% for configuration — and flagged that the error probably flattered the
+      patches. It did. The controlled figure is 36.7&nbsp;s on a restore that now finishes in
+      43. Both numbers are true of different baselines: 225&nbsp;s was measured when a serial
+      memfd loop ran against a slow transport, so removing the serialization also removed a
+      lot of slow reading. 36.7&nbsp;s is what the same patches are worth once the transport
+      underneath them is fast. The honest version is that <strong>the fork is a 2× on the
+      finished stack, and was worth more before the transport was fixed because there was
+      more waste to hide in.</strong>
+    </div>
+  </div>
+</section>
+
+</main>
+
+<footer class="wrap">
+  <div class="col">
+    All measurements on Azure <code>Standard_NC24ads_A100_v4</code>, A100 80GB, 216 GB RAM,
+    local NVMe. Qwen2.5-14B-Instruct under vLLM 0.9.2, CRIU 4.2.1 plus six restore-path
+    patches. Cold runs confirmed by 56.4 GB read from <code>nvme0n1</code> per restore;
+    warm runs read zero. Every configuration verified by token generation.
+  </div>
+</footer>
+
+<script>
+  // Bars fill once, when each chart first enters view. Every .waterfall is
+  // observed, not just the first: a chart left un-revealed sits at scale 0 and
+  // reads as an empty track rather than as an animation that has not run yet.
+  (function () {
+    var charts = document.querySelectorAll('.waterfall');
+    if (!charts.length) return;
+    if (!('IntersectionObserver' in window)) {
+      charts.forEach(function (c) { c.classList.add('in'); });
+      return;
+    }
+    var io = new IntersectionObserver(function (entries) {
+      entries.forEach(function (e) {
+        if (e.isIntersecting) { e.target.classList.add('in'); io.unobserve(e.target); }
+      });
+    }, { threshold: 0.25 });
+    charts.forEach(function (c) { io.observe(c); });
+  })();
+</script>

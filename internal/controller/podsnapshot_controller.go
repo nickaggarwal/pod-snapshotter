@@ -3,6 +3,8 @@ package controller
 import (
 	"context"
 	"fmt"
+	"path"
+	"strings"
 	"sync"
 	"time"
 
@@ -42,6 +44,11 @@ type PodSnapshotReconciler struct {
 	// RequirePrereqs gates checkpointing on the node prereq annotation set by
 	// the agent. Disable in tests / CPU-only trials.
 	RequirePrereqs bool
+
+	// ArtifactRoot is the scheme+prefix that default artifact URIs hang off
+	// (artifact.ParseRoot). Empty means artifact.DefaultRoot. A spec that
+	// names artifactURI explicitly ignores it entirely.
+	ArtifactRoot string
 
 	// inflight tracks running checkpoint calls keyed by namespaced name, so a
 	// reconcile re-entry does not launch a duplicate kubelet call.
@@ -86,6 +93,11 @@ func (r *PodSnapshotReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		return r.reconcilePending(ctx, &snap)
 	case snapv1.SnapshotPhaseCheckpointing:
 		return r.reconcileCheckpointing(ctx, &snap)
+	case snapv1.SnapshotPhaseQuiescing:
+		// Agent-owned (it polls the container's rendezvous directory); the
+		// manager only enforces the deadline so a shim that never reports
+		// fails with a specific reason instead of hanging.
+		return r.reconcileQuiescing(ctx, &snap)
 	case snapv1.SnapshotPhaseCheckpointed, snapv1.SnapshotPhaseUploading:
 		// Agent-owned phases; nothing for the manager to do.
 		return ctrl.Result{}, nil
@@ -152,12 +164,14 @@ func (r *PodSnapshotReconciler) reconcilePending(ctx context.Context, snap *snap
 	}
 	setCondition(&snap.Status.Conditions, snapv1.ConditionNodeReady, metav1.ConditionTrue, "PrereqsMet", "")
 
-	// Default artifact URI and validate it.
-	uri := snap.Spec.ArtifactURI
-	if uri == "" {
-		uri = artifact.DefaultURI(snap.Namespace, snap.Name, container)
+	// Default artifact URI and validate it. An explicit URI wins, and its
+	// trailing slash (or absence) decides the format.
+	uriStr := snap.Spec.ArtifactURI
+	if uriStr == "" {
+		uriStr = artifact.DefaultURI(r.ArtifactRoot, snap.Namespace, snap.Name, container, snap.Spec.ArtifactFormat)
 	}
-	if _, err := artifact.Parse(uri); err != nil {
+	uri, err := artifact.Parse(uriStr)
+	if err != nil {
 		return r.fail(ctx, snap, err.Error())
 	}
 
@@ -165,16 +179,132 @@ func (r *PodSnapshotReconciler) reconcilePending(ctx context.Context, snap *snap
 	snap.Status.PodUID = string(pod.UID)
 	snap.Status.Container = container
 	if snap.Status.Artifact == nil {
-		snap.Status.Artifact = &snapv1.ArtifactStatus{URI: uri}
+		snap.Status.Artifact = &snapv1.ArtifactStatus{URI: uri.String(), Format: uri.Format()}
 	}
+
+	// Quiesce/resume: when the workload opts in, the checkpoint must wait
+	// for its shim to park at a safe point rather than dumping it live
+	// (docs/design-v2.md §4). The node agent owns that wait — it is the only
+	// component that can see inside the container's mount namespace.
+	q, err := resolveQuiesce(&pod)
+	if err != nil {
+		return r.fail(ctx, snap, err.Error())
+	}
+	if q != nil {
+		snap.Status.Quiesce = q
+		snap.Status.Phase = snapv1.SnapshotPhaseQuiescing
+		snap.Status.Message = fmt.Sprintf("waiting for %s/%s from the workload shim", q.Dir, snapv1.ReadyForCheckpointFile)
+		setCondition(&snap.Status.Conditions, snapv1.ConditionQuiesced, metav1.ConditionFalse, "Waiting", snap.Status.Message)
+		return ctrl.Result{}, r.Status().Update(ctx, snap)
+	}
+
 	snap.Status.Phase = snapv1.SnapshotPhaseCheckpointing
-	snap.Status.Message = "calling kubelet checkpoint API"
+	snap.Status.Message = "starting checkpoint"
 	return ctrl.Result{}, r.Status().Update(ctx, snap)
+}
+
+// agentCheckpoints decides whether this snapshot's dump is the node agent's
+// to run. Three things all have to hold, and each failure degrades to the
+// kubelet path rather than failing the snapshot:
+//
+//   - the spec asked for it,
+//   - the artifact is a directory (there is no tar for the agent to hand
+//     back, which is the entire point),
+//   - the node's agent advertises the capability, so a cluster mid-upgrade
+//     does not route work to an agent that will never pick it up.
+func (r *PodSnapshotReconciler) agentCheckpoints(ctx context.Context, snap *snapv1.PodSnapshot) (bool, string) {
+	if snap.Spec.Checkpointer != snapv1.CheckpointerAgent {
+		return false, ""
+	}
+	if snap.Status.Artifact == nil {
+		return false, ""
+	}
+	if uri, err := artifact.Parse(snap.Status.Artifact.URI); err != nil || !uri.Dir {
+		return false, fmt.Sprintf(
+			"checkpointer %q needs a directory artifact; falling back to the kubelet API for %s",
+			snapv1.CheckpointerAgent, snap.Status.Artifact.URI)
+	}
+	var node corev1.Node
+	if err := r.Get(ctx, types.NamespacedName{Name: snap.Status.NodeName}, &node); err != nil {
+		return false, fmt.Sprintf("could not read node %s to check agent capabilities; falling back to the kubelet API",
+			snap.Status.NodeName)
+	}
+	if !snapv1.NodeHasCapability(node.Annotations, snapv1.AgentCheckpointCapability) {
+		return false, fmt.Sprintf(
+			"node %s does not advertise %s (agent too old); falling back to the kubelet API",
+			node.Name, snapv1.AgentCheckpointCapability)
+	}
+	return true, ""
+}
+
+// resolveQuiesce reads the quiesce contract off the pod being snapshotted.
+// Returns nil when the pod has not opted in (the v1 live-dump path).
+func resolveQuiesce(pod *corev1.Pod) (*snapv1.QuiesceStatus, error) {
+	mode := pod.Annotations[snapv1.QuiesceAnnotation]
+	if mode == "" {
+		return nil, nil
+	}
+	if mode != snapv1.QuiesceModePresenceFile {
+		return nil, fmt.Errorf("unsupported %s value %q (only %q is implemented)",
+			snapv1.QuiesceAnnotation, mode, snapv1.QuiesceModePresenceFile)
+	}
+	dir := pod.Annotations[snapv1.QuiesceDirAnnotation]
+	if dir == "" {
+		dir = snapv1.DefaultQuiesceDir
+	}
+	if !strings.HasPrefix(dir, "/") {
+		return nil, fmt.Errorf("%s must be an absolute in-container path, got %q", snapv1.QuiesceDirAnnotation, dir)
+	}
+	timeout := snapv1.DefaultQuiesceTimeout
+	if raw := pod.Annotations[snapv1.QuiesceTimeoutAnnotation]; raw != "" {
+		d, err := time.ParseDuration(raw)
+		if err != nil || d <= 0 {
+			return nil, fmt.Errorf("%s must be a positive Go duration (e.g. \"600s\"), got %q", snapv1.QuiesceTimeoutAnnotation, raw)
+		}
+		timeout = d
+	}
+	deadline := metav1.NewTime(time.Now().Add(timeout))
+	return &snapv1.QuiesceStatus{Mode: mode, Dir: path.Clean(dir), Deadline: &deadline}, nil
+}
+
+func (r *PodSnapshotReconciler) reconcileQuiescing(ctx context.Context, snap *snapv1.PodSnapshot) (ctrl.Result, error) {
+	q := snap.Status.Quiesce
+	if q == nil || q.Deadline == nil {
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+	}
+	if time.Now().Before(q.Deadline.Time) {
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+	}
+	msg := fmt.Sprintf("workload never wrote %s/%s before the quiesce deadline; "+
+		"check the shim in container %q (annotation %s)",
+		q.Dir, snapv1.ReadyForCheckpointFile, snap.Status.Container, snapv1.QuiesceTimeoutAnnotation)
+	setCondition(&snap.Status.Conditions, snapv1.ConditionQuiesced, metav1.ConditionFalse, "QuiesceTimeout", msg)
+	return r.fail(ctx, snap, msg)
 }
 
 func (r *PodSnapshotReconciler) reconcileCheckpointing(ctx context.Context, snap *snapv1.PodSnapshot) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 	key := types.NamespacedName{Namespace: snap.Namespace, Name: snap.Name}
+
+	// The agent may own this phase entirely (docs/design-v2.md §3): it runs
+	// `runc checkpoint` itself and CRIU writes into the artifact directory,
+	// with no tar in between. Nothing for the manager to do but stay out of
+	// the way -- and, once, say in the status which path this took, because
+	// the two are indistinguishable from the finished artifact.
+	if agentOwns, why := r.agentCheckpoints(ctx, snap); agentOwns {
+		want := fmt.Sprintf("node agent %s is running runc checkpoint", snap.Status.NodeName)
+		if snap.Status.Message == want {
+			return ctrl.Result{}, nil
+		}
+		snap.Status.Message = want
+		return ctrl.Result{}, r.Status().Update(ctx, snap)
+	} else if why != "" && snap.Status.Message != why {
+		logger.Info("agent checkpoint not available", "reason", why)
+		snap.Status.Message = why
+		if err := r.Status().Update(ctx, snap); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
 
 	// A previous reconcile may already have a checkpoint call running.
 	if _, running := r.inflight.LoadOrStore(key, struct{}{}); running {

@@ -1,10 +1,28 @@
 nameOverride: ""
 namespace: pod-snapshotter
 
+# Registry every component image is pulled from, prepended to the per-component
+# image.repository paths below. Empty means "the repository field is already
+# fully qualified" -- which is only true for a local kind cluster. Set it for
+# any real deployment; hack/deploy.sh does.
+imageRegistry: ""
+
 manager:
   image:
     repository: pod-snapshotter/manager
-    tag: latest
+    # Pinned, like the agent and CRIU tags. "latest" was what let the chart and
+    # the cluster drift apart in the first place: a tag that means a different
+    # image on every push cannot be compared against what is running, so
+    # hack/deploy.sh --check had nothing to check.
+    # v0.3.0 routes the dump: it reads podsnapshot.io/capabilities off the
+    # node and hands phase Checkpointing to the agent when the snapshot asked
+    # for checkpointer: agent and the node can honor it, instead of calling
+    # the kubelet checkpoint API. Everything else falls back, with the reason
+    # in the snapshot's status.
+    # v0.4.0 takes --artifact-root: the scheme+prefix every default artifact
+    # URI hangs off (artifactRoot below). Older managers reject the flag and
+    # crash-loop, so this tag and that value have to move together.
+    tag: v0.4.0-artifactroot
     pullPolicy: IfNotPresent
   replicas: 1
   leaderElect: false
@@ -14,8 +32,39 @@ manager:
   # Refuse to checkpoint pods on nodes whose agent has not reported
   # prerequisites ok (annotation podsnapshot.io/prereqs=ok).
   requireNodePrereqs: true
+  # Scheme and prefix every default artifact URI hangs off. A PodSnapshot
+  # becomes <artifactRoot>/<namespace>/<name>/<container>/ and a SnapshotBuild
+  # becomes <artifactRoot>/builds/<revision>/. Specs that set artifactURI
+  # themselves ignore this entirely.
+  #
+  # Two tiers are available, and the choice is a real trade:
+  #
+  #   fuse:///snapshots
+  #     The distributed mount. Any node can restore the artifact, which is
+  #     what you want for a snapshot that outlives the node that took it.
+  #     Slower on both sides, and the write path has its own failure mode --
+  #     it has accepted writes without persisting them and handed back
+  #     correctly-sized runs of zeros, which is why publish verifies CRIU's
+  #     image magic (internal/artifact/publish.go, verifyImageMagic).
+  #
+  #   file:///mnt/fuse-nvme0n1/ps-artifacts
+  #     The node's own NVMe -- agent.localArtifactRoot below, which must be
+  #     set to the same path. No network filesystem in either direction.
+  #     Measured on an A100 node with a 56 GB Qwen2.5-14B checkpoint: dump
+  #     1425 s -> 297 s, restore-to-serving 344 s -> 42 s. The catch is that
+  #     the artifact exists on exactly one node, so every restore of it has to
+  #     be pinned to that node (podrestore spec.nodeName).
+  #
+  # Default is the portable one. Point it at the NVMe path when the workload
+  # is a node-local warm pool rather than a cluster-wide image.
+  artifactRoot: fuse:///snapshots
   # fuse-client HTTP API used for artifact existence checks and deletion.
-  fuseAPIEndpoint: "http://fuse-client.fuse-system.svc.cluster.local:8081"
+  # The service is named client-headless, not fuse-client: it is the headless
+  # service in front of the client DaemonSet (selector app=client). The name
+  # matters more than it looks -- a restore's very first act is to HEAD the
+  # MANIFEST through this endpoint, so a wrong host here fails every restore
+  # in Pending with a DNS error and never reaches the checkpoint at all.
+  fuseAPIEndpoint: "http://client-headless.fuse-system.svc.cluster.local:8081"
   resources:
     requests: {cpu: 50m, memory: 128Mi}
     limits: {memory: 512Mi}
@@ -30,27 +79,169 @@ nodeSetup:
   # NVIDIA's standalone checkpoint utility, installed on GPU nodes only.
   cudaCheckpointURL: https://github.com/NVIDIA/cuda-checkpoint/raw/main/bin/x86_64_Linux/cuda-checkpoint
 
+# Patched CRIU (docs/design-v2.md §6b). Upstream v4.2.1 plus the restore
+# read-path patches in hack/criu/patches: native AIO for the async page reads
+# and a thread pool for memfd/shmem restore. Installed to /usr/local/sbin,
+# beside the distro package rather than over it.
+#
+# Off by default: it changes the binary every checkpoint and restore on the
+# node goes through. Set uninstall=true to remove it and fall back.
+criu:
+  enabled: false
+  uninstall: false
+  image:
+    repository: pod-snapshotter/criu
+    # ps5 adds the two commits that put memfd and shmem bytes on the AIO path
+    # (design-v2.md §6d). Measured 2026-08-22 on the A100 pool over five cold
+    # runs: read path 21.4 s -> 19.4 s, O_DIRECT 12575/12575, generation
+    # correct. CF-8/CF-9/CF-10 pass, which is what this tag was waiting on.
+    #
+    # ps5.1 is the same CRIU binary (fork commit 6c683e4) rebuilt to carry
+    # /criu-gitid, so install.sh can tell two images apart when only the tag
+    # moved. Before it, `kubectl set image` alone left the marker matching and
+    # the installer skipped the rollout it had just been asked to do.
+    #
+    # ps5.2 is the same binary again (fork commit 6c683e4) with an installer
+    # that waits for the host's own package provisioning instead of racing it.
+    # A node scaled up fresh can run this DaemonSet minutes before the distro
+    # criu and its shared libraries land, and the run-check then failed on a
+    # missing libnet.so.1 and rolled back -- a healthy build reported as broken.
+    # ps5.3 is the same binary again (fork commit 6c683e4). What changed is
+    # what happens on a node the binary cannot run on: a glibc older than the
+    # one it was built against is a permanent fact about that node, so the
+    # installer now rolls back and parks instead of crashlooping. The 22.04
+    # agentpool node had been restarting forever, which made a clean deploy
+    # indistinguishable from a broken one.
+    # ps5.4 exists only because ps5.3 was pushed five times while that install
+    # script was being fixed. The nodes cached the first push and IfNotPresent
+    # kept it there, so a tag that reads as one version stood for five images
+    # and a restart could not correct it. Same fork commit throughout, so
+    # nothing measured against ps5.3 is wrong -- but a tag that is not a
+    # version is exactly the drift hack/deploy.sh exists to catch, so it gets
+    # a name of its own rather than a sixth push.
+    tag: v4.2.1-ps5.4
+    pullPolicy: IfNotPresent
+
 agent:
   image:
     repository: pod-snapshotter/agent
-    tag: latest
+    # Pinned, not "latest". The agent is what translates the CRIU tuning
+    # annotations into environment for `runc restore`, so which build is
+    # running decides which knobs exist at all -- v0.4.2 and earlier silently
+    # drop podsnapshot.io/criu-aio-chunk, and a restore tuned with it looks
+    # like the knob does nothing rather than like the agent is too old.
+    # v0.5.0 can take the dump itself: `runc checkpoint` with CRIU's
+    # --image-path on the artifact directory, so the images are written once
+    # rather than written, tarred, and untarred (design-v2.md §3). It
+    # advertises agent-checkpoint in podsnapshot.io/capabilities, which is how
+    # the manager knows the node is new enough to route work to.
+    # v0.6.0 takes --local-artifact-root: the node-local directory that holds
+    # file:// artifacts, for dump and restore both, and the only place this
+    # agent will touch one. Older agents reject the flag and crash-loop.
+    tag: v0.6.0-artifactroot
     pullPolicy: IfNotPresent
-  # Restrict the agent to GPU nodes by default. Set to {} to run everywhere
-  # (e.g. CPU-only checkpoint trials on kind).
+  # Where the agent runs. Every linux node by default, not GPU nodes only: the
+  # agent also publishes prereq status and serves pre-warm, and a node with no
+  # agent looks to the manager like a node that failed its checks. Narrow it if
+  # you want checkpointing confined to a pool -- but note that the GPU label to
+  # narrow on is cluster-specific (this one uses accelerator=nvidia, not the
+  # gpu-operator's nvidia.com/gpu.present).
   nodeSelector:
-    nvidia.com/gpu.present: "true"
+    kubernetes.io/os: linux
   tolerations:
     - key: nvidia.com/gpu
       operator: Exists
       effect: NoSchedule
   # Paths on the host.
   fuseMount: /mnt/fuse
+  # Node-local artifact tier: the directory on the node's own NVMe that holds
+  # file:// artifacts, mounted into the agent at the same path it has on the
+  # host. Both directions go through it -- a dump writes CRIU's images straight
+  # into it, and a restore reads them back out of it, with no network
+  # filesystem in either path.
+  #
+  # Set manager.artifactRoot to file://<this path> to make it the default
+  # destination for new snapshots; leave the manager on fuse:/// and this is
+  # still the tier any explicit file:// artifactURI resolves against.
+  #
+  # It is also a confinement boundary, not only a location. A file:// URI on a
+  # CRD is a raw host path handed to a privileged agent, so when this is set
+  # the agent refuses to read or write a file:// artifact anywhere else
+  # (artifact.CheckLocalRoot). Empty disables the mount and the check both,
+  # which is the dev/test posture.
+  #
+  # Why it earns its place: the distributed store is a network filesystem with
+  # its own failure modes -- it has accepted writes and not persisted them,
+  # handing back correctly-sized runs of zeros that no size check can see
+  # (internal/artifact/publish.go, verifyImageMagic). Taking it out of the path
+  # removes that layer, and the numbers say the layer was most of the cost:
+  # 56 GB Qwen2.5-14B on an A100 node, dump 1425 s -> 297 s, restore-to-serving
+  # 344 s -> 42 s.
+  #
+  # The tradeoff is the obvious one: a file:// artifact lives on exactly one
+  # node, so the restore has to be pinned to that node. A warm pool per node,
+  # not a way to ship snapshots between machines.
+  #
+  # Path note: this is under the NVMe mount, NOT under fuse-cache/ -- writing
+  # into fuse-client's own cache directory would leave it managing files it did
+  # not put there and could evict at any point.
+  localArtifactRoot: /mnt/fuse-nvme0n1/ps-artifacts
   checkpointsDir: /var/lib/kubelet/checkpoints
   workRoot: /var/lib/pod-snapshotter/restores
   criSocket: /run/containerd/containerd.sock
   # fuse-client integration on each node.
-  fuseAPIEndpoint: "http://127.0.0.1:8081"
+  # Empty on purpose. The agent uses this to verify an artifact exists before a
+  # restore, and it is hostNetwork, so 127.0.0.1:8081 reaches fuse-client only
+  # on nodes that run one. On a node without it, every verification fails and
+  # the restore fails with it -- the check is strictly less reliable than the
+  # restore it guards. Set it only where fuse-client is on every agent node.
+  fuseAPIEndpoint: ""
   fuseAgentSocket: /var/run/fuse-client/agent.sock
+  # Directory artifacts are restored in place through the fuse mount, so
+  # pre-warm only has to pull their bytes into the node's NVMe tier — no copy.
+  # Turn this on to copy them onto node-local storage instead, which is worth
+  # measuring if the mount's per-read overhead beats the copy.
+  stageImageLocal: false
+  # fuse-client's node-local NVMe cache tier, as a path *on the host*. After
+  # pre-warm the artifact is already on this device, and reading it back
+  # through the FUSE mount costs ~7x (500-690 MB/s vs 2.6-4.5 GB/s measured
+  # on A100 nodes), so the restore reads the CRIU images straight off it.
+  #
+  # Host path, not /host/...: runc is exec'd through nsenter into the host
+  # mount namespace and resolves this there. The agent's own checks go
+  # through its read-only /host mount, which it prepends itself.
+  #
+  # Guarded — the bypass is used only when the tier holds every manifest file
+  # at the right size, otherwise the restore falls back to the mount. Empty
+  # disables it entirely.
+  nvmeCacheRoot: /mnt/fuse-nvme0n1/fuse-cache
+  # Files fetched concurrently from a directory artifact (0 = built-in
+  # default of 4). Tar artifacts are always a single stream.
+  #
+  # Measured throughput peaks at 4 and falls off after it, so this is not a
+  # knob to turn up when restores are slow: 8 was both slower than 4 and the
+  # setting under which fuse-client OOMKilled. See
+  # internal/artifact/prefetch.go for the curve.
+  #
+  # Stated explicitly rather than left at the 0 sentinel. Both mean 4 today,
+  # but the live DaemonSet was hand-patched to an explicit 4 during the §6c
+  # work, and a helm upgrade replacing that with 0 is a silent change to the
+  # rendered args of the thing being benchmarked -- true even while the
+  # effective value is identical.
+  prefetchParallelism: 4
+  # sha256 every image file when the agent publishes a checkpoint it dumped
+  # itself (spec.checkpointer: agent).
+  #
+  # Off, because it costs a full extra read of the checkpoint immediately
+  # after writing it -- 56 GB re-read to verify 56 GB just written, which is
+  # exactly the pass that path exists to remove. The manifest records every
+  # file's size either way, and both the prefetch verifier and the NVMe cache
+  # check fall back to size when no digest is present. Turn it on for
+  # artifacts meant to outlive the node that wrote them.
+  #
+  # The kubelet path always digests: it is streaming the bytes through the tar
+  # expander anyway, so there the hash is free.
+  digestArtifacts: false
   resources:
     requests: {cpu: 100m, memory: 256Mi}
     limits: {memory: 2Gi}
