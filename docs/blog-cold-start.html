@@ -842,7 +842,7 @@ footer {
     <div class="note">
       <span class="note-lab">How this squares with the 677 s at the top</span>
       It does not contradict it — it is a later slice through the same system. Every row
-      in these two tables runs the <em>finished</em> stack: patched CRIU, no staging copy,
+      in this table runs the <em>finished</em> stack: patched CRIU, no staging copy,
       prefetch at 4. So the 344&nbsp;s FUSE row is not the old baseline, it is what
       today's restore costs when the artifact happens to live on the mount. The
       677&nbsp;s number is the honest starting point of the whole project; the
@@ -855,25 +855,6 @@ footer {
       reading it back off. The two NVMe rows read 56.5&nbsp;GB and write nothing:
       amplification exactly 1.0, the same floor the write side hit.
     </p>
-
-    <p>
-      <strong>On the restore, the tar contributes nothing.</strong> 43&nbsp;s against
-      42&nbsp;s is noise. That is not a disappointing result, it is an obvious one in
-      hindsight: by restore time the two artifacts <em>are the same thing</em>. Both are
-      ~56&nbsp;GB of CRIU images sitting in a directory. Whether a tar existed an hour
-      earlier on the write side leaves no trace on the read side, because we untar at
-      publish, not at restore. What actually separates those rows from the first one is
-      the storage tier, and that is worth <strong>8.0×</strong>.
-    </p>
-    <div class="note">
-      <span class="note-lab">How this squares with the 677 s at the top</span>
-      It does not contradict it — it is a later slice through the same system. Every row
-      in this table runs the <em>finished</em> stack: patched CRIU, no staging copy,
-      prefetch at 4. So the 344&nbsp;s FUSE row is not the old baseline, it is what
-      today's restore costs when the artifact happens to live on the mount. The
-      677&nbsp;s number is the honest starting point of the whole project; the
-      344&nbsp;s number is the price of one remaining decision.
-    </div>
     <p>
       So the two halves of this post divide differently than the work did. Part one's
       changes are worth almost nothing here, and the two stages that follow — one a
